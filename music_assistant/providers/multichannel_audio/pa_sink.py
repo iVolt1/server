@@ -24,7 +24,7 @@ def enumerate_surround_sinks() -> list[dict[str, Any]]:
     :returns: List of dicts with keys: name, pa_sink_name, channels,
               layout, channel_map, sample_rate, bit_depth.
     """
-    from .pa_simple import enumerate_pa_sinks  # noqa: PLC0415
+    from music_assistant.providers.local_audio.pa_simple import enumerate_pa_sinks  # noqa: PLC0415
 
     results: list[dict[str, Any]] = []
     for sink in enumerate_pa_sinks():
