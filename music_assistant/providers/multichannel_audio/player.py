@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import numpy as np
-from music_assistant_models.enums import IdentifierType, PlayerFeature, PlayerType
+from music_assistant_models.enums import (
+    ContentType,
+    IdentifierType,
+    PlayerFeature,
+    PlayerType,
+    PlaybackState,
+)
+from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 
-from music_assistant.models.player import Player
+from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
+from music_assistant.models.player import Player, PlayerMedia
 
 from .constants import (
     CACHE_CATEGORY_PREV_STATE,
@@ -76,8 +85,10 @@ class MultiChannelPlayer(Player):
         self._attr_name = display_name
         self._attr_available = True
         self._attr_supported_features = {
+            PlayerFeature.PLAY_MEDIA,
             PlayerFeature.VOLUME_SET,
             PlayerFeature.VOLUME_MUTE,
+            PlayerFeature.PAUSE,
         }
         self._attr_device_info = DeviceInfo(
             model=display_name,
@@ -95,11 +106,13 @@ class MultiChannelPlayer(Player):
         self.bit_depth = bit_depth
         self._is_remap = is_remap
         self._hardware_volume_fallback = False
+        self._playback_task: asyncio.Task[None] | None = None
+        self._paused = False
 
-        self._is_streaming: bool = False
-        self._write_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self._writer_task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
+    @property
+    def needs_poll(self) -> bool:
+        """Return if the player needs to be polled for state updates."""
+        return False
 
     @property
     def volume_control_mode(self) -> str:
@@ -110,29 +123,104 @@ class MultiChannelPlayer(Player):
             self._provider.config.get_value(CONF_VOLUME_CONTROL) or VOLUME_CONTROL_HARDWARE
         )
 
-    # --- State persistence ---
+    # --- MA mandatory player interface ---
 
-    async def restore_state(self) -> None:
-        """Restore cached volume/mute state from a previous session."""
-        if last_state := await self.mass.cache.get(
-            key=self.player_id,
-            provider=self._provider.instance_id,
-            category=CACHE_CATEGORY_PREV_STATE,
-        ):
-            self._attr_volume_muted = last_state[0]
-            self._attr_volume_level = last_state[1]
-        else:
-            self._attr_volume_muted = False
-            self._attr_volume_level = DEFAULT_PLAYER_VOLUME
+    async def play_media(self, media: PlayerMedia) -> None:
+        """Handle PLAY_MEDIA command — resolve stream URL and start PCM playback."""
+        await self._stop_playback()
+        url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
+        self.logger.info("Starting multichannel playback from %s", url)
+        self._attr_current_media = media
+        self._attr_playback_state = PlaybackState.PLAYING
+        self._paused = False
+        self.update_state()
+        self._playback_task = self.mass.create_task(self._playback_loop(url))
 
-    async def _save_state(self) -> None:
-        """Persist current volume/mute state to cache."""
-        await self.mass.cache.set(
-            key=self.player_id,
-            data=[self._attr_volume_muted, self._attr_volume_level],
-            provider=self._provider.instance_id,
-            category=CACHE_CATEGORY_PREV_STATE,
+    async def stop(self) -> None:
+        """Handle STOP command."""
+        await self._stop_playback()
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_current_media = None
+        self.update_state()
+
+    async def pause(self) -> None:
+        """Handle PAUSE command — stop writing to PA but keep task alive."""
+        self._paused = True
+        self._attr_playback_state = PlaybackState.PAUSED
+        self.update_state()
+
+    async def play(self) -> None:
+        """Handle PLAY/resume command."""
+        self._paused = False
+        self._attr_playback_state = PlaybackState.PLAYING
+        self.update_state()
+
+    # --- Playback loop ---
+
+    async def _playback_loop(self, url: str) -> None:
+        """Fetch the MA stream URL and write PCM chunks to the PA sink."""
+        from music_assistant.providers.local_audio.pa_simple import PASimpleStream  # noqa: PLC0415
+
+        output_format = AudioFormat(
+            content_type=ContentType.from_bit_depth(self.bit_depth),
+            sample_rate=self.sample_rate,
+            bit_depth=self.bit_depth,
+            channels=self.channels,
         )
+        stream: PASimpleStream | None = None
+        try:
+            sink_name = self.sink_name
+            stream = await self.mass.loop.run_in_executor(
+                None,
+                lambda: PASimpleStream(
+                    sink_name=sink_name,
+                    app_name="music-assistant-multichannel",
+                    rate=self.sample_rate,
+                    channels=self.channels,
+                    bit_depth=self.bit_depth,
+                ),
+            )
+            self.logger.debug(
+                "PA multichannel stream opened: sink=%s rate=%d channels=%d bit_depth=%d",
+                self.sink_name,
+                self.sample_rate,
+                self.channels,
+                self.bit_depth,
+            )
+
+            async for chunk in get_ffmpeg_stream(
+                audio_input=url,
+                input_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                output_format=output_format,
+            ):
+                if self._paused:
+                    # drain chunks silently while paused to avoid buffer backup
+                    await asyncio.sleep(0.1)
+                    continue
+                chunk = self._apply_software_volume(chunk)
+                await self.mass.loop.run_in_executor(None, stream.write, chunk)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:
+            self.logger.error("Playback error for %s: %s", self.sink_name, err)
+        finally:
+            if stream is not None:
+                with suppress(Exception):
+                    await self.mass.loop.run_in_executor(None, stream.close)
+            self._attr_playback_state = PlaybackState.IDLE
+            self._attr_current_media = None
+            self.update_state()
+            if self._playback_task is asyncio.current_task():
+                self._playback_task = None
+
+    async def _stop_playback(self) -> None:
+        """Cancel and await the playback task if running."""
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._playback_task
+        self._playback_task = None
 
     # --- Volume control ---
 
@@ -167,12 +255,7 @@ class MultiChannelPlayer(Player):
         self.update_state()
 
     async def apply_hardware_ceiling(self) -> None:
-        """
-        Set PA sink hardware volume ceiling (Linux only).
-
-        Physical sinks get the configured ceiling; remap sinks get 100%
-        since the parent ALSA sink already holds the ceiling.
-        """
+        """Set PA sink hardware volume ceiling (Linux only)."""
         target = 100 if self._is_remap else DEFAULT_HARDWARE_VOLUME_CEILING
         loop = asyncio.get_running_loop()
         ok = await loop.run_in_executor(
@@ -229,104 +312,8 @@ class MultiChannelPlayer(Player):
             self.logger.warning("pulsectl mute error for %s: %s", pa_sink_name, err)
             return False
 
-    # --- Streaming ---
-
-    async def start_stream(self) -> None:
-        """Start the PA audio writer task."""
-        async with self._lock:
-            if self._writer_task and not self._writer_task.done():
-                self._writer_task.cancel()
-                try:
-                    await self._writer_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            while not self._write_queue.empty():
-                self._write_queue.get_nowait()
-            self._is_streaming = True
-            self._writer_task = self.mass.create_task(self._audio_writer())
-            self.logger.debug("Multichannel audio writer started for %s", self.sink_name)
-
-    async def stop_stream(self) -> None:
-        """Stop streaming and tear down the PA stream."""
-        async with self._lock:
-            self._is_streaming = False
-            if self._writer_task and not self._writer_task.done():
-                self._writer_task.cancel()
-                try:
-                    await self._writer_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            self._writer_task = None
-            while not self._write_queue.empty():
-                self._write_queue.get_nowait()
-
-    def enqueue_audio(self, pcm_data: bytes) -> None:
-        """
-        Enqueue a PCM chunk for writing to the PA sink.
-
-        :param pcm_data: Raw interleaved multichannel PCM bytes.
-        """
-        if self._is_streaming:
-            self._write_queue.put_nowait(pcm_data)
-
-    async def _audio_writer(self) -> None:
-        """Write queued multichannel PCM to the PA sink via PASimpleStream."""
-        from music_assistant.providers.local_audio.pa_simple import PASimpleStream  # noqa: PLC0415
-        from contextlib import suppress  # noqa: PLC0415
-
-        stream: PASimpleStream | None = None
-        try:
-            self.logger.debug(
-                "Opening PA multichannel stream: sink=%s rate=%d channels=%d bit_depth=%d "
-                "channel_map=%s",
-                self.sink_name,
-                self.sample_rate,
-                self.channels,
-                self.bit_depth,
-                self.channel_map,
-            )
-            sink_name = self.sink_name
-            # PASimpleStream currently takes channels as an int — channel map is
-            # enforced at the PA sink configuration level (the sink was set up with
-            # the correct surround profile, so PA routes channels correctly).
-            stream = await self.mass.loop.run_in_executor(
-                None,
-                lambda: PASimpleStream(
-                    sink_name=sink_name,
-                    app_name="music-assistant-multichannel",
-                    rate=self.sample_rate,
-                    channels=self.channels,
-                    bit_depth=self.bit_depth,
-                ),
-            )
-            self.logger.debug("PA multichannel stream opened for %s", self.sink_name)
-
-            while True:
-                data = await self._write_queue.get()
-                if data is None or not self._is_streaming:
-                    break
-                data = self._apply_software_volume(data)
-                await self.mass.loop.run_in_executor(None, stream.write, data)
-
-        except asyncio.CancelledError:
-            pass
-        except OSError as err:
-            self.logger.error("PA stream error for %s: %s", self.sink_name, err)
-        finally:
-            self._is_streaming = False
-            if stream is not None:
-                with suppress(Exception):
-                    await self.mass.loop.run_in_executor(None, stream.close)
-            if self._writer_task is asyncio.current_task():
-                self._writer_task = None
-
     def _apply_software_volume(self, pcm_data: bytes) -> bytes:
-        """
-        Apply software volume scaling to interleaved multichannel PCM.
-
-        Works identically to the stereo implementation — numpy operations
-        are channel-count agnostic on interleaved data.
-        """
+        """Apply software volume scaling to interleaved multichannel PCM."""
         if self.volume_control_mode != VOLUME_CONTROL_SOFTWARE:
             return pcm_data
         if self._attr_volume_muted:
@@ -335,21 +322,40 @@ class MultiChannelPlayer(Player):
         if volume is None or volume >= 100:
             return pcm_data
         scale = volume / 100.0
-
         if self.bit_depth == 32:
             samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
             scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
             return scaled.astype(np.int32).tobytes()
-
         if self.bit_depth == 24:
-            # MA delivers 24-bit left-justified in 32-bit containers — repack to s24le
             samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
             scaled = np.clip(
                 samples.astype(np.float64) * scale, -2147483648, 2147483647
             ).astype(np.int32)
             return scaled.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-
-        # 16-bit
         samples_16 = np.frombuffer(pcm_data, dtype=np.int16).copy()
         scaled = np.clip(samples_16.astype(np.float64) * scale, -32768, 32767)
         return scaled.astype(np.int16).tobytes()
+
+    # --- State persistence ---
+
+    async def restore_state(self) -> None:
+        """Restore cached volume/mute state from a previous session."""
+        if last_state := await self.mass.cache.get(
+            key=self.player_id,
+            provider=self._provider.instance_id,
+            category=CACHE_CATEGORY_PREV_STATE,
+        ):
+            self._attr_volume_muted = last_state[0]
+            self._attr_volume_level = last_state[1]
+        else:
+            self._attr_volume_muted = False
+            self._attr_volume_level = DEFAULT_PLAYER_VOLUME
+
+    async def _save_state(self) -> None:
+        """Persist current volume/mute state to cache."""
+        await self.mass.cache.set(
+            key=self.player_id,
+            data=[self._attr_volume_muted, self._attr_volume_level],
+            provider=self._provider.instance_id,
+            category=CACHE_CATEGORY_PREV_STATE,
+        )
