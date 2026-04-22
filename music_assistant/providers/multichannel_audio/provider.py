@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
+    CONF_MULTICHANNEL_LAYOUT,
+    CONF_PA_SINK_NAME,
     MULTICHANNEL_CHANNELS,
     MULTICHANNEL_LAYOUT_51,
+    PA_CHANNEL_MAPS,
 )
 from .player import MultiChannelPlayer, get_player_uuid
 
@@ -23,7 +26,7 @@ if TYPE_CHECKING:
 class MultiChannelAudioProvider(PlayerProvider):
     """Player provider that streams 5.1/7.1 surround PCM to a PulseAudio surround sink."""
 
-    _players: dict[str, MultiChannelPlayer]
+    _player: MultiChannelPlayer | None
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -33,83 +36,104 @@ class MultiChannelAudioProvider(PlayerProvider):
             raise RuntimeError(
                 "libpulse-simple.so.0 not found — is PulseAudio installed?"
             ) from err
-        self._players = {}
+        self._player = None
 
     async def loaded_in_mass(self) -> None:
         """Handle provider fully loaded in Music Assistant."""
-        await self._discover_and_register()
+        await self._register_player()
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/removal of the provider."""
-        for player in list(self._players.values()):
+        if self._player:
             with suppress(Exception):
-                await player.stop_stream()
-        self._players.clear()
+                await self._player.stop_stream()
+            self._player = None
 
-    async def _discover_and_register(self) -> None:
-        """Enumerate PulseAudio surround sinks and register players."""
-        from .pa_sink import enumerate_surround_sinks  # noqa: PLC0415
-
-        try:
-            sinks: list[dict[str, Any]] = await self.mass.loop.run_in_executor(
-                None, enumerate_surround_sinks
-            )
-        except Exception as err:
-            self.logger.warning("Failed to enumerate surround sinks: %s", err)
+    async def _register_player(self) -> None:
+        """Register a single multichannel player from provider configuration."""
+        sink_name = str(self.config.get_value(CONF_PA_SINK_NAME) or "")
+        if not sink_name:
+            self.logger.warning("No PA sink configured — skipping player registration")
             return
 
-        if not sinks:
-            self.logger.info("No multichannel PulseAudio sinks found")
-            return
+        layout = str(self.config.get_value(CONF_MULTICHANNEL_LAYOUT) or MULTICHANNEL_LAYOUT_51)
+        channels = MULTICHANNEL_CHANNELS[layout]
+        channel_map = PA_CHANNEL_MAPS[layout]
+        player_id = get_player_uuid(sink_name)
 
-        self.logger.info("Found %d multichannel sink(s)", len(sinks))
+        # Query native sample rate and bit depth from pactl
+        sample_rate, bit_depth = await self.mass.loop.run_in_executor(
+            None, _query_sink_format, sink_name
+        )
 
-        for sink in sinks:
-            sink_name: str = sink["pa_sink_name"]
-            player_id = get_player_uuid(sink_name)
-
-            if player_id in self._players:
-                continue
-
-            layout: str = sink.get("layout", MULTICHANNEL_LAYOUT_51)
-            channels: int = MULTICHANNEL_CHANNELS[layout]
-
-            player = MultiChannelPlayer(
-                provider=self,
-                player_id=player_id,
-                sink_name=sink_name,
-                display_name=sink.get("name", sink_name),
-                channels=channels,
-                layout=layout,
-                channel_map=sink["channel_map"],
-                sample_rate=sink["sample_rate"],
-                bit_depth=sink["bit_depth"],
-                is_remap=sink.get("is_remap", False),
-            )
-            await player.restore_state()
-            await player.apply_hardware_ceiling()
-            await self.mass.players.register_or_update(player)
-            self._players[player_id] = player
-            self.logger.info(
-                "Registered multichannel player: %s (%s, %dch, %dHz, %dbit)",
-                sink_name,
-                layout,
-                channels,
-                sink["sample_rate"],
-                sink["bit_depth"],
-            )
+        self._player = MultiChannelPlayer(
+            provider=self,
+            player_id=player_id,
+            sink_name=sink_name,
+            display_name=f"Multichannel Audio ({layout})",
+            channels=channels,
+            layout=layout,
+            channel_map=channel_map,
+            sample_rate=sample_rate,
+            bit_depth=bit_depth,
+        )
+        await self._player.restore_state()
+        await self._player.apply_hardware_ceiling()
+        await self.mass.players.register_or_update(self._player)
+        self.logger.info(
+            "Registered multichannel player: %s (%s, %dch, %dHz, %dbit)",
+            sink_name,
+            layout,
+            channels,
+            sample_rate,
+            bit_depth,
+        )
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
-        """Set volume level (0-100) for the given player."""
-        if player := self._players.get(player_id):
-            await player.volume_set(volume_level)
+        """Set volume level (0-100) for the player."""
+        if self._player and self._player.player_id == player_id:
+            await self._player.volume_set(volume_level)
 
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
-        """Mute/unmute the given player."""
-        if player := self._players.get(player_id):
-            await player.volume_mute(muted)
+        """Mute/unmute the player."""
+        if self._player and self._player.player_id == player_id:
+            await self._player.volume_mute(muted)
 
     async def cmd_stop(self, player_id: str) -> None:
-        """Send stop command to the given player."""
-        if player := self._players.get(player_id):
-            await player.stop_stream()
+        """Send stop command to the player."""
+        if self._player and self._player.player_id == player_id:
+            await self._player.stop_stream()
+
+
+def _query_sink_format(sink_name: str) -> tuple[int, int]:
+    """
+    Query native sample rate and bit depth for a named PA sink via pactl.
+
+    :param sink_name: The PulseAudio sink name.
+    :returns: Tuple of (sample_rate, bit_depth). Falls back to (48000, 16) on failure.
+    """
+    import json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["pactl", "--format=json", "list", "sinks"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            for sink in json.loads(result.stdout):
+                if sink.get("name") == sink_name:
+                    spec_str: str = sink.get("sample_specification", "")
+                    parts = spec_str.split()
+                    fmt = parts[0]
+                    sample_rate = int(parts[2].replace("Hz", ""))
+                    bit_depth = int(
+                        "".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0]))
+                    )
+                    return sample_rate, bit_depth
+    except Exception:
+        pass
+    return 48000, 16
