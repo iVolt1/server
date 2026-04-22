@@ -36,6 +36,7 @@ VOLUME_CONTROL_SOFTWARE = "software"
 VOLUME_CONTROL_DISABLED = "disabled"
 
 # Config entry keys
+CONF_PA_SINK_NAME = "pa_sink_name"
 CONF_MULTICHANNEL_LAYOUT = "multichannel_layout"
 CONF_VOLUME_CONTROL = "volume_control"
 
