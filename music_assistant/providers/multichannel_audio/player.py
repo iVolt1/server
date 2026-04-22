@@ -271,7 +271,7 @@ class MultiChannelPlayer(Player):
 
     async def _audio_writer(self) -> None:
         """Write queued multichannel PCM to the PA sink via PASimpleStream."""
-        from .pa_simple import PASimpleStream  # noqa: PLC0415
+        from music_assistant.providers.local_audio.pa_simple import PASimpleStream  # noqa: PLC0415
         from contextlib import suppress  # noqa: PLC0415
 
         stream: PASimpleStream | None = None
