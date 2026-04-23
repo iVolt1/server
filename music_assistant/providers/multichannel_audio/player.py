@@ -243,8 +243,18 @@ class MultiChannelPlayer(Player):
             ):
                 if first_chunk:
                     self.logger.debug(
-                        "First PCM chunk received len=%d", len(chunk)
+                        "First PCM chunk received len=%d channels=%d",
+                        len(chunk), self.channels,
                     )
+                    # Log RMS energy per channel pair to verify demux routing
+                    dtype = np.int32 if self.bit_depth >= 24 else np.int16
+                    samples = np.frombuffer(chunk, dtype=dtype)
+                    num_frames = len(samples) // self.channels
+                    if num_frames > 0:
+                        s = samples[:num_frames * self.channels].reshape(num_frames, self.channels)
+                        for ch in range(self.channels):
+                            rms = float(np.sqrt(np.mean(s[:, ch].astype(np.float64) ** 2)))
+                            self.logger.debug("  ch[%d] RMS=%.1f", ch, rms)
                     first_chunk = False
 
                 if self._paused:
