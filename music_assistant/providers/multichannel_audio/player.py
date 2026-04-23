@@ -235,6 +235,11 @@ class MultiChannelPlayer(Player):
                 self.sample_rate,
                 self.bit_depth,
             )
+            self.logger.debug(
+                "pair_sinks=%s streams=%s",
+                list(self._pair_sinks.keys()),
+                list(streams.keys()),
+            )
 
             first_chunk = True
             async for chunk in get_ffmpeg_stream(
@@ -332,6 +337,11 @@ class MultiChannelPlayer(Player):
             samples = samples[: num_frames * self.channels].reshape(num_frames, self.channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if sink_name not in streams:
+                    import logging  # noqa: PLC0415
+                    logging.getLogger("music_assistant.Multichannel Audio Out").warning(
+                        "_write_demuxed: sink %s not in streams (have: %s)",
+                        sink_name, list(streams.keys())
+                    )
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
