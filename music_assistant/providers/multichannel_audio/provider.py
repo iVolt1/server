@@ -57,14 +57,17 @@ class MultiChannelAudioProvider(PlayerProvider):
             return
 
         layout = str(self.config.get_value(CONF_MULTICHANNEL_LAYOUT) or MULTICHANNEL_LAYOUT_51)
-        channels = MULTICHANNEL_CHANNELS[layout]
         channel_map = PA_CHANNEL_MAPS[layout]
         player_id = get_player_uuid(sink_name)
 
-        # Query native sample rate and bit depth from pactl
-        sample_rate, bit_depth = await self.mass.loop.run_in_executor(
+        # Query native format from pactl — channel count is authoritative from the
+        # actual sink, not from the layout config, so the PA stream opens with the
+        # correct channel count and avoids pa_simple_write format mismatch errors.
+        sample_rate, bit_depth, channels = await self.mass.loop.run_in_executor(
             None, _query_sink_format, sink_name
         )
+        if channels == 0:
+            channels = MULTICHANNEL_CHANNELS[layout]
 
         self._player = MultiChannelPlayer(
             provider=self,
@@ -105,12 +108,12 @@ class MultiChannelAudioProvider(PlayerProvider):
             await self._player.stop_stream()
 
 
-def _query_sink_format(sink_name: str) -> tuple[int, int]:
+def _query_sink_format(sink_name: str) -> tuple[int, int, int]:
     """
-    Query native sample rate and bit depth for a named PA sink via pactl.
+    Query native sample rate, bit depth, and channel count for a PA sink via pactl.
 
     :param sink_name: The PulseAudio sink name.
-    :returns: Tuple of (sample_rate, bit_depth). Falls back to (48000, 16) on failure.
+    :returns: Tuple of (sample_rate, bit_depth, channels). Falls back to (48000, 16, 0).
     """
     import json  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -129,11 +132,12 @@ def _query_sink_format(sink_name: str) -> tuple[int, int]:
                     spec_str: str = sink.get("sample_specification", "")
                     parts = spec_str.split()
                     fmt = parts[0]
+                    channels = int(parts[1].replace("ch", ""))
                     sample_rate = int(parts[2].replace("Hz", ""))
                     bit_depth = int(
                         "".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0]))
                     )
-                    return sample_rate, bit_depth
+                    return sample_rate, bit_depth, channels
     except Exception:
         pass
-    return 48000, 16
+    return 48000, 16, 0
