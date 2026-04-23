@@ -325,9 +325,17 @@ class MultiChannelPlayer(Player):
                 # Detect by checking if the content type string contains 'f32' or 'float'
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
-                await self.mass.loop.run_in_executor(
-                    None, self._write_demuxed, chunk, streams, is_float, actual_channels
+                # Write all pairs in parallel to avoid sequential blocking
+                loop = asyncio.get_event_loop()
+                demux_data = await loop.run_in_executor(
+                    None, self._demux_chunk, chunk, is_float, actual_channels
                 )
+                if demux_data:
+                    await asyncio.gather(*[
+                        loop.run_in_executor(None, streams[sink].write, data)
+                        for sink, data in demux_data.items()
+                        if sink in streams
+                    ])
 
         except asyncio.CancelledError:
             pass
@@ -343,6 +351,56 @@ class MultiChannelPlayer(Player):
             self.update_state()
             if self._playback_task is asyncio.current_task():
                 self._playback_task = None
+
+    def _demux_chunk(
+        self,
+        pcm_data: bytes,
+        is_float: bool,
+        source_channels: int,
+    ) -> dict[str, bytes]:
+        """
+        Demux interleaved multichannel PCM into per-pair byte buffers.
+
+        Returns a dict of sink_name -> stereo PCM bytes without writing to PA.
+        Caller writes each pair in parallel.
+
+        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param is_float: True if pcm_data is float32.
+        :param source_channels: Actual channel count in pcm_data.
+        """
+        channels = source_channels if source_channels > 0 else self.channels
+        result: dict[str, bytes] = {}
+
+        if is_float:
+            samples = np.frombuffer(pcm_data, dtype=np.float32)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_i32 = np.clip(
+                    pair * 2147483647.0, -2147483648, 2147483647
+                ).astype(np.int32)
+                result[sink_name] = pair_i32.tobytes()
+        else:
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                result[sink_name] = pair_bytes
+        return result
 
     def _write_demuxed(
         self,
