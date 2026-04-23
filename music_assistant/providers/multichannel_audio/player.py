@@ -164,7 +164,8 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Log streamdetails channel count to verify MA sees the correct channel count
+        # Get source channel count from active queue streamdetails
+        source_channels = self.channels
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
@@ -175,13 +176,17 @@ class MultiChannelPlayer(Player):
                     sd.audio_format.sample_rate,
                     sd.uri,
                 )
+                if sd.audio_format.channels > 0:
+                    source_channels = sd.audio_format.channels
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
         self.update_state()
-        self._playback_task = self.mass.create_task(self._playback_loop(url))
+        self._playback_task = self.mass.create_task(
+            self._playback_loop(url, source_channels)
+        )
 
     @property
     def _source_channels(self) -> int:
@@ -213,7 +218,7 @@ class MultiChannelPlayer(Player):
 
     # --- Playback loop ---
 
-    async def _playback_loop(self, url: str) -> None:
+    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
@@ -224,7 +229,8 @@ class MultiChannelPlayer(Player):
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
 
-        source_channels = self.channels
+        if source_channels == 0:
+            source_channels = self.channels
 
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(self.bit_depth),
