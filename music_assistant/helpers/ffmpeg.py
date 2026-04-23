@@ -26,6 +26,22 @@ LOGGER = logging.getLogger("ffmpeg")
 MINIMAL_FFMPEG_VERSION = 6
 CACHE_ATTR_LIBSOXR_PRESENT: Final[str] = "libsoxr_present"
 
+_CHANNEL_LAYOUT_MAP: Final[dict[int, str]] = {
+    1: "mono",
+    2: "stereo",
+    3: "2.1",
+    4: "quad",
+    5: "4.1",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
+}
+
+
+def _channel_layout_str(channels: int) -> str:
+    """Return the ffmpeg channel layout string for a given channel count."""
+    return _CHANNEL_LAYOUT_MAP.get(channels, "stereo")
+
 
 class FFMpeg(AsyncProcess):
     """FFMpeg wrapped as AsyncProcess."""
@@ -311,7 +327,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
                 "-ac",
                 str(input_format.channels),
                 "-channel_layout",
-                "mono" if input_format.channels == 1 else "stereo",
+                _channel_layout_str(input_format.channels),
                 "-ar",
                 str(input_format.sample_rate),
                 "-acodec",
@@ -330,7 +346,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
         "-ac",
         str(output_format.channels),
         "-channel_layout",
-        "mono" if output_format.channels == 1 else "stereo",
+        _channel_layout_str(output_format.channels),
     ]
     if output_path.upper() == "NULL":
         # devnull stream
