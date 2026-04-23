@@ -201,15 +201,13 @@ class MultiChannelPlayer(Player):
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
 
-        # Request stereo output from MA — the core patches are not yet applied
-        # so MA will deliver a stereo downmix. Once the patches land, change
-        # channels here to self.channels to get the full multichannel stream.
-        # For now this gets audio flowing through the front stereo pair.
+        # Request full multichannel output from MA — requires the ffmpeg.py and
+        # streams/audio.py core patches to be applied so MA negotiates >2 channels.
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(self.bit_depth),
             sample_rate=self.sample_rate,
             bit_depth=self.bit_depth,
-            channels=2,  # TODO: change to self.channels after MA core patches applied
+            channels=self.channels,
         )
 
         streams: dict[str, PASimpleStream] = {}
@@ -229,7 +227,6 @@ class MultiChannelPlayer(Player):
                 )
                 streams[sink_name] = stream
                 self.logger.debug("Opened PA stream for %s", sink_name)
-
             self.logger.info(
                 "Multichannel playback started: %d pairs, %dch, %dHz, %dbit",
                 len(streams),
@@ -255,20 +252,9 @@ class MultiChannelPlayer(Player):
                     continue
 
                 chunk = self._apply_software_volume(chunk)
-
-                # With stereo output (pre-patch), write to front pair only.
-                # Post-patch: demux full multichannel chunk to all pairs.
-                if output_format.channels == 2:
-                    front_sink = f"{self.card_name}_front_stereo"
-                    if front_sink in streams:
-                        await self.mass.loop.run_in_executor(
-                            None, streams[front_sink].write, chunk
-                        )
-                else:
-                    # Full multichannel demux path (post MA core patches)
-                    await self.mass.loop.run_in_executor(
-                        None, self._write_demuxed, chunk, streams
-                    )
+                await self.mass.loop.run_in_executor(
+                    None, self._write_demuxed, chunk, streams
+                )
 
         except asyncio.CancelledError:
             pass
