@@ -148,6 +148,54 @@ class MultiChannelPlayer(Player):
         """Return if the player needs to be polled for state updates."""
         return False
 
+    async def get_config_entries(
+        self,
+        action: str | None = None,
+        values: dict | None = None,
+    ) -> list:
+        """Override default config entries to advertise native multichannel sample rates."""
+        from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption  # noqa: PLC0415
+        from music_assistant_models.enums import ConfigEntryType  # noqa: PLC0415
+        from music_assistant.constants import CONF_SAMPLE_RATES, CONF_OUTPUT_CHANNELS  # noqa: PLC0415
+
+        # Build sample rate options based on the sink's native rate
+        # Include common rates up to the sink's native rate at the native bit depth
+        rates = []
+        for rate in (44100, 48000, 88200, 96000, 176400, 192000):
+            if rate <= self.sample_rate:
+                for depth in (16, 24, 32):
+                    if depth <= self.bit_depth:
+                        rates.append(ConfigValueOption(
+                            title=f"{rate//1000}kHz / {depth} bits",
+                            value=f"{rate}/{depth}",
+                        ))
+
+        return [
+            ConfigEntry(
+                key=CONF_SAMPLE_RATES,
+                type=ConfigEntryType.STRING,
+                label="Sample rates supported by this player",
+                options=rates,
+                default_value=[f"{self.sample_rate}/{self.bit_depth}"],
+                multi_value=True,
+                required=True,
+                description="Select all sample rates and bit depths this player supports.",
+            ),
+            ConfigEntry(
+                key=CONF_OUTPUT_CHANNELS,
+                type=ConfigEntryType.STRING,
+                label="Output Channel Mode",
+                options=[
+                    ConfigValueOption(title="Stereo (both channels)", value="stereo"),
+                ],
+                default_value="stereo",
+                description=(
+                    "Multichannel output is handled internally by this provider. "
+                    "Keep this set to Stereo."
+                ),
+            ),
+        ]
+
     @property
     def volume_control_mode(self) -> str:
         """Return the effective volume control mode for this player."""
@@ -202,15 +250,31 @@ class MultiChannelPlayer(Player):
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
 
-        # Request full multichannel output from MA — requires the ffmpeg.py and
-        # streams/audio.py core patches to be applied so MA negotiates >2 channels.
+        # Probe the actual channel count from the MA stream URL.
+        # Requesting self.channels (8) from a 6ch source causes ffmpeg to
+        # upmix with silent extra channels. Instead request the source's
+        # actual channel count so ffmpeg passes channels through discretely.
+        source_channels = await self.mass.loop.run_in_executor(
+            None, _probe_stream_channels, url
+        )
+        if source_channels == 0:
+            source_channels = self.channels
+
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(self.bit_depth),
             sample_rate=self.sample_rate,
             bit_depth=self.bit_depth,
-            channels=self.channels,
+            channels=source_channels,
         )
-
+        self.logger.debug(
+            "Requesting output format: %dch %dHz %dbit %s (source=%d player=%d)",
+            output_format.channels,
+            output_format.sample_rate,
+            output_format.bit_depth,
+            output_format.content_type,
+            source_channels,
+            self.channels,
+        )
         streams: dict[str, PASimpleStream] = {}
         try:
             # Open a PA stream for each stereo pair
@@ -279,7 +343,7 @@ class MultiChannelPlayer(Player):
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
                 await self.mass.loop.run_in_executor(
-                    None, self._write_demuxed, chunk, streams, is_float
+                    None, self._write_demuxed, chunk, streams, is_float, source_channels
                 )
 
         except asyncio.CancelledError:
@@ -302,51 +366,50 @@ class MultiChannelPlayer(Player):
         pcm_data: bytes,
         streams: dict[str, PASimpleStream],
         is_float: bool = False,
+        source_channels: int = 0,
     ) -> None:
         """
         Demux interleaved multichannel PCM and write each stereo pair to its sink.
 
-        Called in an executor thread. Handles both integer PCM (s16le, s24le, s32le)
-        and float PCM (f32le) which MA uses internally when processing is applied.
+        Called in an executor thread. Uses source_channels for reshape so that
+        a 6ch source is not misinterpreted as 8ch.
 
         :param pcm_data: Interleaved multichannel PCM bytes.
         :param streams: Map of sink name to open PASimpleStream.
-        :param is_float: True if pcm_data is float32 (MA internal F32 format).
+        :param is_float: True if pcm_data is float32.
+        :param source_channels: Actual channel count in pcm_data (0 = use self.channels).
         """
+        channels = source_channels if source_channels > 0 else self.channels
         if is_float:
-            # MA internal F32 — reshape as float32 then convert to int32 for PA
             samples_f = np.frombuffer(pcm_data, dtype=np.float32)
-            num_frames = len(samples_f) // self.channels
+            num_frames = len(samples_f) // channels
             if num_frames == 0:
                 return
-            samples_f = samples_f[: num_frames * self.channels].reshape(num_frames, self.channels)
+            samples_f = samples_f[: num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams:
+                if sink_name not in streams or left_idx >= channels or right_idx >= channels:
                     continue
                 pair_f = np.column_stack((samples_f[:, left_idx], samples_f[:, right_idx]))
-                # Convert F32 (-1.0 to 1.0) to S32 for PA
                 pair_i32 = np.clip(pair_f * 2147483647.0, -2147483648, 2147483647).astype(np.int32)
                 streams[sink_name].write(pair_i32.tobytes())
         else:
-            # Integer PCM
             dtype = np.int16 if self.bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
-            num_frames = len(samples) // self.channels
+            num_frames = len(samples) // channels
             if num_frames == 0:
                 return
-            samples = samples[: num_frames * self.channels].reshape(num_frames, self.channels)
+            samples = samples[: num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams:
+                if sink_name not in streams or left_idx >= channels or right_idx >= channels:
                     import logging  # noqa: PLC0415
-                    logging.getLogger("music_assistant.Multichannel Audio Out").warning(
-                        "_write_demuxed: sink %s not in streams (have: %s)",
-                        sink_name, list(streams.keys())
+                    logging.getLogger("music_assistant.Multichannel Audio Out").debug(
+                        "_write_demuxed: skipping %s (idx %d,%d >= %dch)",
+                        sink_name, left_idx, right_idx, channels,
                     )
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
                 if self.bit_depth == 24:
-                    # MA delivers 24-bit left-justified in 32-bit containers — repack to s24le
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                 streams[sink_name].write(pair_bytes)
 
@@ -493,3 +556,38 @@ class MultiChannelPlayer(Player):
             provider=self._provider.instance_id,
             category=CACHE_CATEGORY_PREV_STATE,
         )
+
+
+def _probe_stream_channels(url: str) -> int:
+    """
+    Probe the channel count of an audio stream URL using ffprobe.
+
+    Called in an executor thread. Returns 0 on failure.
+
+    :param url: The audio stream URL to probe.
+    """
+    import json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-select_streams", "a:0",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            streams = data.get("streams", [])
+            if streams:
+                return int(streams[0].get("channels", 0))
+    except Exception:
+        pass
+    return 0
