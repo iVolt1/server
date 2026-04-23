@@ -159,7 +159,7 @@ class MultiChannelPlayer(Player):
 
     async def _playback_loop(self, url: str) -> None:
         """Fetch the MA stream URL and write PCM chunks to the PA sink."""
-        from music_assistant.providers.local_audio.pa_simple import PASimpleStream  # noqa: PLC0415
+        from .pa_simple import PASimpleStream  # noqa: PLC0415
 
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(self.bit_depth),
@@ -188,11 +188,19 @@ class MultiChannelPlayer(Player):
                 self.bit_depth,
             )
 
+            chunk_count = 0
             async for chunk in get_ffmpeg_stream(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
             ):
+                chunk_count += 1
+                if chunk_count == 1:
+                    self.logger.debug(
+                        "First PCM chunk received len=%d format=%s",
+                        len(chunk),
+                        output_format,
+                    )
                 if self._paused:
                     # drain chunks silently while paused to avoid buffer backup
                     await asyncio.sleep(0.1)
