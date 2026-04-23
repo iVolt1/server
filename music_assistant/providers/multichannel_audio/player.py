@@ -240,8 +240,7 @@ class MultiChannelPlayer(Player):
             output_format.content_type,
             source_channels,
             self.channels,
-        )
-        streams: dict[str, PASimpleStream] = {}
+        )        streams: dict[str, PASimpleStream] = {}
         try:
             # Open a PA stream for each stereo pair
             for sink_name in self._pair_sinks:
