@@ -248,6 +248,19 @@ class MultiChannelPlayer(Player):
                         self.channels,
                         output_format.content_type,
                     )
+                    # Log RMS energy per channel to verify multichannel content
+                    ct_val = str(output_format.content_type.value).lower()
+                    is_float_check = "f32" in ct_val or "float" in ct_val
+                    dtype_check = np.float32 if is_float_check else (
+                        np.int16 if self.bit_depth == 16 else np.int32
+                    )
+                    s = np.frombuffer(chunk, dtype=dtype_check)
+                    nf = len(s) // self.channels
+                    if nf > 0:
+                        s = s[:nf * self.channels].reshape(nf, self.channels)
+                        for ch in range(self.channels):
+                            rms = float(np.sqrt(np.mean(s[:, ch].astype(np.float64) ** 2)))
+                            self.logger.debug("  ch[%d] RMS=%.1f", ch, rms)
                     first_chunk = False
 
                 if self._paused:
