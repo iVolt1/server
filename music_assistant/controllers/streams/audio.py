@@ -1167,11 +1167,25 @@ class StreamsAudio:
             if sample_rate in supported_sample_rates:
                 output_sample_rate = sample_rate
                 break
+
+        # For multichannel players, use the active queue item's channel count
+        # rather than hardcoding stereo.
+        flow_channels = 2
+        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
+            try:
+                queue = self.mass.player_queues.get_active_queue(player.player_id)
+                if queue and queue.current_item and queue.current_item.streamdetails:
+                    src_ch = queue.current_item.streamdetails.audio_format.channels
+                    if src_ch > 2:
+                        flow_channels = src_ch
+            except Exception:
+                pass
+
         return AudioFormat(
             content_type=INTERNAL_PCM_FORMAT.content_type,
             sample_rate=output_sample_rate,
             bit_depth=INTERNAL_PCM_FORMAT.bit_depth,
-            channels=2,
+            channels=flow_channels,
         )
 
     async def select_pcm_format(
