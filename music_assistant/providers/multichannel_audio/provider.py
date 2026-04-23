@@ -13,7 +13,6 @@ from .constants import (
     CONF_PA_SINK_NAME,
     MULTICHANNEL_CHANNELS,
     MULTICHANNEL_LAYOUT_51,
-    PA_CHANNEL_MAPS,
 )
 from .player import MultiChannelPlayer, get_player_uuid
 
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
 
 
 class MultiChannelAudioProvider(PlayerProvider):
-    """Player provider that streams 5.1/7.1 surround PCM to a PulseAudio surround sink."""
+    """Player provider that streams multichannel audio via stereo PA remap sink pairs."""
 
     _player: MultiChannelPlayer | None
 
@@ -57,26 +56,25 @@ class MultiChannelAudioProvider(PlayerProvider):
             return
 
         layout = str(self.config.get_value(CONF_MULTICHANNEL_LAYOUT) or MULTICHANNEL_LAYOUT_51)
-        channel_map = PA_CHANNEL_MAPS[layout]
+        channels = MULTICHANNEL_CHANNELS[layout]
         player_id = get_player_uuid(sink_name)
 
-        # Query native format from pactl — channel count is authoritative from the
-        # actual sink, not from the layout config, so the PA stream opens with the
-        # correct channel count and avoids pa_simple_write format mismatch errors.
-        sample_rate, bit_depth, channels = await self.mass.loop.run_in_executor(
+        # Query native format from the surround sink via pactl
+        sample_rate, bit_depth, _ = await self.mass.loop.run_in_executor(
             None, _query_sink_format, sink_name
         )
-        if channels == 0:
-            channels = MULTICHANNEL_CHANNELS[layout]
+
+        # Derive card name from sink name for stereo pair lookup.
+        # e.g. "Creative_X_Fi_surround" -> "Creative_X_Fi"
+        card_name = sink_name.replace("_surround", "")
 
         self._player = MultiChannelPlayer(
             provider=self,
             player_id=player_id,
-            sink_name=sink_name,
+            card_name=card_name,
             display_name=f"Multichannel Audio ({layout})",
             channels=channels,
             layout=layout,
-            channel_map=channel_map,
             sample_rate=sample_rate,
             bit_depth=bit_depth,
         )
@@ -84,12 +82,13 @@ class MultiChannelAudioProvider(PlayerProvider):
         await self._player.apply_hardware_ceiling()
         await self.mass.players.register_or_update(self._player)
         self.logger.info(
-            "Registered multichannel player: %s (%s, %dch, %dHz, %dbit)",
+            "Registered multichannel player: %s (%s, %dch, %dHz, %dbit) -> pairs: %s",
             sink_name,
             layout,
             channels,
             sample_rate,
             bit_depth,
+            list(self._player._pair_sinks.keys()),
         )
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
