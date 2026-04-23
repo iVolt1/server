@@ -1083,6 +1083,7 @@ class StreamsAudio:
         content_sample_rate: int,
         content_bit_depth: int,
         media_type: MediaType = MediaType.UNKNOWN,
+        content_channels: int = 0,
     ) -> AudioFormat:
         """Parse (player specific) output format details for given format string."""
         content_type: ContentType = ContentType.try_parse(output_format_str)
@@ -1116,15 +1117,30 @@ class StreamsAudio:
             content_type = ContentType.from_bit_depth(output_bit_depth)
 
         # Check if the player advertises a native multichannel output format.
-        # If so, honour its channel count rather than forcing stereo.
+        # Use the player's channel count but cap it at the content's channel count
+        # to avoid silent upmixing when source has fewer channels than the player.
         player_channels = 2
         if hasattr(player, "channels") and isinstance(player.channels, int):
             player_channels = player.channels
 
+        # If content_channels not provided, try to get it from the active queue
+        if content_channels == 0 and player_channels > 2:
+            try:
+                queue = self.mass.player_queues.get_active_queue(player.player_id)
+                if queue and queue.current_item and queue.current_item.streamdetails:
+                    content_channels = queue.current_item.streamdetails.audio_format.channels
+            except Exception:
+                pass
+
         if output_channels_str not in ("stereo",):
             resolved_channels = 1
         elif player_channels > 2:
-            resolved_channels = player_channels
+            # Cap at source channel count to avoid silent upmixing.
+            # If content_channels is unknown (0), use player_channels.
+            if content_channels > 0:
+                resolved_channels = min(player_channels, content_channels)
+            else:
+                resolved_channels = player_channels
         else:
             resolved_channels = 2
 
