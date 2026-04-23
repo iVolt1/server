@@ -1061,10 +1061,12 @@ class StreamsAudio:
         conf_channels = self.mass.config.get_raw_player_config_value(
             player_id, CONF_OUTPUT_CHANNELS, "stereo"
         )
-        if conf_channels == "left":
-            filter_params.append("pan=mono|c0=FL")
-        elif conf_channels == "right":
-            filter_params.append("pan=mono|c0=FR")
+        # Pan filters only make sense for stereo/mono output — skip for multichannel
+        if output_format.channels <= 2:
+            if conf_channels == "left":
+                filter_params.append("pan=mono|c0=FL")
+            elif conf_channels == "right":
+                filter_params.append("pan=mono|c0=FR")
 
         if limiter_enabled:
             filter_params.append("alimiter=limit=-2dB:level=false:asc=true")
@@ -1112,11 +1114,25 @@ class StreamsAudio:
             output_bit_depth = min(output_bit_depth, 16)
         if output_format_str == "pcm":
             content_type = ContentType.from_bit_depth(output_bit_depth)
+
+        # Check if the player advertises a native multichannel output format.
+        # If so, honour its channel count rather than forcing stereo.
+        player_channels = 2
+        if hasattr(player, "channels") and isinstance(player.channels, int):
+            player_channels = player.channels
+
+        if output_channels_str not in ("stereo",):
+            resolved_channels = 1
+        elif player_channels > 2:
+            resolved_channels = player_channels
+        else:
+            resolved_channels = 2
+
         fmt = AudioFormat(
             content_type=content_type,
             sample_rate=output_sample_rate,
             bit_depth=output_bit_depth,
-            channels=1 if output_channels_str != "stereo" else 2,
+            channels=resolved_channels,
         )
         fmt.bit_rate = get_bit_rate(fmt)
         return fmt
@@ -1189,7 +1205,10 @@ class StreamsAudio:
             bit_depth=bit_depth,
             channels=streamdetails.audio_format.channels,
         )
-        if smartfades_enabled:
+        # Crossfade requires stereo PCM. For multichannel streams, skip the
+        # channel override — crossfade will be disabled by crossfade_allowed()
+        # returning False for multichannel players.
+        if smartfades_enabled and streamdetails.audio_format.channels <= 2:
             pcm_format.channels = 2
 
         return pcm_format
@@ -2058,6 +2077,16 @@ class StreamsAudio:
             return False  # just a guard
         if not (self.mass.players.get_player(player_id)):
             return False  # just a guard
+        # Multichannel streams cannot be crossfaded — the mixer assumes stereo PCM
+        player_obj = self.mass.players.get_player(player_id)
+        if (
+            player_obj
+            and hasattr(player_obj, "channels")
+            and isinstance(player_obj.channels, int)
+            and player_obj.channels > 2
+        ):
+            self.logger.debug("Skipping crossfade: multichannel player")
+            return False
         if queue_item.media_type != MediaType.TRACK:
             self.logger.debug("Skipping crossfade: current item is not a track")
             return False
