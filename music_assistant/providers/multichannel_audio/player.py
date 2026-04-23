@@ -148,54 +148,6 @@ class MultiChannelPlayer(Player):
         """Return if the player needs to be polled for state updates."""
         return False
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict | None = None,
-    ) -> list:
-        """Override default config entries to advertise native multichannel sample rates."""
-        from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption  # noqa: PLC0415
-        from music_assistant_models.enums import ConfigEntryType  # noqa: PLC0415
-        from music_assistant.constants import CONF_SAMPLE_RATES, CONF_OUTPUT_CHANNELS  # noqa: PLC0415
-
-        # Build sample rate options based on the sink's native rate
-        # Include common rates up to the sink's native rate at the native bit depth
-        rates = []
-        for rate in (44100, 48000, 88200, 96000, 176400, 192000):
-            if rate <= self.sample_rate:
-                for depth in (16, 24, 32):
-                    if depth <= self.bit_depth:
-                        rates.append(ConfigValueOption(
-                            title=f"{rate//1000}kHz / {depth} bits",
-                            value=f"{rate}/{depth}",
-                        ))
-
-        return [
-            ConfigEntry(
-                key=CONF_SAMPLE_RATES,
-                type=ConfigEntryType.STRING,
-                label="Sample rates supported by this player",
-                options=rates,
-                default_value=[f"{self.sample_rate}/{self.bit_depth}"],
-                multi_value=True,
-                required=True,
-                description="Select all sample rates and bit depths this player supports.",
-            ),
-            ConfigEntry(
-                key=CONF_OUTPUT_CHANNELS,
-                type=ConfigEntryType.STRING,
-                label="Output Channel Mode",
-                options=[
-                    ConfigValueOption(title="Stereo (both channels)", value="stereo"),
-                ],
-                default_value="stereo",
-                description=(
-                    "Multichannel output is handled internally by this provider. "
-                    "Keep this set to Stereo."
-                ),
-            ),
-        ]
-
     @property
     def volume_control_mode(self) -> str:
         """Return the effective volume control mode for this player."""
@@ -217,6 +169,15 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(self._playback_loop(url))
+
+    @property
+    def _source_channels(self) -> int:
+        """Return stored source channel count, defaulting to player channels."""
+        return getattr(self, "_stored_source_channels", self.channels)
+
+    @_source_channels.setter
+    def _source_channels(self, value: int) -> None:
+        self._stored_source_channels = value
 
     async def stop(self) -> None:
         """Handle STOP command."""
@@ -250,15 +211,7 @@ class MultiChannelPlayer(Player):
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
 
-        # Probe the actual channel count from the MA stream URL.
-        # Requesting self.channels (8) from a 6ch source causes ffmpeg to
-        # upmix with silent extra channels. Instead request the source's
-        # actual channel count so ffmpeg passes channels through discretely.
-        source_channels = await self.mass.loop.run_in_executor(
-            None, _probe_stream_channels, url
-        )
-        if source_channels == 0:
-            source_channels = self.channels
+        source_channels = self.channels
 
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(self.bit_depth),
@@ -306,29 +259,40 @@ class MultiChannelPlayer(Player):
             )
 
             first_chunk = True
+            actual_channels = source_channels
             async for chunk in get_ffmpeg_stream(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
             ):
                 if first_chunk:
+                    # Detect actual channel count from chunk size.
+                    # bytes_per_sample = bit_depth // 8 (use 4 for 24-bit containers)
+                    bps = 4 if self.bit_depth >= 24 else 2
+                    samples_total = len(chunk) // bps
+                    # Try each possible channel count to find what divides evenly
+                    for candidate in (6, 8, 2, 4, 1):
+                        if samples_total % candidate == 0:
+                            actual_channels = candidate
+                            break
                     self.logger.debug(
-                        "First PCM chunk: len=%d channels=%d content_type=%s",
+                        "First PCM chunk: len=%d detected_channels=%d requested=%d content_type=%s",
                         len(chunk),
-                        self.channels,
+                        actual_channels,
+                        source_channels,
                         output_format.content_type,
                     )
-                    # Log RMS energy per channel to verify multichannel content
+                    # Log RMS energy per detected channel
                     ct_val = str(output_format.content_type.value).lower()
                     is_float_check = "f32" in ct_val or "float" in ct_val
                     dtype_check = np.float32 if is_float_check else (
                         np.int16 if self.bit_depth == 16 else np.int32
                     )
                     s = np.frombuffer(chunk, dtype=dtype_check)
-                    nf = len(s) // self.channels
+                    nf = len(s) // actual_channels
                     if nf > 0:
-                        s = s[:nf * self.channels].reshape(nf, self.channels)
-                        for ch in range(self.channels):
+                        s = s[:nf * actual_channels].reshape(nf, actual_channels)
+                        for ch in range(actual_channels):
                             rms = float(np.sqrt(np.mean(s[:, ch].astype(np.float64) ** 2)))
                             self.logger.debug("  ch[%d] RMS=%.1f", ch, rms)
                     first_chunk = False
@@ -343,7 +307,7 @@ class MultiChannelPlayer(Player):
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
                 await self.mass.loop.run_in_executor(
-                    None, self._write_demuxed, chunk, streams, is_float, source_channels
+                    None, self._write_demuxed, chunk, streams, is_float, actual_channels
                 )
 
         except asyncio.CancelledError:
