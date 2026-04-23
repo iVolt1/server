@@ -243,18 +243,11 @@ class MultiChannelPlayer(Player):
             ):
                 if first_chunk:
                     self.logger.debug(
-                        "First PCM chunk received len=%d channels=%d",
-                        len(chunk), self.channels,
+                        "First PCM chunk: len=%d channels=%d content_type=%s",
+                        len(chunk),
+                        self.channels,
+                        output_format.content_type,
                     )
-                    # Log RMS energy per channel pair to verify demux routing
-                    dtype = np.int32 if self.bit_depth >= 24 else np.int16
-                    samples = np.frombuffer(chunk, dtype=dtype)
-                    num_frames = len(samples) // self.channels
-                    if num_frames > 0:
-                        s = samples[:num_frames * self.channels].reshape(num_frames, self.channels)
-                        for ch in range(self.channels):
-                            rms = float(np.sqrt(np.mean(s[:, ch].astype(np.float64) ** 2)))
-                            self.logger.debug("  ch[%d] RMS=%.1f", ch, rms)
                     first_chunk = False
 
                 if self._paused:
@@ -262,8 +255,12 @@ class MultiChannelPlayer(Player):
                     continue
 
                 chunk = self._apply_software_volume(chunk)
+                # MA uses F32 internally when processing is applied (normalization, DSP etc.)
+                # Detect by checking if the content type string contains 'f32' or 'float'
+                ct_val = str(output_format.content_type.value).lower()
+                is_float = "f32" in ct_val or "float" in ct_val
                 await self.mass.loop.run_in_executor(
-                    None, self._write_demuxed, chunk, streams
+                    None, self._write_demuxed, chunk, streams, is_float
                 )
 
         except asyncio.CancelledError:
@@ -285,41 +282,49 @@ class MultiChannelPlayer(Player):
         self,
         pcm_data: bytes,
         streams: dict[str, PASimpleStream],
+        is_float: bool = False,
     ) -> None:
         """
         Demux interleaved multichannel PCM and write each stereo pair to its sink.
 
-        Called in an executor thread. All sink writes happen sequentially in
-        the same thread — since all sinks share the same ALSA hardware clock
-        the timing difference is negligible.
+        Called in an executor thread. Handles both integer PCM (s16le, s24le, s32le)
+        and float PCM (f32le) which MA uses internally when processing is applied.
 
         :param pcm_data: Interleaved multichannel PCM bytes.
         :param streams: Map of sink name to open PASimpleStream.
+        :param is_float: True if pcm_data is float32 (MA internal F32 format).
         """
-        bytes_per_sample = self.bit_depth // 8
-        # For 24-bit MA delivers in 32-bit containers
-        if self.bit_depth == 24:
-            bytes_per_sample = 4
-
-        dtype = {16: np.int16, 24: np.int32, 32: np.int32}[self.bit_depth]
-        samples = np.frombuffer(pcm_data, dtype=dtype)
-
-        # Reshape to (num_frames, num_channels)
-        num_frames = len(samples) // self.channels
-        if num_frames == 0:
-            return
-        samples = samples[: num_frames * self.channels].reshape(num_frames, self.channels)
-
-        for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-            if sink_name not in streams:
-                continue
-            # Extract the two channels and interleave them as stereo
-            pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-            pair_bytes = pair.astype(dtype).tobytes()
-            # Repack 24-bit to 3-byte packed s24le if needed
-            if self.bit_depth == 24:
-                pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-            streams[sink_name].write(pair_bytes)
+        if is_float:
+            # MA internal F32 — reshape as float32 then convert to int32 for PA
+            samples_f = np.frombuffer(pcm_data, dtype=np.float32)
+            num_frames = len(samples_f) // self.channels
+            if num_frames == 0:
+                return
+            samples_f = samples_f[: num_frames * self.channels].reshape(num_frames, self.channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
+                pair_f = np.column_stack((samples_f[:, left_idx], samples_f[:, right_idx]))
+                # Convert F32 (-1.0 to 1.0) to S32 for PA
+                pair_i32 = np.clip(pair_f * 2147483647.0, -2147483648, 2147483647).astype(np.int32)
+                streams[sink_name].write(pair_i32.tobytes())
+        else:
+            # Integer PCM
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
+            num_frames = len(samples) // self.channels
+            if num_frames == 0:
+                return
+            samples = samples[: num_frames * self.channels].reshape(num_frames, self.channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
+                    # MA delivers 24-bit left-justified in 32-bit containers — repack to s24le
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                streams[sink_name].write(pair_bytes)
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
