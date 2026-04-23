@@ -43,18 +43,19 @@ if TYPE_CHECKING:
 
 # Channel pair definitions for demuxing interleaved multichannel PCM.
 # Each entry maps a PA sink name suffix to the channel indices it carries.
-# For 7.1: FL=0, FR=1, RL=2, RR=3, FC=4, LFE=5, SL=6, SR=7
-# For 5.1: FL=0, FR=1, RL=2, RR=3, FC=4, LFE=5
+# FLAC channel ordering per spec:
+# 5.1: FL=0, FR=1, FC=2, LFE=3, RL=4, RR=5
+# 7.1: FL=0, FR=1, FC=2, LFE=3, RL=4, RR=5, SL=6, SR=7
 _PAIR_CHANNEL_INDICES_71 = {
     "front_stereo":  (0, 1),   # FL, FR
-    "rear_stereo":   (2, 3),   # RL, RR
-    "center_sub":    (4, 5),   # FC, LFE
+    "rear_stereo":   (4, 5),   # RL, RR
+    "center_sub":    (2, 3),   # FC, LFE
     "side_stereo":   (6, 7),   # SL, SR
 }
 _PAIR_CHANNEL_INDICES_51 = {
     "front_stereo":  (0, 1),   # FL, FR
-    "rear_stereo":   (2, 3),   # RL, RR
-    "center_sub":    (4, 5),   # FC, LFE
+    "rear_stereo":   (4, 5),   # RL, RR
+    "center_sub":    (2, 3),   # FC, LFE
 }
 
 
