@@ -164,6 +164,19 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
+        # Log streamdetails channel count to verify MA sees the correct channel count
+        try:
+            queue = self.mass.player_queues.get_active_queue(self.player_id)
+            if queue and queue.current_item and queue.current_item.streamdetails:
+                sd = queue.current_item.streamdetails
+                self.logger.debug(
+                    "streamdetails: channels=%d sample_rate=%d uri=%s",
+                    sd.audio_format.channels,
+                    sd.audio_format.sample_rate,
+                    sd.uri,
+                )
+        except Exception as err:
+            self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
