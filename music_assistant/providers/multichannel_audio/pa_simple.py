@@ -103,6 +103,17 @@ def _get_lib() -> ctypes.CDLL:
     return _lib
 
 
+class _PABufferAttr(ctypes.Structure):
+    """PA buffer attributes for controlling stream buffering."""
+    _fields_: ClassVar = [
+        ("maxlength", ctypes.c_uint32),
+        ("tlength",   ctypes.c_uint32),
+        ("prebuf",    ctypes.c_uint32),
+        ("minreq",    ctypes.c_uint32),
+        ("fragsize",  ctypes.c_uint32),
+    ]
+
+
 class PASimpleStream:
     """Synchronous PCM playback stream to a named PulseAudio sink.
 
@@ -118,14 +129,32 @@ class PASimpleStream:
         rate: int,
         channels: int,
         bit_depth: int = 16,
+        buffer_msec: int = 200,
     ) -> None:
-        """Open a synchronous PCM playback stream to the named PulseAudio sink."""
+        """Open a synchronous PCM playback stream to the named PulseAudio sink.
+
+        :param buffer_msec: Target buffer size in milliseconds. Larger values
+            reduce underruns at the cost of increased latency. Default 200ms.
+        """
         lib = _get_lib()
         spec = _PASampleSpec(
             format=_pa_sample_format(bit_depth),
             rate=rate,
             channels=channels,
         )
+
+        # Calculate target buffer length in bytes
+        bytes_per_sec = rate * channels * (4 if bit_depth >= 24 else 2)
+        tlength = int(bytes_per_sec * buffer_msec / 1000)
+
+        buf_attr = _PABufferAttr(
+            maxlength=0xFFFFFFFF,   # PA chooses max
+            tlength=tlength,        # target buffer size
+            prebuf=0xFFFFFFFF,      # PA chooses prebuf
+            minreq=0xFFFFFFFF,      # PA chooses minreq
+            fragsize=0xFFFFFFFF,    # recording only
+        )
+
         error = ctypes.c_int(0)
         self._lib = lib
         self._lock = threading.Lock()
@@ -138,7 +167,7 @@ class PASimpleStream:
             b"playback",
             ctypes.byref(spec),
             None,
-            None,
+            ctypes.byref(buf_attr),
             ctypes.byref(error),
         )
         if not self._conn:
