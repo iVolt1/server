@@ -194,18 +194,11 @@ class MultiChannelPlayer(Player):
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
         self.update_state()
-        # Use direct file path for normal playback to avoid MA's double-transcode
-        # bottleneck. Fall back to MA flow stream URL when seeking so MA handles
-        # the seek position correctly.
         seek_position = getattr(media, "seek_position", 0) or 0
-        if direct_path and not seek_position:
-            playback_url = direct_path
-        else:
-            playback_url = url
-            if seek_position:
-                self.logger.debug("Seek to %.1fs — using MA flow stream", seek_position)
+        # Always prefer direct file path — ffmpeg handles seek via -ss
+        playback_url = direct_path or url
         self._playback_task = self.mass.create_task(
-            self._playback_loop(playback_url, source_channels)
+            self._playback_loop(playback_url, source_channels, seek_position)
         )
 
     @property
@@ -238,7 +231,7 @@ class MultiChannelPlayer(Player):
 
     # --- Playback loop ---
 
-    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
+    async def _playback_loop(self, url: str, source_channels: int = 0, seek_position: float = 0) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
@@ -303,10 +296,14 @@ class MultiChannelPlayer(Player):
                 self.bit_depth,
             )
 
+            extra_input_args = ["-ss", str(seek_position)] if seek_position else []
+            if seek_position:
+                self.logger.debug("Seeking to %.1fs", seek_position)
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
+                extra_input_args=extra_input_args,
                 extra_output_args=["-flush_packets", "1"],
                 collect_log_history=True,
             )
