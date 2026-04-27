@@ -249,8 +249,11 @@ class MultiChannelPlayer(Player):
         )
         streams: dict[str, PASimpleStream] = {}
         try:
-            # Open a PA stream for each stereo pair
-            for sink_name in self._pair_sinks:
+            # Only open PA streams for pairs whose channel indices exist in the source.
+            # Opening unused streams causes PA buffer starvation and rhythmic stuttering.
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= source_channels or right_idx >= source_channels:
+                    continue
                 sname = sink_name
                 stream = await self.mass.loop.run_in_executor(
                     None,
@@ -265,9 +268,9 @@ class MultiChannelPlayer(Player):
                 streams[sink_name] = stream
                 self.logger.debug("Opened PA stream for %s", sink_name)
             self.logger.info(
-                "Multichannel playback started: %d pairs, %dch, %dHz, %dbit",
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
                 len(streams),
-                self.channels,
+                source_channels,
                 self.sample_rate,
                 self.bit_depth,
             )
@@ -352,9 +355,6 @@ class MultiChannelPlayer(Player):
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= channels or right_idx >= channels:
                     continue
-                # For stereo sources only write to front pair
-                if channels <= 2 and "front_stereo" not in sink_name:
-                    continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_i32 = np.clip(
                     pair * 2147483647.0, -2147483648, 2147483647
@@ -369,9 +369,6 @@ class MultiChannelPlayer(Player):
             samples = samples[:num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= channels or right_idx >= channels:
-                    continue
-                # For stereo sources only write to front pair
-                if channels <= 2 and "front_stereo" not in sink_name:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
