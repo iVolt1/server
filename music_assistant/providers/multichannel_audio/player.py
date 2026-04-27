@@ -195,6 +195,11 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         seek_position = getattr(media, "seek_position", 0) or 0
+        self.logger.debug(
+            "play_media: seek_position=%s media_attrs=%s",
+            seek_position,
+            [a for a in dir(media) if not a.startswith('_')],
+        )
         # Always prefer direct file path — ffmpeg handles seek via -ss
         playback_url = direct_path or url
         self._playback_task = self.mass.create_task(
