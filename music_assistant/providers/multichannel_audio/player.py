@@ -271,49 +271,21 @@ class MultiChannelPlayer(Player):
                 self.sample_rate,
                 self.bit_depth,
             )
-            self.logger.debug(
-                "pair_sinks=%s streams=%s",
-                list(self._pair_sinks.keys()),
-                list(streams.keys()),
-            )
 
             first_chunk = True
-            actual_channels = source_channels
+            actual_channels = source_channels if source_channels > 0 else self.channels
             async for chunk in get_ffmpeg_stream(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
             ):
                 if first_chunk:
-                    # Detect actual channel count from chunk size.
-                    # bytes_per_sample = bit_depth // 8 (use 4 for 24-bit containers)
-                    bps = 4 if self.bit_depth >= 24 else 2
-                    samples_total = len(chunk) // bps
-                    # Try each possible channel count to find what divides evenly
-                    for candidate in (6, 8, 2, 4, 1):
-                        if samples_total % candidate == 0:
-                            actual_channels = candidate
-                            break
                     self.logger.debug(
-                        "First PCM chunk: len=%d detected_channels=%d requested=%d content_type=%s",
+                        "First PCM chunk: len=%d channels=%d content_type=%s",
                         len(chunk),
                         actual_channels,
-                        source_channels,
                         output_format.content_type,
                     )
-                    # Log RMS energy per detected channel
-                    ct_val = str(output_format.content_type.value).lower()
-                    is_float_check = "f32" in ct_val or "float" in ct_val
-                    dtype_check = np.float32 if is_float_check else (
-                        np.int16 if self.bit_depth == 16 else np.int32
-                    )
-                    s = np.frombuffer(chunk, dtype=dtype_check)
-                    nf = len(s) // actual_channels
-                    if nf > 0:
-                        s = s[:nf * actual_channels].reshape(nf, actual_channels)
-                        for ch in range(actual_channels):
-                            rms = float(np.sqrt(np.mean(s[:, ch].astype(np.float64) ** 2)))
-                            self.logger.debug("  ch[%d] RMS=%.1f", ch, rms)
                     first_chunk = False
 
                 if self._paused:
@@ -380,6 +352,9 @@ class MultiChannelPlayer(Player):
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= channels or right_idx >= channels:
                     continue
+                # For stereo sources only write to front pair
+                if channels <= 2 and "front_stereo" not in sink_name:
+                    continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_i32 = np.clip(
                     pair * 2147483647.0, -2147483648, 2147483647
@@ -395,64 +370,15 @@ class MultiChannelPlayer(Player):
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= channels or right_idx >= channels:
                     continue
+                # For stereo sources only write to front pair
+                if channels <= 2 and "front_stereo" not in sink_name:
+                    continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
                 if self.bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                 result[sink_name] = pair_bytes
         return result
-
-    def _write_demuxed(
-        self,
-        pcm_data: bytes,
-        streams: dict[str, PASimpleStream],
-        is_float: bool = False,
-        source_channels: int = 0,
-    ) -> None:
-        """
-        Demux interleaved multichannel PCM and write each stereo pair to its sink.
-
-        Called in an executor thread. Uses source_channels for reshape so that
-        a 6ch source is not misinterpreted as 8ch.
-
-        :param pcm_data: Interleaved multichannel PCM bytes.
-        :param streams: Map of sink name to open PASimpleStream.
-        :param is_float: True if pcm_data is float32.
-        :param source_channels: Actual channel count in pcm_data (0 = use self.channels).
-        """
-        channels = source_channels if source_channels > 0 else self.channels
-        if is_float:
-            samples_f = np.frombuffer(pcm_data, dtype=np.float32)
-            num_frames = len(samples_f) // channels
-            if num_frames == 0:
-                return
-            samples_f = samples_f[: num_frames * channels].reshape(num_frames, channels)
-            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams or left_idx >= channels or right_idx >= channels:
-                    continue
-                pair_f = np.column_stack((samples_f[:, left_idx], samples_f[:, right_idx]))
-                pair_i32 = np.clip(pair_f * 2147483647.0, -2147483648, 2147483647).astype(np.int32)
-                streams[sink_name].write(pair_i32.tobytes())
-        else:
-            dtype = np.int16 if self.bit_depth == 16 else np.int32
-            samples = np.frombuffer(pcm_data, dtype=dtype)
-            num_frames = len(samples) // channels
-            if num_frames == 0:
-                return
-            samples = samples[: num_frames * channels].reshape(num_frames, channels)
-            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams or left_idx >= channels or right_idx >= channels:
-                    import logging  # noqa: PLC0415
-                    logging.getLogger("music_assistant.Multichannel Audio Out").debug(
-                        "_write_demuxed: skipping %s (idx %d,%d >= %dch)",
-                        sink_name, left_idx, right_idx, channels,
-                    )
-                    continue
-                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                pair_bytes = pair.astype(dtype).tobytes()
-                if self.bit_depth == 24:
-                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                streams[sink_name].write(pair_bytes)
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
@@ -597,38 +523,3 @@ class MultiChannelPlayer(Player):
             provider=self._provider.instance_id,
             category=CACHE_CATEGORY_PREV_STATE,
         )
-
-
-def _probe_stream_channels(url: str) -> int:
-    """
-    Probe the channel count of an audio stream URL using ffprobe.
-
-    Called in an executor thread. Returns 0 on failure.
-
-    :param url: The audio stream URL to probe.
-    """
-    import json  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-select_streams", "a:0",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            streams = data.get("streams", [])
-            if streams:
-                return int(streams[0].get("channels", 0))
-    except Exception:
-        pass
-    return 0
