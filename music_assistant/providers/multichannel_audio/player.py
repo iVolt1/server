@@ -164,9 +164,8 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Get source channel count and direct file path from active queue streamdetails
+        # Get source channel count from active queue streamdetails
         source_channels = self.channels
-        direct_path: str | None = None
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
@@ -179,41 +178,15 @@ class MultiChannelPlayer(Player):
                 )
                 if sd.audio_format.channels > 0:
                     source_channels = sd.audio_format.channels
-                # Use direct file path if available to bypass MA's flow stream
-                # and avoid the double-transcode bottleneck for local files
-                if (
-                    hasattr(sd, "path")
-                    and isinstance(sd.path, str)
-                    and sd.path.startswith("/")
-                ):
-                    direct_path = sd.path
-                    self.logger.debug("Using direct file path: %s", direct_path)
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
         self.update_state()
-        # Always use the MA flow stream URL — it encodes seek position internally.
-        # Direct file path bypasses seek so we don't use it.
-        # Stutter is prevented by using small chunks via iter_chunked in _playback_loop.
-        playback_url = url
-        self.logger.debug(
-            "play_media: queue_item_id=%s",
-            getattr(media, "queue_item_id", "?"),
-        )
         self._playback_task = self.mass.create_task(
-            self._playback_loop(playback_url, source_channels)
+            self._playback_loop(url, source_channels)
         )
-
-    @property
-    def _source_channels(self) -> int:
-        """Return stored source channel count, defaulting to player channels."""
-        return getattr(self, "_stored_source_channels", self.channels)
-
-    @_source_channels.setter
-    def _source_channels(self, value: int) -> None:
-        self._stored_source_channels = value
 
     async def stop(self) -> None:
         """Handle STOP command."""
