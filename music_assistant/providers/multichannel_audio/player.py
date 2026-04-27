@@ -278,6 +278,7 @@ class MultiChannelPlayer(Player):
 
             first_chunk = True
             actual_channels = source_channels if source_channels > 0 else self.channels
+            last_chunk_time = 0.0
             async for chunk in get_ffmpeg_stream(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
@@ -291,6 +292,17 @@ class MultiChannelPlayer(Player):
                         output_format.content_type,
                     )
                     first_chunk = False
+                    last_chunk_time = asyncio.get_event_loop().time()
+                else:
+                    now = asyncio.get_event_loop().time()
+                    gap = now - last_chunk_time
+                    last_chunk_time = now
+                    chunk_duration = len(chunk) / (4 * actual_channels * self.sample_rate)
+                    if gap > chunk_duration * 1.5:
+                        self.logger.warning(
+                            "Chunk delivery gap: %.1fms (expected %.1fms)",
+                            gap * 1000, chunk_duration * 1000,
+                        )
 
                 if self._paused:
                     await asyncio.sleep(0.05)
