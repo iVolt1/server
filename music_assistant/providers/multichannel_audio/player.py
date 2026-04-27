@@ -232,12 +232,13 @@ class MultiChannelPlayer(Player):
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
-        Opens one PASimpleStream per stereo pair, then for each PCM chunk
-        extracts the two relevant channels and writes them to the
-        corresponding sink. All writes happen in the same executor thread
-        to keep the pairs as tightly coupled as possible.
+        Opens one PASimpleStream per stereo pair whose channel indices
+        exist in the source, then for each PCM chunk extracts the two
+        relevant channels and writes them sequentially to the corresponding
+        sink. All writes happen in the same executor thread.
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
+        from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
 
         if source_channels == 0:
             source_channels = self.channels
@@ -257,10 +258,16 @@ class MultiChannelPlayer(Player):
             source_channels,
             self.channels,
         )
+
+        # Target 10ms chunks to ensure steady delivery to PA sinks.
+        # Default get_ffmpeg_stream chunks are too large causing delivery gaps.
+        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
+
         streams: dict[str, PASimpleStream] = {}
+        ffmpeg_proc: FFMpeg | None = None
         try:
-            # Only open PA streams for pairs whose channel indices exist in the source.
-            # Opening unused streams causes PA buffer starvation and rhythmic stuttering.
+            # Only open PA streams for pairs whose channel indices exist in the source
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= source_channels or right_idx >= source_channels:
                     continue
@@ -286,19 +293,23 @@ class MultiChannelPlayer(Player):
                 self.bit_depth,
             )
 
-            first_chunk = True
-            actual_channels = source_channels if source_channels > 0 else self.channels
-            last_chunk_time = 0.0
-            async for chunk in get_ffmpeg_stream(
+            ffmpeg_proc = FFMpeg(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
-            ):
+                extra_output_args=["-flush_packets", "1"],
+                collect_log_history=True,
+            )
+            await ffmpeg_proc.start()
+
+            first_chunk = True
+            last_chunk_time = 0.0
+            async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
                 if first_chunk:
                     self.logger.debug(
                         "First PCM chunk: len=%d channels=%d content_type=%s",
                         len(chunk),
-                        actual_channels,
+                        source_channels,
                         output_format.content_type,
                     )
                     first_chunk = False
@@ -307,8 +318,8 @@ class MultiChannelPlayer(Player):
                     now = asyncio.get_event_loop().time()
                     gap = now - last_chunk_time
                     last_chunk_time = now
-                    chunk_duration = len(chunk) / (4 * actual_channels * self.sample_rate)
-                    if gap > chunk_duration * 1.5:
+                    chunk_duration = len(chunk) / (4 * source_channels * self.sample_rate)
+                    if gap > chunk_duration * 2.0:
                         self.logger.warning(
                             "Chunk delivery gap: %.1fms (expected %.1fms)",
                             gap * 1000, chunk_duration * 1000,
@@ -321,10 +332,8 @@ class MultiChannelPlayer(Player):
                 chunk = self._apply_software_volume(chunk)
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
-                # Demux and write all pairs in a single executor call to avoid
-                # thread pool overhead and keep writes sequential in one thread.
                 await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write, chunk, streams, is_float, actual_channels
+                    None, self._demux_and_write, chunk, streams, is_float, source_channels
                 )
 
         except asyncio.CancelledError:
@@ -332,6 +341,9 @@ class MultiChannelPlayer(Player):
         except Exception as err:
             self.logger.error("Playback error: %s", err)
         finally:
+            if ffmpeg_proc is not None:
+                with suppress(Exception):
+                    await ffmpeg_proc.close()
             for sink_name, stream in streams.items():
                 with suppress(Exception):
                     await self.mass.loop.run_in_executor(None, stream.close)
@@ -341,6 +353,7 @@ class MultiChannelPlayer(Player):
             self.update_state()
             if self._playback_task is asyncio.current_task():
                 self._playback_task = None
+
 
     def _demux_and_write(
         self,
