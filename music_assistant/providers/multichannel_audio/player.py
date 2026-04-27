@@ -194,8 +194,18 @@ class MultiChannelPlayer(Player):
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
         self.update_state()
+        # Use direct file path for normal playback to avoid MA's double-transcode
+        # bottleneck. Fall back to MA flow stream URL when seeking so MA handles
+        # the seek position correctly.
+        seek_position = getattr(media, "seek_position", 0) or 0
+        if direct_path and not seek_position:
+            playback_url = direct_path
+        else:
+            playback_url = url
+            if seek_position:
+                self.logger.debug("Seek to %.1fs — using MA flow stream", seek_position)
         self._playback_task = self.mass.create_task(
-            self._playback_loop(direct_path or url, source_channels)
+            self._playback_loop(playback_url, source_channels)
         )
 
     @property
@@ -319,7 +329,7 @@ class MultiChannelPlayer(Player):
                     gap = now - last_chunk_time
                     last_chunk_time = now
                     chunk_duration = len(chunk) / (4 * source_channels * self.sample_rate)
-                    if gap > chunk_duration * 2.0:
+                    if gap > chunk_duration * 5.0:
                         self.logger.warning(
                             "Chunk delivery gap: %.1fms (expected %.1fms)",
                             gap * 1000, chunk_duration * 1000,
