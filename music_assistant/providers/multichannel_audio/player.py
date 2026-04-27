@@ -194,11 +194,24 @@ class MultiChannelPlayer(Player):
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
         self.update_state()
-        seek_position = getattr(media, "seek_position", 0) or 0
+        seek_position = 0.0
+        # Detect seek by checking if same track is being restarted.
+        # MA encodes seek into a new flow URL but we use direct file path.
+        # Use elapsed_time from PlayerMedia as the seek position for ffmpeg -ss.
+        if (
+            direct_path
+            and self._attr_current_media
+            and hasattr(media, "queue_item_id")
+            and hasattr(self._attr_current_media, "queue_item_id")
+            and media.queue_item_id == self._attr_current_media.queue_item_id
+        ):
+            seek_position = float(getattr(media, "elapsed_time", 0) or 0)
+            if seek_position:
+                self.logger.debug("Seek detected: elapsed_time=%.1fs", seek_position)
         self.logger.debug(
-            "play_media: seek_position=%s media_attrs=%s",
+            "play_media: seek_position=%.1f queue_item_id=%s",
             seek_position,
-            [a for a in dir(media) if not a.startswith('_')],
+            getattr(media, "queue_item_id", "?"),
         )
         # Always prefer direct file path — ffmpeg handles seek via -ss
         playback_url = direct_path or url
@@ -288,7 +301,7 @@ class MultiChannelPlayer(Player):
                         rate=self.sample_rate,
                         channels=2,
                         bit_depth=self.bit_depth,
-                        buffer_msec=300,
+                        buffer_msec=80,
                     ),
                 )
                 streams[sink_name] = stream
