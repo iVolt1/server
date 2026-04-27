@@ -164,8 +164,9 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Get source channel count from active queue streamdetails
+        # Get source channel count and direct file path from active queue streamdetails
         source_channels = self.channels
+        direct_path: str | None = None
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
@@ -178,6 +179,15 @@ class MultiChannelPlayer(Player):
                 )
                 if sd.audio_format.channels > 0:
                     source_channels = sd.audio_format.channels
+                # Use direct file path if available to bypass MA's flow stream
+                # and avoid the double-transcode bottleneck for local files
+                if (
+                    hasattr(sd, "path")
+                    and isinstance(sd.path, str)
+                    and sd.path.startswith("/")
+                ):
+                    direct_path = sd.path
+                    self.logger.debug("Using direct file path: %s", direct_path)
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
@@ -185,7 +195,7 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(
-            self._playback_loop(url, source_channels)
+            self._playback_loop(direct_path or url, source_channels)
         )
 
     @property
