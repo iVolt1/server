@@ -1,7 +1,7 @@
 {
   "type": "player",
-  "domain": "spdif_audio",
-  "name": "S/PDIF Audio Out",
+  "domain": "digital_audio",
+  "name": "Digital Audio Out",
   "description": "Deliver encoded multichannel audio (AC3, DTS) via S/PDIF or HDMI using IEC 61937 passthrough.",
   "codeowners": ["@iVolt1"],
   "requirements": [],
