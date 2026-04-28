@@ -185,7 +185,7 @@ class SPDIFAudioProvider(PlayerProvider):
             },
             # IEC 61937 streams arrive at the sink as 2ch stereo containers,
             # but MA sees the logical channel count of the encoded format.
-            channel_count=max_channels,
+            channels=max_channels,
             sample_rate=sample_rate,
             bit_depth=SPDIF_STREAM_BIT_DEPTH,
         )
