@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import ContentType, PlayerFeature, PlaybackState
+from music_assistant_models.enums import PlayerFeature, PlaybackState
 from music_assistant_models.player import DeviceInfo
-from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.models.player import Player, PlayerMedia
 
@@ -179,11 +178,10 @@ class SPDIFPlayer(Player):
         source_sample_rate: int,
     ) -> None:
         """Encode MA flow stream to IEC 61937 and write to PA sink."""
-        from music_assistant.helpers.ffmpeg import FFMpeg
 
         loop = asyncio.get_running_loop()
         pa_stream = None
-        ffmpeg: FFMpeg | None = None
+        ffmpeg_proc: asyncio.subprocess.Process | None = None
         try:
             pa_stream, err = await loop.run_in_executor(
                 None,
@@ -210,44 +208,66 @@ class SPDIFPlayer(Player):
             extra_output_args = _ffmpeg_encode_args(
                 encoding, source_channels, source_sample_rate
             )
-            # output_format with UNKNOWN content_type only emits -ac/-channel_layout.
-            # All codec+mux args go in extra_output_args to avoid conflicts.
-            output_format = AudioFormat(
-                content_type=ContentType.UNKNOWN,
-                sample_rate=_SPDIF_SAMPLE_RATE,
-                bit_depth=16,
-                channels=_SPDIF_CHANNELS,
+            # Build ffmpeg command directly — FFMpeg helper doesn't support spdif output.
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-reconnect",
+                "1",
+                "-reconnect_delay_max",
+                "10",
+                "-reconnect_streamed",
+                "1",
+                "-i",
+                url,
+                *extra_output_args,
+                "-",  # write IEC 61937 bitstream to stdout
+            ]
+            self.logger.debug("ffmpeg cmd: %s", " ".join(ffmpeg_cmd))
+            ffmpeg_proc = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            ffmpeg = FFMpeg(
-                audio_input=url,
-                input_format=AudioFormat(content_type=ContentType.UNKNOWN),
-                output_format=output_format,
-                extra_output_args=extra_output_args,
-                collect_log_history=True,
-            )
-            await ffmpeg.start()
-            async for chunk in ffmpeg.iter_chunked(_CHUNK_BYTES):
-                if self._stop_event.is_set():
-                    break
-                if not chunk:
-                    continue
-                write_err = await loop.run_in_executor(
-                    None, lambda c=chunk: pa_simple_write(pa_stream, c)
-                )
-                if write_err is not None:
-                    self.logger.error(
-                        "PA write error on '%s': %s",
-                        self._sink_name,
-                        pa_strerror(write_err),
+
+            # Drain stderr in background so it doesn't block
+            async def _log_stderr() -> None:
+                assert ffmpeg_proc.stderr is not None
+                async for line in ffmpeg_proc.stderr:
+                    self.logger.debug(
+                        "ffmpeg: %s", line.decode(errors="replace").rstrip()
                     )
-                    break
+
+            stderr_task = asyncio.create_task(_log_stderr())
+            try:
+                assert ffmpeg_proc.stdout is not None
+                while True:
+                    if self._stop_event.is_set():
+                        break
+                    chunk = await ffmpeg_proc.stdout.read(_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    write_err = await loop.run_in_executor(
+                        None, lambda c=chunk: pa_simple_write(pa_stream, c)
+                    )
+                    if write_err is not None:
+                        self.logger.error(
+                            "PA write error on '%s': %s",
+                            self._sink_name,
+                            pa_strerror(write_err),
+                        )
+                        break
+            finally:
+                stderr_task.cancel()
+                if ffmpeg_proc.returncode is None:
+                    ffmpeg_proc.kill()
+                    await ffmpeg_proc.wait()
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001
             self.logger.exception("Unexpected error in S/PDIF playback loop")
-            if ffmpeg is not None and hasattr(ffmpeg, "log_history"):
-                for line in ffmpeg.log_history:
-                    self.logger.error("ffmpeg: %s", line)
         finally:
             if pa_stream is not None:
                 try:
@@ -256,10 +276,4 @@ class SPDIFPlayer(Player):
                     pass
                 await loop.run_in_executor(None, lambda: pa_simple_free(pa_stream))
             self._attr_playback_state = PlaybackState.IDLE
-            if (
-                ffmpeg is not None
-                and hasattr(ffmpeg, "log_history")
-                and ffmpeg.log_history
-            ):
-                self.logger.debug("ffmpeg log: %s", "\n".join(ffmpeg.log_history))
             self.logger.debug("S/PDIF playback loop exited for '%s'", self._sink_name)
