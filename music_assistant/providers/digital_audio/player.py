@@ -180,6 +180,7 @@ class SPDIFPlayer(Player):
         loop = asyncio.get_running_loop()
         pa_stream = None
         ffmpeg_proc: asyncio.subprocess.Process | None = None
+        _cancelled = False
         try:
             # Force the sink to 48000 Hz before opening the IEC 61937 stream.
             # AC3 only supports up to 48000 Hz; PA must not resample the bitstream.
@@ -282,15 +283,25 @@ class SPDIFPlayer(Player):
                     ffmpeg_proc.kill()
                     await ffmpeg_proc.wait()
         except asyncio.CancelledError:
-            pass
+            _cancelled = True
         except Exception:  # noqa: BLE001
             self.logger.exception("Unexpected error in S/PDIF playback loop")
         finally:
             if pa_stream is not None:
+                # Skip drain on cancellation — stream may be mid-write; free directly.
+                if not _cancelled:
+                    try:
+                        await loop.run_in_executor(
+                            None, lambda s=pa_stream: pa_simple_drain(s)
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
-                    await loop.run_in_executor(None, lambda: pa_simple_drain(pa_stream))
+                    await loop.run_in_executor(
+                        None, lambda s=pa_stream: pa_simple_free(s)
+                    )
                 except Exception:  # noqa: BLE001
                     pass
-                await loop.run_in_executor(None, lambda: pa_simple_free(pa_stream))
             self._attr_playback_state = PlaybackState.IDLE
+            self.update_state()
             self.logger.debug("S/PDIF playback loop exited for '%s'", self._sink_name)
