@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-DOMAIN = "spdif_audio"
+DOMAIN = "digital_audio"
 
 # Config entry keys
 CONF_PA_SINK_NAME = "pa_sink_name"
