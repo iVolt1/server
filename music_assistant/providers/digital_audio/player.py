@@ -83,6 +83,7 @@ class SPDIFPlayer(Player):
             PlayerFeature.POWER,
             PlayerFeature.VOLUME_SET,
             PlayerFeature.PAUSE,
+            PlayerFeature.PLAY_MEDIA,
         }
         self._attr_playback_state = PlaybackState.IDLE
         self._sink_name = sink_name
