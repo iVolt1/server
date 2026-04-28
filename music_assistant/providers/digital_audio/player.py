@@ -75,6 +75,12 @@ class SPDIFPlayer(Player):
     ) -> None:
         """Initialize the S/PDIF player."""
         self._attr_name = f"S/PDIF {sink_name}"
+        self._sink_name = sink_name
+        self._playback_task: asyncio.Task | None = None
+        self._stop_event: asyncio.Event = asyncio.Event()
+        # super().__init__ resets _attr_supported_features and _attr_device_info
+        # to empty defaults — set those AFTER calling super.
+        super().__init__(provider, player_id)
         self._attr_available = True
         self._attr_device_info = DeviceInfo(
             model="S/PDIF IEC 61937", manufacturer="PulseAudio"
@@ -86,11 +92,6 @@ class SPDIFPlayer(Player):
             PlayerFeature.PLAY_MEDIA,
         }
         self._attr_playback_state = PlaybackState.IDLE
-        self._sink_name = sink_name
-        self._playback_task: asyncio.Task | None = None
-        self._stop_event: asyncio.Event = asyncio.Event()
-        # super().__init__ must be last — it calls mass.config etc.
-        super().__init__(provider, player_id)
 
     async def power(self, powered: bool) -> None:
         """Power on/off."""
