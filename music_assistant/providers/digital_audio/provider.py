@@ -33,7 +33,6 @@ LOGGER = logging.getLogger(__name__)
 # (the encoded bitstream is multiplexed into a stereo PCM frame).
 SPDIF_STREAM_CHANNELS = 2
 SPDIF_STREAM_SAMPLE_RATE = 48000  # standard IEC 61937 rate
-SPDIF_STREAM_BIT_DEPTH = 16  # IEC 61937 uses 16-bit containers
 
 
 class SPDIFAudioProvider(PlayerProvider):
@@ -176,18 +175,12 @@ class SPDIFAudioProvider(PlayerProvider):
             type=PlayerType.PLAYER,
             name=f"S/PDIF {sink_name}",
             available=True,
-            powered=False,
             device_info=DeviceInfo(model="S/PDIF IEC 61937", manufacturer="PulseAudio"),
             supported_features={
                 PlayerFeature.POWER,
                 PlayerFeature.VOLUME_SET,
                 PlayerFeature.PAUSE,
             },
-            # IEC 61937 streams arrive at the sink as 2ch stereo containers,
-            # but MA sees the logical channel count of the encoded format.
-            channels=max_channels,
-            sample_rate=sample_rate,
-            bit_depth=SPDIF_STREAM_BIT_DEPTH,
         )
 
         await self.mass.players.register(player)
