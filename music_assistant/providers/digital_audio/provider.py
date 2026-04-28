@@ -45,6 +45,8 @@ class SPDIFAudioProvider(PlayerProvider):
     async def unload(self, is_removed: bool = False) -> None:
         """Unload provider."""
         if self._player:
+            self._player._attr_available = False
+            self._player.update_state()
             await self._player.stop()
 
     async def _register_player(self) -> None:
