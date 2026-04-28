@@ -62,8 +62,6 @@ def _ffmpeg_encode_args(
         "spdif",
         "-ar",
         str(_SPDIF_SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
     ]
 
 
