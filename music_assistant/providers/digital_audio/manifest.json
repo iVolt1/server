@@ -1,0 +1,12 @@
+{
+  "type": "music_assistant.provider",
+  "domain": "spdif_audio",
+  "name": "S/PDIF Audio Out",
+  "description": "Deliver encoded multichannel audio (AC3, DTS) via S/PDIF or HDMI using IEC 61937 passthrough.",
+  "codeowners": ["@iVolt1"],
+  "requirements": [],
+  "documentation": "https://github.com/iVolt1/server",
+  "multi_instance": true,
+  "icon_url": "",
+  "version": "0.0.1"
+}
