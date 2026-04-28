@@ -221,6 +221,7 @@ class SPDIFPlayer(Player):
                 output_format=output_format,
                 extra_output_args=extra_output_args,
             )
+            await ffmpeg.start()
             async for chunk in ffmpeg.iter_chunked(_CHUNK_BYTES):
                 if self._stop_event.is_set():
                     break
