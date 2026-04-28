@@ -1,241 +1,64 @@
-"""S/PDIF Audio Out — Player implementation."""
 
-from __future__ import annotations
+root@d5369777-music-assistant-dev:/# sed -n '220,280p' /app/venv/lib/python3.14/site-packages/music_assistant/providers/multichannel_audio/player.py
+        """
+        from .pa_simple import PASimpleStream  # noqa: PLC0415
+        from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
 
-import asyncio
-from typing import TYPE_CHECKING
+        if source_channels == 0:
+            source_channels = self.channels
 
-from music_assistant_models.enums import PlayerFeature, PlaybackState
-from music_assistant_models.player import DeviceInfo
-
-from music_assistant.models.player import Player, PlayerMedia
-
-from .constants import (
-    CONF_ENCODING_FORMAT,
-    ENCODING_BITRATES,
-    ENCODING_DTS,
-    ENCODING_MAX_CHANNELS,
-)
-from .pa_simple import (
-    PA_SAMPLE_S16LE,
-    pa_simple_drain,
-    pa_simple_free,
-    pa_simple_new,
-    pa_simple_write,
-    pa_strerror,
-)
-
-if TYPE_CHECKING:
-    from .provider import SPDIFAudioProvider
-
-_SPDIF_CHANNELS = 2
-_SPDIF_SAMPLE_RATE = 48000
-_PA_BUFFER_MSEC = 160
-_CHUNK_BYTES = 1920
-
-
-def _ffmpeg_encode_args(
-    encoding: str, source_channels: int, source_sample_rate: int
-) -> list[str]:
-    """Build ffmpeg output args for IEC 61937 encoding."""
-    bitrate = ENCODING_BITRATES[encoding]
-    max_ch = ENCODING_MAX_CHANNELS[encoding]
-    out_channels = min(source_channels, max_ch)
-    ch_layout_map = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}
-    ch_layout = ch_layout_map.get(out_channels, f"{out_channels}c")
-    codec_map = {"ac3": "ac3", "dts": "dts", "eac3": "eac3"}
-    codec = codec_map[encoding]
-    extra: list[str] = []
-    if encoding == ENCODING_DTS and source_sample_rate >= 96000:
-        extra = ["-profile:a", "3"]
-    return [
-        "-ac",
-        str(out_channels),
-        "-channel_layout",
-        ch_layout,
-        "-c:a",
-        codec,
-        "-b:a",
-        str(bitrate),
-        *extra,
-        "-f",
-        "spdif",
-        "-ar",
-        str(_SPDIF_SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
-    ]
-
-
-class SPDIFPlayer(Player):
-    """S/PDIF output player — encodes to IEC 61937 and writes to PA iec958 sink."""
-
-    def __init__(
-        self, provider: SPDIFAudioProvider, player_id: str, sink_name: str
-    ) -> None:
-        """Initialize the S/PDIF player."""
-        self._attr_name = f"S/PDIF {sink_name}"
-        self._sink_name = sink_name
-        self._playback_task: asyncio.Task | None = None
-        self._stop_event: asyncio.Event = asyncio.Event()
-        # super().__init__ resets _attr_supported_features and _attr_device_info
-        # to empty defaults — set those AFTER calling super.
-        super().__init__(provider, player_id)
-        self._attr_available = True
-        self._attr_device_info = DeviceInfo(
-            model="S/PDIF IEC 61937", manufacturer="PulseAudio"
+        output_format = AudioFormat(
+            content_type=ContentType.from_bit_depth(self.bit_depth),
+            sample_rate=self.sample_rate,
+            bit_depth=self.bit_depth,
+            channels=source_channels,
         )
-        self._attr_supported_features = {
-            PlayerFeature.POWER,
-            PlayerFeature.VOLUME_SET,
-            PlayerFeature.PAUSE,
-            PlayerFeature.PLAY_MEDIA,
-        }
-        self._attr_playback_state = PlaybackState.IDLE
-
-    async def power(self, powered: bool) -> None:
-        """Power on/off."""
-        self._attr_powered = powered
-        if not powered:
-            await self.stop()
-
-    async def volume_set(self, volume_level: int) -> None:
-        """Set volume via pactl."""
-        pa_vol = int(volume_level / 100 * 65536)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pactl",
-                "set-sink-volume",
-                self._sink_name,
-                str(pa_vol),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=3)
-            self._attr_volume_level = volume_level
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("pactl set-sink-volume failed: %s", exc)
-
-    async def play(self) -> None:
-        """Resume — MA calls play_media for actual content."""
-
-    async def stop(self) -> None:
-        """Stop playback."""
-        self._stop_event.set()
-        if self._playback_task and not self._playback_task.done():
-            self._playback_task.cancel()
-            try:
-                await self._playback_task
-            except asyncio.CancelledError:
-                pass
-        self._playback_task = None
-        self._attr_playback_state = PlaybackState.IDLE
-
-    async def pause(self) -> None:
-        """Pause."""
-        await self.stop()
-        self._attr_playback_state = PlaybackState.PAUSED
-
-    async def play_media(self, media: PlayerMedia) -> None:
-        """Start playing media."""
-        await self.stop()
-        encoding: str = self._provider.config.get_value(CONF_ENCODING_FORMAT)
-        source_channels = 2
-        source_sample_rate = 48000
-        try:
-            if media.streamdetails and media.streamdetails.audio_format:
-                source_channels = media.streamdetails.audio_format.channels or 2
-                source_sample_rate = (
-                    media.streamdetails.audio_format.sample_rate or 48000
-                )
-        except AttributeError:
-            pass
         self.logger.debug(
-            "play_media: sink=%s encoding=%s ch=%d sr=%d uri=%s",
-            self._sink_name,
-            encoding,
+            "Requesting output format: %dch %dHz %dbit %s (source=%d player=%d)",
+            output_format.channels,
+            output_format.sample_rate,
+            output_format.bit_depth,
+            output_format.content_type,
             source_channels,
-            source_sample_rate,
-            media.uri,
-        )
-        self._stop_event.clear()
-        self._attr_playback_state = PlaybackState.PLAYING
-        self._attr_current_media = media
-        self._playback_task = asyncio.create_task(
-            self._playback_loop(
-                media.uri, encoding, source_channels, source_sample_rate
-            )
+            self.channels,
         )
 
-    async def _playback_loop(
-        self,
-        url: str,
-        encoding: str,
-        source_channels: int,
-        source_sample_rate: int,
-    ) -> None:
-        """Encode MA flow stream to IEC 61937 and write to PA sink."""
-        from music_assistant.helpers.ffmpeg import FFMpeg
+        # Target 10ms chunks to ensure steady delivery to PA sinks.
+        # Default get_ffmpeg_stream chunks are too large causing delivery gaps.
+        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
 
-        loop = asyncio.get_running_loop()
-        pa_stream = None
+        streams: dict[str, PASimpleStream] = {}
+        ffmpeg_proc: FFMpeg | None = None
         try:
-            pa_stream, err = await loop.run_in_executor(
-                None,
-                lambda: pa_simple_new(
-                    server=None,
-                    app_name="music_assistant_spdif",
-                    sink_name=self._sink_name,
-                    stream_name="spdif_out",
-                    sample_format=PA_SAMPLE_S16LE,
-                    sample_rate=_SPDIF_SAMPLE_RATE,
-                    channels=_SPDIF_CHANNELS,
-                    buffer_msec=_PA_BUFFER_MSEC,
-                ),
-            )
-            if pa_stream is None:
-                self.logger.error(
-                    "Failed to open PA stream to '%s': %s",
-                    self._sink_name,
-                    pa_strerror(err),
-                )
-                self._attr_playback_state = PlaybackState.IDLE
-                return
-
-            extra_output_args = _ffmpeg_encode_args(
-                encoding, source_channels, source_sample_rate
-            )
-            ffmpeg = FFMpeg(
-                audio_input=url,
-                input_format=None,
-                output_format="spdif",
-                extra_output_args=extra_output_args,
-            )
-            async for chunk in ffmpeg.iter_chunked(_CHUNK_BYTES):
-                if self._stop_event.is_set():
-                    break
-                if not chunk:
+            # Only open PA streams for pairs whose channel indices exist in the source
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= source_channels or right_idx >= source_channels:
                     continue
-                write_err = await loop.run_in_executor(
-                    None, lambda c=chunk: pa_simple_write(pa_stream, c)
+                sname = sink_name
+                stream = await self.mass.loop.run_in_executor(
+                    None,
+                    lambda s=sname: PASimpleStream(
+                        sink_name=s,
+                        app_name="music-assistant-multichannel",
+                        rate=self.sample_rate,
+                        channels=2,
+                        bit_depth=self.bit_depth,
+                        buffer_msec=80,
+                    ),
                 )
-                if write_err is not None:
-                    self.logger.error(
-                        "PA write error on '%s': %s",
-                        self._sink_name,
-                        pa_strerror(write_err),
-                    )
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception:  # noqa: BLE001
-            self.logger.exception("Unexpected error in S/PDIF playback loop")
-        finally:
-            if pa_stream is not None:
-                try:
-                    await loop.run_in_executor(None, lambda: pa_simple_drain(pa_stream))
-                except Exception:  # noqa: BLE001
-                    pass
-                await loop.run_in_executor(None, lambda: pa_simple_free(pa_stream))
-            self._attr_playback_state = PlaybackState.IDLE
-            self.logger.debug("S/PDIF playback loop exited for '%s'", self._sink_name)
+                streams[sink_name] = stream
+                self.logger.debug("Opened PA stream for %s", sink_name)
+            self.logger.info(
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
+                len(streams),
+                source_channels,
+                self.sample_rate,
+                self.bit_depth,
+            )
+
+            ffmpeg_proc = FFMpeg(
+                audio_input=url,
+                input_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                output_format=output_format,
+root@d5369777-music-assistant-dev:/# 
