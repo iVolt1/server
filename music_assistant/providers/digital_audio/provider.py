@@ -63,7 +63,7 @@ class SPDIFAudioProvider(PlayerProvider):
             sink_name=sink_name,
         )
 
-        await self.mass.players.register(self._player)
+        await self.mass.players.register_or_update(self._player)
         LOGGER.info(
             "Registered S/PDIF player '%s' — encoding=%s max_ch=%d",
             sink_name,
