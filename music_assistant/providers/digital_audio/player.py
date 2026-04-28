@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from .provider import SPDIFAudioProvider
 
 _SPDIF_CHANNELS = 2
-_SPDIF_SAMPLE_RATE = 96000
+_SPDIF_SAMPLE_RATE = 48000
 _PA_BUFFER_MSEC = 160
 _CHUNK_BYTES = 1920
 
@@ -181,6 +181,25 @@ class SPDIFPlayer(Player):
         pa_stream = None
         ffmpeg_proc: asyncio.subprocess.Process | None = None
         try:
+            # Force the sink to 48000 Hz before opening the IEC 61937 stream.
+            # AC3 only supports up to 48000 Hz; PA must not resample the bitstream.
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "pactl",
+                    "set-sink-sample-rate",
+                    self._sink_name,
+                    str(_SPDIF_SAMPLE_RATE),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=3)
+                self.logger.debug(
+                    "Set sink %s to %d Hz for IEC 61937",
+                    self._sink_name,
+                    _SPDIF_SAMPLE_RATE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Could not set sink sample rate: %s", exc)
             pa_stream, err = await loop.run_in_executor(
                 None,
                 lambda: pa_simple_new(
