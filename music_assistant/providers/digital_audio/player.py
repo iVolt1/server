@@ -16,14 +16,7 @@ from .constants import (
     ENCODING_DTS,
     ENCODING_MAX_CHANNELS,
 )
-from .pa_simple import (
-    PA_SAMPLE_S16LE,
-    pa_simple_drain,
-    pa_simple_free,
-    pa_simple_new,
-    pa_simple_write,
-    pa_strerror,
-)
+from .pa_passthrough import PAPassthroughStream
 
 if TYPE_CHECKING:
     from .provider import SPDIFAudioProvider
@@ -182,43 +175,20 @@ class SPDIFPlayer(Player):
         ffmpeg_proc: asyncio.subprocess.Process | None = None
         _cancelled = False
         try:
-            # Force the sink to 48000 Hz before opening the IEC 61937 stream.
-            # AC3 only supports up to 48000 Hz; PA must not resample the bitstream.
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "pactl",
-                    "set-sink-sample-rate",
-                    self._sink_name,
-                    str(_SPDIF_SAMPLE_RATE),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=3)
-                self.logger.debug(
-                    "Set sink %s to %d Hz for IEC 61937",
-                    self._sink_name,
-                    _SPDIF_SAMPLE_RATE,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("Could not set sink sample rate: %s", exc)
-            pa_stream, err = await loop.run_in_executor(
-                None,
-                lambda: pa_simple_new(
-                    server=None,
-                    app_name="music_assistant_spdif",
-                    sink_name=self._sink_name,
-                    stream_name="spdif_out",
-                    sample_format=PA_SAMPLE_S16LE,
-                    sample_rate=_SPDIF_SAMPLE_RATE,
-                    channels=_SPDIF_CHANNELS,
-                    buffer_msec=_PA_BUFFER_MSEC,
-                ),
+            # Open PA passthrough stream for IEC 61937 (not PCM via pa_simple)
+            pa_stream = PAPassthroughStream(
+                sink_name=self._sink_name,
+                encoding=encoding,
+                sample_rate=_SPDIF_SAMPLE_RATE,
+                buffer_msec=_PA_BUFFER_MSEC,
             )
-            if pa_stream is None:
+            try:
+                await loop.run_in_executor(None, pa_stream.open)
+            except Exception as exc:  # noqa: BLE001
                 self.logger.error(
-                    "Failed to open PA stream to '%s': %s",
+                    "Failed to open PA passthrough stream to '%s': %s",
                     self._sink_name,
-                    pa_strerror(err),
+                    exc,
                 )
                 self._attr_playback_state = PlaybackState.IDLE
                 return
@@ -267,14 +237,13 @@ class SPDIFPlayer(Player):
                     chunk = await ffmpeg_proc.stdout.read(_CHUNK_BYTES)
                     if not chunk:
                         break
-                    write_err = await loop.run_in_executor(
-                        None, lambda c=chunk: pa_simple_write(pa_stream, c)
-                    )
-                    if write_err is not None:
+                    try:
+                        await loop.run_in_executor(
+                            None, lambda c=chunk: pa_stream.write(c)
+                        )
+                    except OSError as exc:
                         self.logger.error(
-                            "PA write error on '%s': %s",
-                            self._sink_name,
-                            pa_strerror(write_err),
+                            "PA write error on '%s': %s", self._sink_name, exc
                         )
                         break
             finally:
@@ -288,18 +257,14 @@ class SPDIFPlayer(Player):
             self.logger.exception("Unexpected error in S/PDIF playback loop")
         finally:
             if pa_stream is not None:
-                # Skip drain on cancellation — stream may be mid-write; free directly.
+                # Skip drain on cancellation — stream may be mid-write; close directly.
                 if not _cancelled:
                     try:
-                        await loop.run_in_executor(
-                            None, lambda s=pa_stream: pa_simple_drain(s)
-                        )
+                        await loop.run_in_executor(None, pa_stream.drain)
                     except Exception:  # noqa: BLE001
                         pass
                 try:
-                    await loop.run_in_executor(
-                        None, lambda s=pa_stream: pa_simple_free(s)
-                    )
+                    await loop.run_in_executor(None, pa_stream.close)
                 except Exception:  # noqa: BLE001
                     pass
             self._attr_playback_state = PlaybackState.IDLE
