@@ -183,6 +183,7 @@ class SPDIFPlayer(Player):
 
         loop = asyncio.get_running_loop()
         pa_stream = None
+        ffmpeg: FFMpeg | None = None
         try:
             pa_stream, err = await loop.run_in_executor(
                 None,
@@ -209,8 +210,10 @@ class SPDIFPlayer(Player):
             extra_output_args = _ffmpeg_encode_args(
                 encoding, source_channels, source_sample_rate
             )
+            # output_format with UNKNOWN content_type only emits -ac/-channel_layout.
+            # All codec+mux args go in extra_output_args to avoid conflicts.
             output_format = AudioFormat(
-                content_type=ContentType.PCM_S16LE,
+                content_type=ContentType.UNKNOWN,
                 sample_rate=_SPDIF_SAMPLE_RATE,
                 bit_depth=16,
                 channels=_SPDIF_CHANNELS,
@@ -220,6 +223,7 @@ class SPDIFPlayer(Player):
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
                 extra_output_args=extra_output_args,
+                collect_log_history=True,
             )
             await ffmpeg.start()
             async for chunk in ffmpeg.iter_chunked(_CHUNK_BYTES):
@@ -241,6 +245,9 @@ class SPDIFPlayer(Player):
             pass
         except Exception:  # noqa: BLE001
             self.logger.exception("Unexpected error in S/PDIF playback loop")
+            if ffmpeg is not None and hasattr(ffmpeg, "log_history"):
+                for line in ffmpeg.log_history:
+                    self.logger.error("ffmpeg: %s", line)
         finally:
             if pa_stream is not None:
                 try:
@@ -249,4 +256,10 @@ class SPDIFPlayer(Player):
                     pass
                 await loop.run_in_executor(None, lambda: pa_simple_free(pa_stream))
             self._attr_playback_state = PlaybackState.IDLE
+            if (
+                ffmpeg is not None
+                and hasattr(ffmpeg, "log_history")
+                and ffmpeg.log_history
+            ):
+                self.logger.debug("ffmpeg log: %s", "\n".join(ffmpeg.log_history))
             self.logger.debug("S/PDIF playback loop exited for '%s'", self._sink_name)
