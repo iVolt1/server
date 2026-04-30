@@ -282,7 +282,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(prev_player_id)
 
     async def _position_poll_loop(self) -> None:
-        """Poll go-librespot /status for accurate position updates."""
+        """Poll go-librespot /status and correct position if it drifts significantly."""
         while not self._stop_called and self._active_player_id:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -295,15 +295,29 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 and (track := data.get("track"))
                                 and self._source_details.metadata
                             ):
-                                position_ms = track.get("position", 0)
-                                self._source_details.metadata.elapsed_time = position_ms / 1000
-                                self._source_details.metadata.elapsed_time_last_updated = (
-                                    time.time()
-                                )
-                                if self._active_player_id:
-                                    self.mass.players.trigger_player_update(
-                                        self._active_player_id
+                                actual_position = track.get("position", 0) / 1000
+                                # Calculate what MA thinks the position is right now
+                                meta = self._source_details.metadata
+                                if meta.elapsed_time_last_updated is not None:
+                                    expected_position = (
+                                        meta.elapsed_time
+                                        + (time.time() - meta.elapsed_time_last_updated)
                                     )
+                                else:
+                                    expected_position = meta.elapsed_time or 0
+                                # Only correct if drift exceeds 3 seconds
+                                if abs(actual_position - expected_position) > 3:
+                                    self.logger.debug(
+                                        "Position drift detected: expected=%.1f actual=%.1f, correcting",
+                                        expected_position,
+                                        actual_position,
+                                    )
+                                    meta.elapsed_time = actual_position
+                                    meta.elapsed_time_last_updated = time.time()
+                                    if self._active_player_id:
+                                        self.mass.players.trigger_player_update(
+                                            self._active_player_id
+                                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:
