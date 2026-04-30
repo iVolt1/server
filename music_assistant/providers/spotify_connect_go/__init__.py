@@ -25,6 +25,7 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
+    PlayerFeature,
     ProviderFeature,
     StreamType,
 )
@@ -116,6 +117,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._stop_called: bool = False
         self._runner_task: asyncio.Task | None = None
         self._websocket_task: asyncio.Task | None = None
+        self._position_poll_task: asyncio.Task | None = None
         self._go_librespot_proc: AsyncProcess | None = None
         self._go_librespot_started = asyncio.Event()
         self.named_pipe = f"/tmp/{self.instance_id}"  # noqa: S108
@@ -134,7 +136,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             name=self.manifest.name,
             passive=False,
             can_play_pause=True,
-            can_seek=False,
+            can_seek=True,
             can_next_previous=True,
             audio_format=AudioFormat(
                 content_type=ContentType.PCM_S16LE,
@@ -149,6 +151,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             on_pause=self._on_pause_callback,
             on_next=self._on_next_callback,
             on_previous=self._on_previous_callback,
+            on_seek=self._on_seek_callback,
             on_volume=self._on_volume_callback,
             on_select=self._on_source_selected,
         )
@@ -165,6 +168,14 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Return the features supported by this Provider."""
         return {ProviderFeature.AUDIO_SOURCE}
 
+    def _add_seek_to_player(self, player_id: str) -> None:
+        """Add PlayerFeature.SEEK to a player and invalidate its state cache."""
+        player = self.mass.players.get_player(player_id)
+        if player and PlayerFeature.SEEK not in player._attr_supported_features:
+            player._attr_supported_features.add(PlayerFeature.SEEK)
+            player.update_state()
+            self.logger.debug("Added PlayerFeature.SEEK to player %s", player_id)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not os.path.exists(self._go_librespot_bin):
@@ -174,11 +185,17 @@ class SpotifyConnectGoProvider(PluginProvider):
         os.makedirs(self.config_dir, exist_ok=True)
         self.player = self.mass.players.get_player(self.mass_player_id)
         if self.player:
+            self._add_seek_to_player(self.mass_player_id)
+            if group_id := getattr(self.player, "active_group", None):
+                self._add_seek_to_player(group_id)
             self._setup_player_daemon()
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         self._stop_called = True
+        if self._position_poll_task and not self._position_poll_task.done():
+            self._position_poll_task.cancel()
+            self._position_poll_task = None
         if self._ws_connection:
             await self._ws_connection.close()
         if self._ws_session:
@@ -223,6 +240,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
+        self._add_seek_to_player(new_player_id)
+        # Start position polling for accurate progress bar
+        if self._position_poll_task and not self._position_poll_task.done():
+            self._position_poll_task.cancel()
+        self._position_poll_task = self.mass.create_task(self._position_poll_loop())
 
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
@@ -231,11 +253,43 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._source_details.in_use_by = None
         self._source_details.metadata = None
         self._current_track_uri = None
+        if self._position_poll_task and not self._position_poll_task.done():
+            self._position_poll_task.cancel()
+            self._position_poll_task = None
         if prev_player_id:
             self.logger.debug(
                 "Playback ended on player %s, clearing active player", prev_player_id
             )
             self.mass.players.trigger_player_update(prev_player_id)
+
+    async def _position_poll_loop(self) -> None:
+        """Poll go-librespot /status for accurate position updates."""
+        while not self._stop_called and self._active_player_id:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{self._api_base_url}/status") as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if (
+                                not data.get("stopped")
+                                and not data.get("paused")
+                                and (track := data.get("track"))
+                                and self._source_details.metadata
+                            ):
+                                position_ms = track.get("position", 0)
+                                self._source_details.metadata.elapsed_time = position_ms / 1000
+                                self._source_details.metadata.elapsed_time_last_updated = (
+                                    time.time()
+                                )
+                                if self._active_player_id:
+                                    self.mass.players.trigger_player_update(
+                                        self._active_player_id
+                                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug("Position poll error: %s", e)
+            await asyncio.sleep(1)
 
     async def _on_play_callback(self) -> None:
         """Called by MA when play is requested."""
@@ -252,6 +306,18 @@ class SpotifyConnectGoProvider(PluginProvider):
     async def _on_previous_callback(self) -> None:
         """Called by MA when previous track is requested."""
         await self._send_api_command("player/prev", method="POST")
+
+    async def _on_seek_callback(self, position: int) -> None:
+        """Called by MA when seek is requested (position in seconds)."""
+        self.logger.debug("Seek requested to position: %s seconds", position)
+        position_ms = int(position * 1000)
+        await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
+        # Update metadata immediately so bar jumps to new position
+        if self._source_details.metadata:
+            self._source_details.metadata.elapsed_time = position
+            self._source_details.metadata.elapsed_time_last_updated = time.time()
+        if self._active_player_id:
+            self.mass.players.trigger_player_update(self._active_player_id)
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Volume is handled by MA at the player level, not go-librespot."""
