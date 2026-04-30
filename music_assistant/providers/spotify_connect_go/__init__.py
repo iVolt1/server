@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 CONF_MASS_PLAYER_ID = "mass_player_id"
 CONF_SERVER_PORT = "server_port"
+CONF_EXTERNAL_VOLUME = "external_volume"
 CONNECT_ITEM_ID = "spotify_connect_go"
 
 # Default server port for go-librespot web interface
@@ -88,6 +89,18 @@ async def get_config_entries(
             required=False,
         ),
         ConfigEntry(
+            key=CONF_EXTERNAL_VOLUME,
+            type=ConfigEntryType.BOOLEAN,
+            label="External Volume Control",
+            description=(
+                "When enabled, volume is controlled by Music Assistant at the player level "
+                "(recommended for sync groups). When disabled, the Spotify app volume slider "
+                "controls playback volume."
+            ),
+            default_value=True,
+            required=False,
+        ),
+        ConfigEntry(
             key="metadata_delay",
             type=ConfigEntryType.FLOAT,
             label="Metadata Delay (seconds)",
@@ -110,6 +123,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.mass_player_id = cast("str", self.config.get_value(CONF_MASS_PLAYER_ID))
         self.server_port = cast(
             "int", self.config.get_value(CONF_SERVER_PORT) or DEFAULT_SERVER_PORT
+        )
+        self.external_volume = cast(
+            "bool",
+            self.config.get_value(CONF_EXTERNAL_VOLUME)
+            if self.config.get_value(CONF_EXTERNAL_VOLUME) is not None
+            else True,
         )
         self.cache_dir = os.path.join(self.mass.cache_path, self.instance_id)
         self.config_dir = os.path.join(self.cache_dir, "config")
@@ -311,8 +330,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Called by MA when seek is requested (position in seconds)."""
         self.logger.debug("Seek requested to position: %s seconds", position)
         position_ms = int(position * 1000)
-        await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
-        # Update metadata immediately so bar jumps to new position
+        await self._send_api_json("player/seek", {"position": position_ms})
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
@@ -320,8 +338,10 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(self._active_player_id)
 
     async def _on_volume_callback(self, volume: int) -> None:
-        """Volume is handled by MA at the player level, not go-librespot."""
-        pass
+        """Called by MA when volume change is requested."""
+        if not self.external_volume:
+            # When external_volume is False, forward MA volume changes to go-librespot
+            await self._send_api_json("player/volume", {"volume": volume})
 
     # ---------------------------------------------------------------------------
     # go-librespot API
@@ -368,6 +388,30 @@ class SpotifyConnectGoProvider(PluginProvider):
         except Exception as e:
             self.logger.error("Failed to send API command %s: %s", endpoint, e)
 
+    async def _send_api_json(self, endpoint: str, payload: dict) -> None:
+        """Send a JSON POST request to the go-librespot API."""
+        url = f"{self._api_base_url}/{endpoint}"
+        self.logger.debug("Sending JSON POST to %s: %s", url, payload)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as response:
+                    response_text = await response.text()
+                    self.logger.debug(
+                        "API response (%s): %s - %s",
+                        response.status,
+                        endpoint,
+                        response_text,
+                    )
+                    if response.status != 200:
+                        self.logger.error(
+                            "API command failed: %s - Status: %s - Response: %s",
+                            endpoint,
+                            response.status,
+                            response_text,
+                        )
+        except Exception as e:
+            self.logger.error("Failed to send API JSON command %s: %s", endpoint, e)
+
     # ---------------------------------------------------------------------------
     # go-librespot process management
     # ---------------------------------------------------------------------------
@@ -403,7 +447,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             "bitrate": 320,
             "volume_steps": 100,
             "initial_volume": 100,
-            "external_volume": True,
+            "external_volume": self.external_volume,
             "disable_autoplay": False,
         }
         with open(config_path, "w") as f:
