@@ -277,7 +277,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Called by MA when seek is requested (position in seconds)."""
         self.logger.info("SEEK CALLBACK CALLED with position: %s", position)
         position_ms = int(position * 1000)
-        await self._send_api_command(f"player/seek?position={position_ms}", method="PUT")
+        await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
