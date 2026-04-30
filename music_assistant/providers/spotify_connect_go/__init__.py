@@ -231,6 +231,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         prev_player_id = self._active_player_id
         self._active_player_id = None
         self._source_details.in_use_by = None
+        self._source_details.metadata = None
         self._current_track_uri = None
         if prev_player_id:
             self.logger.debug(
@@ -256,8 +257,14 @@ class SpotifyConnectGoProvider(PluginProvider):
 
     async def _on_seek_callback(self, position: int) -> None:
         """Called by MA when seek is requested (position in seconds)."""
-        position_ms = position * 1000
+        position_ms = int(position * 1000)
         await self._send_api_command(f"player/seek?position={position_ms}", method="PUT")
+        # Update local metadata position immediately so the bar reflects the seek
+        if self._source_details.metadata:
+            self._source_details.metadata.elapsed_time = position
+            self._source_details.metadata.elapsed_time_last_updated = time.time()
+        if self._active_player_id:
+            self.mass.players.trigger_player_update(self._active_player_id)
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Volume is handled by MA at the player level, not go-librespot."""
@@ -277,7 +284,10 @@ class SpotifyConnectGoProvider(PluginProvider):
                     async with session.post(url) as response:
                         response_text = await response.text()
                         self.logger.debug(
-                            "API response (%s): %s - %s", response.status, endpoint, response_text
+                            "API response (%s): %s - %s",
+                            response.status,
+                            endpoint,
+                            response_text,
                         )
                         if response.status != 200:
                             self.logger.error(
@@ -290,7 +300,10 @@ class SpotifyConnectGoProvider(PluginProvider):
                     async with session.put(url) as response:
                         response_text = await response.text()
                         self.logger.debug(
-                            "API response (%s): %s - %s", response.status, endpoint, response_text
+                            "API response (%s): %s - %s",
+                            response.status,
+                            endpoint,
+                            response_text,
                         )
                         if response.status != 200:
                             self.logger.error(
@@ -399,7 +412,9 @@ class SpotifyConnectGoProvider(PluginProvider):
                 except Exception as e:
                     if i < max_retries - 1:
                         self.logger.debug(
-                            "Waiting for go-librespot to start (attempt %d/%d)", i + 1, max_retries
+                            "Waiting for go-librespot to start (attempt %d/%d)",
+                            i + 1,
+                            max_retries,
                         )
                         await asyncio.sleep(1)
                     else:
@@ -412,7 +427,9 @@ class SpotifyConnectGoProvider(PluginProvider):
 
             stderr_task = self.mass.create_task(self._read_stderr_output(go_librespot))
             return_code = await go_librespot.wait()
-            self.logger.info("go-librespot process exited with return code: %s", return_code)
+            self.logger.info(
+                "go-librespot process exited with return code: %s", return_code
+            )
             stderr_task.cancel()
             with suppress(asyncio.CancelledError):
                 await stderr_task
@@ -428,7 +445,9 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._pipe_fd = None
             if self._go_librespot_proc:
                 await self._go_librespot_proc.close()
-            self.logger.info("Spotify Connect Go background daemon stopped for %s", self.name)
+            self.logger.info(
+                "Spotify Connect Go background daemon stopped for %s", self.name
+            )
             await check_output("rm", "-f", self.named_pipe)
 
             if not self._go_librespot_started.is_set():
@@ -521,6 +540,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                         self.logger.debug("Track restart detected - resetting position to 0")
                         if self._source_details.metadata:
                             self._source_details.metadata.elapsed_time = 0
+                            self._source_details.metadata.elapsed_time_last_updated = time.time()
 
             if not self._source_details.in_use_by:
                 self.logger.info("Selecting source on player %s", self.mass_player_id)
@@ -528,46 +548,53 @@ class SpotifyConnectGoProvider(PluginProvider):
 
         elif event_type in ("playback_paused", "paused", "inactive"):
             self.logger.debug("Playback paused")
-            if self._source_details.in_use_by:
-                player = self.mass.players.get_player(self._source_details.in_use_by)
-                if player:
-                    if data := event_data.get("data", {}):
-                        if "position" in data:
-                            position_sec = data.get("position") / 1000
-                            if self._source_details.metadata:
-                                self._source_details.metadata.elapsed_time = position_sec
+            if self._source_details.metadata:
+                if data := event_data.get("data", {}):
+                    if "position" in data:
+                        position_sec = data.get("position") / 1000
+                        self._source_details.metadata.elapsed_time = position_sec
+                # Freeze progress by clearing elapsed_time_last_updated
+                self._source_details.metadata.elapsed_time_last_updated = None
+                if self._active_player_id:
+                    self.mass.players.trigger_player_update(self._active_player_id)
 
         elif event_type in ("stopped", "session_disconnected"):
             self.logger.info("Playback stopped/disconnected event: %s", event_type)
-            if event_type == "session_disconnected":
-                self.logger.info("Session disconnected - clearing everything")
-                self._source_details.metadata = None
             self._clear_active_player()
-
-        elif event_type == "volume":
-            volume = event_data.get("data", {}).get("value", 0)
-            self.logger.debug("go-librespot volume event ignored (MA handles volume): %d", volume)
 
         elif event_type == "not_playing":
             self.logger.debug("Playback ended (not_playing)")
             self._clear_active_player()
+
+        elif event_type == "volume":
+            volume = event_data.get("data", {}).get("value", 0)
+            self.logger.debug(
+                "go-librespot volume event ignored (MA handles volume): %d", volume
+            )
 
         elif event_type in ("seek", "seeked", "position_correction"):
             if data := event_data.get("data", {}):
                 if "position" in data:
                     position_ms = data.get("position")
                     position_sec = position_ms / 1000
+                    # Ignore stale position updates for a different track
                     current_uri = data.get("uri", "")
                     if current_uri and current_uri != self._current_track_uri:
-                        self.logger.debug("Position update has different URI - ignoring stale data")
+                        self.logger.debug(
+                            "Position update has different URI - ignoring stale data"
+                        )
                         return
                     if self._source_details.metadata:
+                        # Cap to duration
                         if (
                             self._source_details.metadata.duration
                             and position_sec > self._source_details.metadata.duration
                         ):
                             position_sec = self._source_details.metadata.duration
                         self._source_details.metadata.elapsed_time = position_sec
+                        self._source_details.metadata.elapsed_time_last_updated = time.time()
+                    if self._active_player_id:
+                        self.mass.players.trigger_player_update(self._active_player_id)
                     self.logger.debug("Updated position to %s seconds", position_sec)
 
         elif event_type == "preload_next":
@@ -581,7 +608,9 @@ class SpotifyConnectGoProvider(PluginProvider):
 
         elif event_type == "session_client_changed":
             if data := event_data.get("data", {}):
-                self.logger.info("Control client changed to: %s", data.get("client_name", "Unknown"))
+                self.logger.info(
+                    "Control client changed to: %s", data.get("client_name", "Unknown")
+                )
 
         elif event_type == "loading":
             self.logger.debug("Loading track...")
@@ -611,55 +640,58 @@ class SpotifyConnectGoProvider(PluginProvider):
         if artist_names := track_info.get("artist_names"):
             if isinstance(artist_names, list) and artist_names:
                 artist = (
-                    artist_names[0] if isinstance(artist_names[0], str) else str(artist_names[0])
+                    artist_names[0]
+                    if isinstance(artist_names[0], str)
+                    else str(artist_names[0])
                 )
             elif isinstance(artist_names, str):
                 artist = artist_names
 
         album_name = track_info.get("album_name", "Unknown")
         image_url = track_info.get("album_cover_url")
-        duration = track_info.get("duration")
 
         self.logger.info(
             "Creating PlayerMedia: title=%s, artist=%s, album=%s", title, artist, album_name
         )
-        
+
+        # Build PlayerMedia — duration set separately after ms->s conversion
         media = PlayerMedia(
             uri=track_uri.replace("spotify:", "spotifyconnect:"),
             title=title,
             artist=artist,
             album=album_name,
             media_type=MediaType.TRACK,
-            duration=duration,
             can_seek=True,
         )
 
         if image_url:
             media.image_url = image_url
 
-        if duration := track_info.get("duration"):
-            media.duration = duration / 1000
+        # Duration comes in milliseconds from go-librespot
+        if raw_duration := track_info.get("duration"):
+            media.duration = raw_duration / 1000
+            self.logger.debug("Track duration: %s seconds", media.duration)
 
+        # Set elapsed time and start the progress clock
         if is_new_track:
             reported_position = (
                 track_info.get("position", 0) / 1000 if "position" in track_info else 0
             )
             if reported_position > 5:
                 media.elapsed_time = reported_position
-                media.elapsed_time_last_updated = time.time()
                 self.logger.info(
                     "Reconnecting to track at position: %s seconds", reported_position
                 )
             else:
                 media.elapsed_time = 0
-                media.elapsed_time_last_updated = time.time()
-                self.logger.info("New track - forcing elapsed_time to 0")
+                self.logger.info("New track - starting from 0")
         elif "position" in track_info:
             media.elapsed_time = track_info.get("position") / 1000
-            media.elapsed_time_last_updated = time.time()
         else:
             media.elapsed_time = 0
-            media.elapsed_time_last_updated = time.time()
+
+        # Always set the timestamp so MA's progress bar starts advancing
+        media.elapsed_time_last_updated = time.time()
 
         if track_number := track_info.get("track_number"):
             media.track_number = track_number
@@ -670,6 +702,10 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.logger.info(
             "Updated source metadata: %s - %s (uri: %s)", media.title, media.artist, media.uri
         )
+
+        # Notify MA of the metadata update
+        if self._active_player_id:
+            self.mass.players.trigger_player_update(self._active_player_id)
 
     # ---------------------------------------------------------------------------
     # Player daemon management
