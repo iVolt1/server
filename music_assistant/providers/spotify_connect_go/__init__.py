@@ -302,28 +302,27 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 and self._source_details.metadata
                             ):
                                 actual_position = track.get("position", 0) / 1000
-                                # Skip if position equals or exceeds duration (track ending)
-                                if meta.duration and actual_position >= meta.duration:
-                                    continue
                                 meta = self._source_details.metadata
-                                # Calculate what MA thinks the position is right now
-                                if meta.elapsed_time_last_updated is not None:
-                                    expected_position = (
-                                        (meta.elapsed_time or 0)
-                                        + (time.time() - meta.elapsed_time_last_updated)
-                                    )
-                                else:
-                                    expected_position = meta.elapsed_time or 0
-                                # Only correct if drift exceeds 3 seconds
-                                if abs(actual_position - expected_position) > 3:
-                                    self.logger.debug(
-                                        "Position drift: expected=%.1f actual=%.1f, correcting",
-                                        expected_position,
-                                        actual_position,
-                                    )
-                                    meta.elapsed_time = actual_position
-                                    meta.elapsed_time_last_updated = time.time()
-                                    self._trigger_update()
+                                # Skip if position equals or exceeds duration (track ending)
+                                if not (meta.duration and actual_position >= meta.duration):
+                                    # Calculate what MA thinks the position is right now
+                                    if meta.elapsed_time_last_updated is not None:
+                                        expected_position = (
+                                            (meta.elapsed_time or 0)
+                                            + (time.time() - meta.elapsed_time_last_updated)
+                                        )
+                                    else:
+                                        expected_position = meta.elapsed_time or 0
+                                    # Only correct if drift exceeds 3 seconds
+                                    if abs(actual_position - expected_position) > 3:
+                                        self.logger.debug(
+                                            "Position drift: expected=%.1f actual=%.1f, correcting",
+                                            expected_position,
+                                            actual_position,
+                                        )
+                                        meta.elapsed_time = actual_position
+                                        meta.elapsed_time_last_updated = time.time()
+                                        self._trigger_update()
             except asyncio.CancelledError:
                 break
             except Exception as e:
