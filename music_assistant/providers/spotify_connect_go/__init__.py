@@ -603,6 +603,9 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
 
         elif event_type in ("seek", "seeked", "position_correction"):
+            self.logger.debug("SEEK EVENT RAW DATA: %s", event_data)
+            self.logger.debug("SEEK EVENT RAW: uri=%s, position=%s, our_uri=%s", 
+            data.get("uri"), data.get("position"), self._current_track_uri)
             if data := event_data.get("data", {}):
                 if "position" in data:
                     position_ms = data.get("position")
