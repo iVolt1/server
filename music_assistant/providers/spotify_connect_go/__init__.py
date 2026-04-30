@@ -623,7 +623,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.logger.info(
             "Creating PlayerMedia: title=%s, artist=%s, album=%s", title, artist, album_name
         )
-
+        
         media = PlayerMedia(
             uri=track_uri.replace("spotify:", "spotifyconnect:"),
             title=title,
@@ -631,6 +631,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             album=album_name,
             media_type=MediaType.TRACK,
             duration=duration,
+            can_seek=True,
         )
 
         if image_url:
@@ -645,16 +646,20 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
             if reported_position > 5:
                 media.elapsed_time = reported_position
+                media.elapsed_time_last_updated = time.time()
                 self.logger.info(
                     "Reconnecting to track at position: %s seconds", reported_position
                 )
             else:
                 media.elapsed_time = 0
+                media.elapsed_time_last_updated = time.time()
                 self.logger.info("New track - forcing elapsed_time to 0")
         elif "position" in track_info:
             media.elapsed_time = track_info.get("position") / 1000
+            media.elapsed_time_last_updated = time.time()
         else:
             media.elapsed_time = 0
+            media.elapsed_time_last_updated = time.time()
 
         if track_number := track_info.get("track_number"):
             media.track_number = track_number
