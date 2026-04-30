@@ -167,6 +167,14 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Return the features supported by this Provider."""
         return {ProviderFeature.AUDIO_SOURCE}
 
+    def _add_seek_to_player(self, player_id: str) -> None:
+        """Add PlayerFeature.SEEK to a player and invalidate its state cache."""
+        player = self.mass.players.get_player(player_id)
+        if player and PlayerFeature.SEEK not in player._attr_supported_features:
+            player._attr_supported_features.add(PlayerFeature.SEEK)
+            player.update_state()
+            self.logger.debug("Added PlayerFeature.SEEK to player %s", player_id)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not os.path.exists(self._go_librespot_bin):
@@ -175,8 +183,11 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
         os.makedirs(self.config_dir, exist_ok=True)
         self.player = self.mass.players.get_player(self.mass_player_id)
-        self.player._attr_supported_features.add(PlayerFeature.SEEK)
         if self.player:
+            self._add_seek_to_player(self.mass_player_id)
+            # Also add to active group if player is already part of one
+            if group_id := self.player.active_group:
+                self._add_seek_to_player(group_id)
             self._setup_player_daemon()
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -227,6 +238,8 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
+        # Ensure the active player has PlayerFeature.SEEK so the progress bar is enabled
+        self._add_seek_to_player(new_player_id)
 
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
@@ -663,7 +676,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             artist=artist,
             album=album_name,
             media_type=MediaType.TRACK,
-            can_seek=True,
         )
 
         if image_url:
