@@ -131,6 +131,8 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._metadata_update_task: asyncio.Task | None = None
 
         # Create the source details
+        # Using OGG passthrough mode - go-librespot outputs raw Ogg Vorbis
+        # which FFmpeg can handle natively including seek positions
         self._source_details = PluginSource(
             id=self.instance_id,
             name=self.manifest.name,
@@ -139,8 +141,8 @@ class SpotifyConnectGoProvider(PluginProvider):
             can_seek=True,
             can_next_previous=True,
             audio_format=AudioFormat(
-                content_type=ContentType.PCM_S16LE,
-                codec_type=ContentType.PCM_S16LE,
+                content_type=ContentType.OGG,
+                bit_rate=320000,
                 sample_rate=44100,
                 bit_depth=16,
                 channels=2,
@@ -274,25 +276,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.logger.debug("Seek requested to position: %s seconds", position)
         position_ms = int(position * 1000)
         self._seek_in_progress = True
-
-        # First seek go-librespot to the new position
         await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
-
-        # Update metadata position immediately
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
-
-        # Deselect then reselect source to force MA to restart streaming
-        # from the new position in the pipe
         if self._active_player_id:
-            with suppress(Exception):
-                await self.mass.players.deselect_source(self._active_player_id)
-            await asyncio.sleep(0.3)
-            await self.mass.players.select_source(
-                self._active_player_id, self.instance_id
-            )
-
+            self.mass.players.trigger_player_update(self._active_player_id)
         await asyncio.sleep(2)
         self._seek_in_progress = False
 
@@ -374,7 +363,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             "audio_backend": "pipe",
             "audio_device": "",
             "audio_output_pipe": self.named_pipe,
-            "audio_output_pipe_format": "s16le",
             "audio_buffer_time": 50000,
             "audio_period_count": 4,
             "bitrate": 320,
@@ -419,6 +407,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._go_librespot_bin,
                 "--config_dir",
                 self.config_dir,
+                "--passthrough",
             ]
             self.logger.debug("Starting go-librespot with args: %s", " ".join(args))
             self._go_librespot_proc = go_librespot = AsyncProcess(
@@ -628,7 +617,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
 
         elif event_type in ("seek", "seeked", "position_correction"):
-            data = event_data.get("data", {}) or {}
             # go-librespot always reports position=0 in seek events so we ignore the position
             # _on_seek_callback already set the correct elapsed_time
             self._seek_in_progress = False
@@ -691,7 +679,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             "Creating PlayerMedia: title=%s, artist=%s, album=%s", title, artist, album_name
         )
 
-        # Build PlayerMedia — duration set separately after ms->s conversion
         media = PlayerMedia(
             uri=track_uri.replace("spotify:", "spotifyconnect:"),
             title=title,
@@ -739,7 +726,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             "Updated source metadata: %s - %s (uri: %s)", media.title, media.artist, media.uri
         )
 
-        # Notify MA of the metadata update
         if self._active_player_id:
             self.mass.players.trigger_player_update(self._active_player_id)
 
