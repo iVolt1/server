@@ -709,6 +709,16 @@ class SpotifyConnectGoProvider(PluginProvider):
                 "go-librespot volume event ignored (MA handles volume): %d", volume
             )
 
+        elif event_type in ("seek", "seeked", "position_correction"):
+            if data := event_data.get("data", {}):
+                if "position" in data:
+                    position_sec = data.get("position") / 1000
+                    if self._source_details.metadata:
+                        self._source_details.metadata.elapsed_time = position_sec
+                        self._source_details.metadata.elapsed_time_last_updated = time.time()
+                    self._trigger_update()
+                    self.logger.debug("Seek confirmed at position: %.1f seconds", position_sec)
+                    
         elif event_type == "end_of_track":
             self.logger.debug("Track ended")
 
