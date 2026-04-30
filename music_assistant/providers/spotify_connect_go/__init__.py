@@ -127,6 +127,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._pipe_fd: int | None = None
         self._active_player_id: str | None = None
         self._current_track_uri: str | None = None
+        self._seek_in_progress: bool = False
         self._metadata_update_task: asyncio.Task | None = None
 
         # Create the source details
@@ -185,7 +186,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.player = self.mass.players.get_player(self.mass_player_id)
         if self.player:
             self._add_seek_to_player(self.mass_player_id)
-            # Also add to active group if player is already part of one            
             if group_id := getattr(self.player, "active_group", None):
                 self._add_seek_to_player(group_id)
             self._setup_player_daemon()
@@ -237,11 +237,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
-        self.logger.info(
-            "SEEK DEBUG - in_use_by: %s, active_player: %s",
-            self._source_details.in_use_by,
-            self._active_player_id,
-        )
         self._add_seek_to_player(new_player_id)
 
     def _clear_active_player(self) -> None:
@@ -251,6 +246,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._source_details.in_use_by = None
         self._source_details.metadata = None
         self._current_track_uri = None
+        self._seek_in_progress = False
         if prev_player_id:
             self.logger.debug(
                 "Playback ended on player %s, clearing active player", prev_player_id
@@ -275,14 +271,18 @@ class SpotifyConnectGoProvider(PluginProvider):
 
     async def _on_seek_callback(self, position: int) -> None:
         """Called by MA when seek is requested (position in seconds)."""
-        self.logger.info("SEEK CALLBACK CALLED with position: %s", position)
+        self.logger.debug("Seek requested to position: %s seconds", position)
         position_ms = int(position * 1000)
+        self._seek_in_progress = True
         await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
         if self._active_player_id:
             self.mass.players.trigger_player_update(self._active_player_id)
+        # Clear seek flag after delay to suppress position-reset events from go-librespot
+        await asyncio.sleep(2)
+        self._seek_in_progress = False
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Volume is handled by MA at the player level, not go-librespot."""
@@ -471,7 +471,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         if not self._go_librespot_started.is_set():
             self.unload_with_error("Unable to initialize go-librespot daemon.")
             return
-   
+
         if not self._stop_called and self._go_librespot_started.is_set():
             self.logger.warning(
                 "go-librespot exited unexpectedly, restarting in 5 seconds..."
@@ -555,10 +555,17 @@ class SpotifyConnectGoProvider(PluginProvider):
                 elif not is_resume and "uri" in data:
                     track_uri = data.get("uri", "")
                     if track_uri == self._current_track_uri:
-                        self.logger.debug("Track restart detected - resetting position to 0")
-                        if self._source_details.metadata:
-                            self._source_details.metadata.elapsed_time = 0
-                            self._source_details.metadata.elapsed_time_last_updated = time.time()
+                        if self._seek_in_progress:
+                            self.logger.debug(
+                                "Track restart event during seek - ignoring position reset"
+                            )
+                        else:
+                            self.logger.debug("Track restart detected - resetting position to 0")
+                            if self._source_details.metadata:
+                                self._source_details.metadata.elapsed_time = 0
+                                self._source_details.metadata.elapsed_time_last_updated = (
+                                    time.time()
+                                )
 
             if not self._source_details.in_use_by:
                 self.logger.info("Selecting source on player %s", self.mass_player_id)
@@ -583,13 +590,19 @@ class SpotifyConnectGoProvider(PluginProvider):
             else:
                 # Delay clearing on 'stopped' to handle Spotify Connect transfer sequences
                 # where go-librespot briefly stops before restarting on the new device
+                stopped_player_id = self._active_player_id
+
                 async def _delayed_clear() -> None:
                     await asyncio.sleep(3)
-                    # Only clear if we haven't started playing again
-                    if not self._source_details.in_use_by:
+                    if self._active_player_id != stopped_player_id:
+                        self.logger.debug("New playback started during stop delay - not clearing")
+                        return
+                    if self._current_track_uri:
+                        self.logger.debug("Track still active during stop delay - not clearing")
                         return
                     self.logger.debug("Clearing active player after stop delay")
                     self._clear_active_player()
+
                 self.mass.create_task(_delayed_clear())
 
         elif event_type == "not_playing":
@@ -604,18 +617,12 @@ class SpotifyConnectGoProvider(PluginProvider):
 
         elif event_type in ("seek", "seeked", "position_correction"):
             data = event_data.get("data", {}) or {}
-            self.logger.debug("SEEK EVENT RAW DATA: %s", event_data)
-            if "position" in data:
-                position_sec = data.get("position") / 1000
-                current_uri = data.get("uri", "")
-                if current_uri and current_uri != self._current_track_uri:
-                    self.logger.debug("Position update has different URI - ignoring stale data")
-                    return
-                # go-librespot always reports position=0 in seek events
-                # so we skip updating elapsed_time here - _on_seek_callback already set it
-                if self._active_player_id:
-                    self.mass.players.trigger_player_update(self._active_player_id)
-                self.logger.debug("Seek event received, position reported: %s seconds", position_sec)
+            # go-librespot always reports position=0 in seek events so we ignore the position
+            # _on_seek_callback already set the correct elapsed_time
+            self._seek_in_progress = False
+            if self._active_player_id:
+                self.mass.players.trigger_player_update(self._active_player_id)
+            self.logger.debug("Seek confirmed by go-librespot")
 
         elif event_type == "end_of_track":
             self.logger.debug("Track ended")
@@ -651,6 +658,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         if is_new_track:
             self.logger.info("New track detected: %s", track_uri)
             self._current_track_uri = track_uri
+            self._seek_in_progress = False
 
         title = track_info.get("name", "Unknown")
         artist = "Unknown"
