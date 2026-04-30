@@ -468,16 +468,16 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
             await check_output("rm", "-f", self.named_pipe)
 
-            if not self._go_librespot_started.is_set():
-                self.unload_with_error("Unable to initialize go-librespot daemon.")
-                return
-
-            if not self._stop_called and self._go_librespot_started.is_set():
-                self.logger.warning(
-                    "go-librespot exited unexpectedly, restarting in 5 seconds..."
-                )
-                await asyncio.sleep(5)
-                self._setup_player_daemon()
+        if not self._go_librespot_started.is_set():
+            self.unload_with_error("Unable to initialize go-librespot daemon.")
+            return
+   
+        if not self._stop_called and self._go_librespot_started.is_set():
+            self.logger.warning(
+                "go-librespot exited unexpectedly, restarting in 5 seconds..."
+            )
+            await asyncio.sleep(5)
+            self._setup_player_daemon()
 
     async def _read_stderr_output(self, process: AsyncProcess) -> None:
         """Read stderr output from go-librespot process."""
@@ -603,35 +603,19 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
 
         elif event_type in ("seek", "seeked", "position_correction"):
+            data = event_data.get("data", {}) or {}
             self.logger.debug("SEEK EVENT RAW DATA: %s", event_data)
-            self.logger.debug("SEEK EVENT RAW: uri=%s, position=%s, our_uri=%s", 
-            data.get("uri"), data.get("position"), self._current_track_uri)
-            if data := event_data.get("data", {}):
-                if "position" in data:
-                    position_ms = data.get("position")
-                    position_sec = position_ms / 1000
-                    # Ignore stale position updates for a different track
-                    current_uri = data.get("uri", "")
-                    if current_uri and current_uri != self._current_track_uri:
-                        self.logger.debug(
-                            "Position update has different URI - ignoring stale data"
-                        )
-                        return
-                    if self._source_details.metadata:
-                        # Cap to duration
-                        if (
-                            self._source_details.metadata.duration
-                            and position_sec > self._source_details.metadata.duration
-                        ):
-                            position_sec = self._source_details.metadata.duration
-                        self._source_details.metadata.elapsed_time = position_sec
-                        self._source_details.metadata.elapsed_time_last_updated = time.time()
-                    if self._active_player_id:
-                        self.mass.players.trigger_player_update(self._active_player_id)
-                    self.logger.debug("Updated position to %s seconds", position_sec)
-
-        elif event_type == "preload_next":
-            self.logger.debug("Preloading next track")
+            if "position" in data:
+                position_sec = data.get("position") / 1000
+                current_uri = data.get("uri", "")
+                if current_uri and current_uri != self._current_track_uri:
+                    self.logger.debug("Position update has different URI - ignoring stale data")
+                    return
+                # go-librespot always reports position=0 in seek events
+                # so we skip updating elapsed_time here - _on_seek_callback already set it
+                if self._active_player_id:
+                    self.mass.players.trigger_player_update(self._active_player_id)
+                self.logger.debug("Seek event received, position reported: %s seconds", position_sec)
 
         elif event_type == "end_of_track":
             self.logger.debug("Track ended")
