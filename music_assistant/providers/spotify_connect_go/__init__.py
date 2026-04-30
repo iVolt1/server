@@ -550,6 +550,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.logger.info("go-librespot runner cancelled")
         except Exception as e:
             self.logger.error("Error running go-librespot: %s", e)
+   
         finally:
             if self._pipe_fd is not None:
                 with suppress(OSError):
@@ -557,6 +558,13 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._pipe_fd = None
             if self._go_librespot_proc:
                 await self._go_librespot_proc.close()
+            # Cancel websocket task on crash/restart
+            if self._websocket_task and not self._websocket_task.done():
+                self._websocket_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._websocket_task
+                self._websocket_task = None
+                self._go_librespot_started.clear() 
             self.logger.info(
                 "Spotify Connect Go background daemon stopped for %s", self.name
             )
