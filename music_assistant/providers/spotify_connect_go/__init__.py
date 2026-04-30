@@ -195,6 +195,12 @@ class SpotifyConnectGoProvider(PluginProvider):
             player.update_state()
             self.logger.debug("Added PlayerFeature.SEEK to player %s", player_id)
 
+    def _trigger_update(self) -> None:
+        """Trigger player update on the correct player — the one with in_use_by set."""
+        player_id = self._source_details.in_use_by or self._active_player_id
+        if player_id:
+            self.mass.players.trigger_player_update(player_id)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not os.path.exists(self._go_librespot_bin):
@@ -296,11 +302,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 and self._source_details.metadata
                             ):
                                 actual_position = track.get("position", 0) / 1000
-                                # Calculate what MA thinks the position is right now
                                 meta = self._source_details.metadata
+                                # Calculate what MA thinks the position is right now
                                 if meta.elapsed_time_last_updated is not None:
                                     expected_position = (
-                                        meta.elapsed_time
+                                        (meta.elapsed_time or 0)
                                         + (time.time() - meta.elapsed_time_last_updated)
                                     )
                                 else:
@@ -308,16 +314,13 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 # Only correct if drift exceeds 3 seconds
                                 if abs(actual_position - expected_position) > 3:
                                     self.logger.debug(
-                                        "Position drift detected: expected=%.1f actual=%.1f, correcting",
+                                        "Position drift: expected=%.1f actual=%.1f, correcting",
                                         expected_position,
                                         actual_position,
                                     )
                                     meta.elapsed_time = actual_position
                                     meta.elapsed_time_last_updated = time.time()
-                                    if self._active_player_id:
-                                        self.mass.players.trigger_player_update(
-                                            self._active_player_id
-                                        )
+                                    self._trigger_update()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -348,13 +351,11 @@ class SpotifyConnectGoProvider(PluginProvider):
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
-        if self._active_player_id:
-            self.mass.players.trigger_player_update(self._active_player_id)
+        self._trigger_update()
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Called by MA when volume change is requested."""
         if not self.external_volume:
-            # When external_volume is False, forward MA volume changes to go-librespot
             await self._send_api_json("player/volume", {"volume": volume})
 
     # ---------------------------------------------------------------------------
@@ -666,8 +667,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                         self._source_details.metadata.elapsed_time = position_sec
                 # Freeze progress by clearing elapsed_time_last_updated
                 self._source_details.metadata.elapsed_time_last_updated = None
-                if self._active_player_id:
-                    self.mass.players.trigger_player_update(self._active_player_id)
+                self._trigger_update()
 
         elif event_type in ("stopped", "session_disconnected"):
             self.logger.info("Playback stopped/disconnected event: %s", event_type)
@@ -802,8 +802,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             "Updated source metadata: %s - %s (uri: %s)", media.title, media.artist, media.uri
         )
 
-        if self._active_player_id:
-            self.mass.players.trigger_player_update(self._active_player_id)
+        self._trigger_update()
 
     # ---------------------------------------------------------------------------
     # Player daemon management
