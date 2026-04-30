@@ -302,6 +302,9 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 and self._source_details.metadata
                             ):
                                 actual_position = track.get("position", 0) / 1000
+                                # Skip if position equals or exceeds duration (track ending)
+                                if meta.duration and actual_position >= meta.duration:
+                                    continue
                                 meta = self._source_details.metadata
                                 # Calculate what MA thinks the position is right now
                                 if meta.elapsed_time_last_updated is not None:
@@ -713,6 +716,13 @@ class SpotifyConnectGoProvider(PluginProvider):
             if data := event_data.get("data", {}):
                 if "position" in data:
                     position_sec = data.get("position") / 1000
+                    if self._source_details.metadata:
+                        # Cap to duration to prevent bar sticking at 100%
+                        if (
+                            self._source_details.metadata.duration
+                            and position_sec >= self._source_details.metadata.duration
+                        ):
+                            return
                     if self._source_details.metadata:
                         self._source_details.metadata.elapsed_time = position_sec
                         self._source_details.metadata.elapsed_time_last_updated = time.time()
