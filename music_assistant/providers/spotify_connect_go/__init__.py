@@ -135,10 +135,10 @@ class SpotifyConnectGoProvider(PluginProvider):
             can_seek=True,
             can_next_previous=True,
             audio_format=AudioFormat(
-                content_type=ContentType.PCM_S32LE,
-                codec_type=ContentType.PCM_S32LE,
+                content_type=ContentType.PCM_S16LE,
+                codec_type=ContentType.PCM_S16LE,
                 sample_rate=44100,
-                bit_depth=32,
+                bit_depth=16,
                 channels=2,
             ),
             metadata=PlayerMedia(
@@ -294,7 +294,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             "audio_backend": "pipe",
             "audio_device": "",
             "audio_output_pipe": self.named_pipe,
-            "audio_output_pipe_format": "s32le",
+            "audio_output_pipe_format": "s16le",
             "audio_buffer_time": 50000,  # 500ms in microseconds
             "audio_period_count": 4,
             "bitrate": 320,
