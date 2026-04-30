@@ -274,13 +274,25 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.logger.debug("Seek requested to position: %s seconds", position)
         position_ms = int(position * 1000)
         self._seek_in_progress = True
+
+        # First seek go-librespot to the new position
         await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
+
+        # Update metadata position immediately
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
+
+        # Deselect then reselect source to force MA to restart streaming
+        # from the new position in the pipe
         if self._active_player_id:
-            self.mass.players.trigger_player_update(self._active_player_id)
-        # Clear seek flag after delay to suppress position-reset events from go-librespot
+            with suppress(Exception):
+                await self.mass.players.deselect_source(self._active_player_id)
+            await asyncio.sleep(0.3)
+            await self.mass.players.select_source(
+                self._active_player_id, self.instance_id
+            )
+
         await asyncio.sleep(2)
         self._seek_in_progress = False
 
