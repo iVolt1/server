@@ -25,6 +25,7 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
+    PlayerFeature,
     ProviderFeature,
     StreamType,
 )
@@ -174,6 +175,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             )
         os.makedirs(self.config_dir, exist_ok=True)
         self.player = self.mass.players.get_player(self.mass_player_id)
+        self.player._attr_supported_features.add(PlayerFeature.SEEK)
         if self.player:
             self._setup_player_daemon()
 
