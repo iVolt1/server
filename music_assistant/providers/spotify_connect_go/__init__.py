@@ -25,7 +25,6 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
-    PlayerFeature,
     ProviderFeature,
     StreamType,
 )
@@ -127,22 +126,19 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._pipe_fd: int | None = None
         self._active_player_id: str | None = None
         self._current_track_uri: str | None = None
-        self._seek_in_progress: bool = False
         self._metadata_update_task: asyncio.Task | None = None
 
         # Create the source details
-        # Using OGG passthrough mode - go-librespot outputs raw Ogg Vorbis
-        # which FFmpeg can handle natively including seek positions
         self._source_details = PluginSource(
             id=self.instance_id,
             name=self.manifest.name,
             passive=False,
             can_play_pause=True,
-            can_seek=True,
+            can_seek=False,
             can_next_previous=True,
             audio_format=AudioFormat(
-                content_type=ContentType.OGG,
-                bit_rate=320000,
+                content_type=ContentType.PCM_S16LE,
+                codec_type=ContentType.PCM_S16LE,
                 sample_rate=44100,
                 bit_depth=16,
                 channels=2,
@@ -153,7 +149,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             on_pause=self._on_pause_callback,
             on_next=self._on_next_callback,
             on_previous=self._on_previous_callback,
-            on_seek=self._on_seek_callback,
             on_volume=self._on_volume_callback,
             on_select=self._on_source_selected,
         )
@@ -170,14 +165,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Return the features supported by this Provider."""
         return {ProviderFeature.AUDIO_SOURCE}
 
-    def _add_seek_to_player(self, player_id: str) -> None:
-        """Add PlayerFeature.SEEK to a player and invalidate its state cache."""
-        player = self.mass.players.get_player(player_id)
-        if player and PlayerFeature.SEEK not in player._attr_supported_features:
-            player._attr_supported_features.add(PlayerFeature.SEEK)
-            player.update_state()
-            self.logger.debug("Added PlayerFeature.SEEK to player %s", player_id)
-
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         if not os.path.exists(self._go_librespot_bin):
@@ -187,9 +174,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         os.makedirs(self.config_dir, exist_ok=True)
         self.player = self.mass.players.get_player(self.mass_player_id)
         if self.player:
-            self._add_seek_to_player(self.mass_player_id)
-            if group_id := getattr(self.player, "active_group", None):
-                self._add_seek_to_player(group_id)
             self._setup_player_daemon()
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -239,7 +223,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
-        self._add_seek_to_player(new_player_id)
 
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
@@ -248,7 +231,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._source_details.in_use_by = None
         self._source_details.metadata = None
         self._current_track_uri = None
-        self._seek_in_progress = False
         if prev_player_id:
             self.logger.debug(
                 "Playback ended on player %s, clearing active player", prev_player_id
@@ -270,20 +252,6 @@ class SpotifyConnectGoProvider(PluginProvider):
     async def _on_previous_callback(self) -> None:
         """Called by MA when previous track is requested."""
         await self._send_api_command("player/prev", method="POST")
-
-    async def _on_seek_callback(self, position: int) -> None:
-        """Called by MA when seek is requested (position in seconds)."""
-        self.logger.debug("Seek requested to position: %s seconds", position)
-        position_ms = int(position * 1000)
-        self._seek_in_progress = True
-        await self._send_api_command(f"player/seek?pos={position_ms}", method="POST")
-        if self._source_details.metadata:
-            self._source_details.metadata.elapsed_time = position
-            self._source_details.metadata.elapsed_time_last_updated = time.time()
-        if self._active_player_id:
-            self.mass.players.trigger_player_update(self._active_player_id)
-        await asyncio.sleep(2)
-        self._seek_in_progress = False
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Volume is handled by MA at the player level, not go-librespot."""
@@ -363,6 +331,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             "audio_backend": "pipe",
             "audio_device": "",
             "audio_output_pipe": self.named_pipe,
+            "audio_output_pipe_format": "s16le",
             "audio_buffer_time": 50000,
             "audio_period_count": 4,
             "bitrate": 320,
@@ -407,7 +376,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._go_librespot_bin,
                 "--config_dir",
                 self.config_dir,
-                "--passthrough",
             ]
             self.logger.debug("Starting go-librespot with args: %s", " ".join(args))
             self._go_librespot_proc = go_librespot = AsyncProcess(
@@ -556,17 +524,10 @@ class SpotifyConnectGoProvider(PluginProvider):
                 elif not is_resume and "uri" in data:
                     track_uri = data.get("uri", "")
                     if track_uri == self._current_track_uri:
-                        if self._seek_in_progress:
-                            self.logger.debug(
-                                "Track restart event during seek - ignoring position reset"
-                            )
-                        else:
-                            self.logger.debug("Track restart detected - resetting position to 0")
-                            if self._source_details.metadata:
-                                self._source_details.metadata.elapsed_time = 0
-                                self._source_details.metadata.elapsed_time_last_updated = (
-                                    time.time()
-                                )
+                        self.logger.debug("Track restart detected - resetting position to 0")
+                        if self._source_details.metadata:
+                            self._source_details.metadata.elapsed_time = 0
+                            self._source_details.metadata.elapsed_time_last_updated = time.time()
 
             if not self._source_details.in_use_by:
                 self.logger.info("Selecting source on player %s", self.mass_player_id)
@@ -616,14 +577,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 "go-librespot volume event ignored (MA handles volume): %d", volume
             )
 
-        elif event_type in ("seek", "seeked", "position_correction"):
-            # go-librespot always reports position=0 in seek events so we ignore the position
-            # _on_seek_callback already set the correct elapsed_time
-            self._seek_in_progress = False
-            if self._active_player_id:
-                self.mass.players.trigger_player_update(self._active_player_id)
-            self.logger.debug("Seek confirmed by go-librespot")
-
         elif event_type == "end_of_track":
             self.logger.debug("Track ended")
 
@@ -658,7 +611,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         if is_new_track:
             self.logger.info("New track detected: %s", track_uri)
             self._current_track_uri = track_uri
-            self._seek_in_progress = False
 
         title = track_info.get("name", "Unknown")
         artist = "Unknown"
