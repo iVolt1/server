@@ -185,8 +185,8 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.player = self.mass.players.get_player(self.mass_player_id)
         if self.player:
             self._add_seek_to_player(self.mass_player_id)
-            # Also add to active group if player is already part of one
-            if group_id := self.player.active_group:
+            # Also add to active group if player is already part of one            
+            if group_id := getattr(self.player, "active_group", None):
                 self._add_seek_to_player(group_id)
             self._setup_player_daemon()
 
