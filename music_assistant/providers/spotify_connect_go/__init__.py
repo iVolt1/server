@@ -223,7 +223,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         new_player_id = self._source_details.in_use_by
         if not new_player_id:
             return
-        # If there's already an active player and it's different, stop it
         if self._active_player_id and self._active_player_id != new_player_id:
             self.logger.info(
                 "Source selected on player %s, stopping playback on %s",
@@ -238,7 +237,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
-        # Ensure the active player has PlayerFeature.SEEK so the progress bar is enabled
+        self.logger.info(
+            "SEEK DEBUG - in_use_by: %s, active_player: %s",
+            self._source_details.in_use_by,
+            self._active_player_id,
+        )
         self._add_seek_to_player(new_player_id)
 
     def _clear_active_player(self) -> None:
@@ -272,9 +275,9 @@ class SpotifyConnectGoProvider(PluginProvider):
 
     async def _on_seek_callback(self, position: int) -> None:
         """Called by MA when seek is requested (position in seconds)."""
+        self.logger.info("SEEK CALLBACK CALLED with position: %s", position)
         position_ms = int(position * 1000)
         await self._send_api_command(f"player/seek?position={position_ms}", method="PUT")
-        # Update local metadata position immediately so the bar reflects the seek
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
