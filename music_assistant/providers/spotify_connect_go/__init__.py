@@ -575,7 +575,19 @@ class SpotifyConnectGoProvider(PluginProvider):
 
         elif event_type in ("stopped", "session_disconnected"):
             self.logger.info("Playback stopped/disconnected event: %s", event_type)
-            self._clear_active_player()
+            if event_type == "session_disconnected":
+                self._clear_active_player()
+            else:
+                # Delay clearing on 'stopped' to handle Spotify Connect transfer sequences
+                # where go-librespot briefly stops before restarting on the new device
+                async def _delayed_clear() -> None:
+                    await asyncio.sleep(3)
+                    # Only clear if we haven't started playing again
+                    if not self._source_details.in_use_by:
+                        return
+                    self.logger.debug("Clearing active player after stop delay")
+                    self._clear_active_player()
+                self.mass.create_task(_delayed_clear())
 
         elif event_type == "not_playing":
             self.logger.debug("Playback ended (not_playing)")
