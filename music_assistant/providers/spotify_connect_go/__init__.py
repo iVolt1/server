@@ -206,6 +206,38 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player._attr_elapsed_time_last_updated = updated
             self.mass.players.trigger_player_update(player_id)
 
+    def _register_fake_queue(self, player_id: str) -> None:
+        """Register a synthetic queue entry so the frontend accepts QUEUE_TIME_UPDATED."""
+        player = self.mass.players.get_player(player_id)
+        display_name = player.display_name if player else player_id
+        fake_queue = {
+            "queue_id": player_id,
+            "active": True,
+            "display_name": display_name,
+            "available": True,
+            "items": 1,
+            "shuffle_enabled": False,
+            "repeat_mode": "off",
+            "dont_stop_the_music_enabled": False,
+            "current_index": 0,
+            "index_in_buffer": None,
+            "elapsed_time": self._source_details.metadata.elapsed_time if self._source_details.metadata else 0,
+            "elapsed_time_last_updated": time.time(),
+            "state": "playing",
+            "current_item": None,
+            "next_item": None,
+            "radio_source": [],
+            "flow_mode": False,
+            "resume_pos": 0,
+            "extra_attributes": {},
+        }
+        self.mass.signal_event(
+            EventType.QUEUE_ADDED,
+            object_id=player_id,
+            data=fake_queue,
+        )
+        self.logger.debug("Registered fake queue for player %s", player_id)
+
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
@@ -229,11 +261,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player.update_state(force_update=True)
                 # Signal QUEUE_TIME_UPDATED directly so frontend progress bar updates
                 if self._source_details.metadata.elapsed_time is not None:
-                    self.logger.debug(
-                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: player_id=%s elapsed=%.1f",
-                        player_id,
-                        elapsed,
-                    )
                     self.mass.signal_event(
                         EventType.QUEUE_TIME_UPDATED,
                         object_id=player_id,
@@ -248,11 +275,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
                         group_player.update_state(force_update=True)
-                        self.logger.debug(
-                            "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: group_id=%s elapsed=%.1f",
-                            group_id,
-                            elapsed,
-                        )
                         self.mass.signal_event(
                             EventType.QUEUE_TIME_UPDATED,
                             object_id=group_id,
@@ -352,6 +374,11 @@ class SpotifyConnectGoProvider(PluginProvider):
             new_player_id,
             player.state.active_group if player else "NO PLAYER",
         )
+        # Register a fake queue so the frontend accepts QUEUE_TIME_UPDATED for this player
+        self._register_fake_queue(new_player_id)
+        if player and player.state.active_group:
+            self._register_fake_queue(player.state.active_group)
+
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
         prev_player_id = self._active_player_id
