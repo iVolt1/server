@@ -250,17 +250,24 @@ class SpotifyConnectGoProvider(PluginProvider):
         if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
             if player:
-                if self._source_details.metadata.elapsed_time is not None:
-                    elapsed = self._source_details.metadata.elapsed_time
-                    updated = self._source_details.metadata.elapsed_time_last_updated
+                elapsed = self._source_details.metadata.elapsed_time
+                updated = self._source_details.metadata.elapsed_time_last_updated
+                if elapsed is not None:
                     player._attr_elapsed_time = elapsed
                     player._attr_elapsed_time_last_updated = updated
                     if player._attr_current_media:
                         player._attr_current_media.elapsed_time = elapsed
                         player._attr_current_media.elapsed_time_last_updated = updated
+                else:
+                    self.logger.debug("FORCE_UPDATE: elapsed_time is None, skipping QUEUE_TIME_UPDATED")
                 player.update_state(force_update=True)
                 # Signal QUEUE_TIME_UPDATED directly so frontend progress bar updates
-                if self._source_details.metadata.elapsed_time is not None:
+                if elapsed is not None:
+                    self.logger.debug(
+                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: player_id=%s elapsed=%.1f",
+                        player_id,
+                        elapsed,
+                    )
                     self.mass.signal_event(
                         EventType.QUEUE_TIME_UPDATED,
                         object_id=player_id,
@@ -271,15 +278,21 @@ class SpotifyConnectGoProvider(PluginProvider):
                 if group_id:
                     group_player = self.mass.players.get_player(group_id)
                     if group_player:
-                        if self._source_details.metadata.elapsed_time is not None:
+                        if elapsed is not None:
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
                         group_player.update_state(force_update=True)
-                        self.mass.signal_event(
-                            EventType.QUEUE_TIME_UPDATED,
-                            object_id=group_id,
-                            data=elapsed,
-                        )
+                        if elapsed is not None:
+                            self.logger.debug(
+                                "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: group_id=%s elapsed=%.1f",
+                                group_id,
+                                elapsed,
+                            )
+                            self.mass.signal_event(
+                                EventType.QUEUE_TIME_UPDATED,
+                                object_id=group_id,
+                                data=elapsed,
+                            )
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
         """Debug: check if _attr_elapsed_time was overwritten after force_update."""
         player = self.mass.players.get_player(player_id)
