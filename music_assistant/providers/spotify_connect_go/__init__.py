@@ -208,13 +208,22 @@ class SpotifyConnectGoProvider(PluginProvider):
         if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
             if player:
-                # Update player's raw elapsed_time attributes so they get serialized
-                # correctly in the PLAYER_UPDATED event sent to the frontend
-                player._attr_elapsed_time = self._source_details.metadata.elapsed_time
-                player._attr_elapsed_time_last_updated = (
-                    self._source_details.metadata.elapsed_time_last_updated
-                )
+                elapsed = self._source_details.metadata.elapsed_time
+                updated = self._source_details.metadata.elapsed_time_last_updated
+                # Update raw player attributes so PLAYER_UPDATED event has correct position
+                player._attr_elapsed_time = elapsed
+                player._attr_elapsed_time_last_updated = updated
+                # Also update _attr_current_media if it exists
+                if player._attr_current_media:
+                    player._attr_current_media.elapsed_time = elapsed
+                    player._attr_current_media.elapsed_time_last_updated = updated
                 player.update_state(force_update=True)
+                # Also force group player if in one
+                group_id = getattr(player, "active_group", None)
+                if group_id:
+                    group_player = self.mass.players.get_player(group_id)
+                    if group_player:
+                        group_player.update_state(force_update=True)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
