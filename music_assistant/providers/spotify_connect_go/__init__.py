@@ -207,46 +207,35 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(player_id)
 
     def _register_fake_queue(self, player_id: str) -> None:
-        """Register a synthetic queue entry so the frontend accepts QUEUE_TIME_UPDATED.
+        """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works.
  
-        The frontend resolves activePlayerQueue by looking up active_source (our instance_id)
-        in p.queues, so we must register under instance_id, not player_id.
+        We signal QUEUE_UPDATED for the real player_id queue with active=True.
+        The frontend's activePlayerQueue has two branches:
+          1. active_source in p.queues  → our instance_id (not a real queue, causes play_media errors)
+          2. !active_source && player_id in p.queues && queue.active  → player_id real queue
+        By forcing active=True on the real queue via QUEUE_UPDATED, branch 2 works correctly.
+        We then use player_id for all QUEUE_TIME_UPDATED signals.
         """
         player = self.mass.players.get_player(player_id)
         display_name = player.display_name if player else player_id
-        fake_queue = {
-            "queue_id": self.instance_id,
-            "active": True,
-            "display_name": display_name,
-            "available": True,
-            "items": 1,
-            "shuffle_enabled": False,
-            "repeat_mode": "off",
-            "dont_stop_the_music_enabled": False,
-            "current_index": 0,
-            "index_in_buffer": None,
-            "elapsed_time": self._source_details.metadata.elapsed_time if self._source_details.metadata else 0,
-            "elapsed_time_last_updated": time.time(),
-            "state": "playing",
-            "current_item": None,
-            "next_item": None,
-            "radio_source": [],
-            "flow_mode": False,
-            "resume_pos": 0,
-            "extra_attributes": {},
-        }
         self.mass.signal_event(
-            EventType.QUEUE_ADDED,
-            object_id=self.instance_id,
-            data=fake_queue,
+            EventType.QUEUE_UPDATED,
+            object_id=player_id,
+            data={
+                "queue_id": player_id,
+                "active": True,
+                "display_name": display_name,
+                "available": True,
+                "items": 0,
+                "state": "playing",
+                "elapsed_time": self._source_details.metadata.elapsed_time if self._source_details.metadata else 0,
+                "elapsed_time_last_updated": time.time(),
+            },
         )
-        self.logger.debug(
-            "Registered fake queue for instance_id=%s (player=%s)",
-            self.instance_id,
-            player_id,
-        )
+        self.logger.debug("Activated real queue for player %s", player_id)
 
-    def _force_update(self) -> None:
+
+        def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
         self.logger.debug(
@@ -271,22 +260,20 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player.update_state(force_update=True)
                 if elapsed is not None:
                     self.logger.debug(
-                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: instance_id=%s elapsed=%.1f",
-                        self.instance_id,
+                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: player_id=%s elapsed=%.1f",
+                        player_id,
                         elapsed,
                     )
-                    # Signal under instance_id — frontend looks up activePlayerQueue
-                    # via active_source which equals our instance_id, not player_id
                     self.mass.signal_event(
                         EventType.QUEUE_TIME_UPDATED,
-                        object_id=self.instance_id,
+                        object_id=player_id,
                         data=elapsed,
                     )
                     self.mass.signal_event(
                         EventType.QUEUE_UPDATED,
-                        object_id=self.instance_id,
+                        object_id=player_id,
                         data={
-                            "queue_id": self.instance_id,
+                            "queue_id": player_id,
                             "elapsed_time": elapsed,
                             "elapsed_time_last_updated": time.time(),
                             "active": True,
@@ -302,6 +289,29 @@ class SpotifyConnectGoProvider(PluginProvider):
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
                         group_player.update_state(force_update=True)
+                        if elapsed is not None:
+                            self.logger.debug(
+                                "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: group_id=%s elapsed=%.1f",
+                                group_id,
+                                elapsed,
+                            )
+                            self.mass.signal_event(
+                                EventType.QUEUE_TIME_UPDATED,
+                                object_id=group_id,
+                                data=elapsed,
+                            )
+                            self.mass.signal_event(
+                                EventType.QUEUE_UPDATED,
+                                object_id=group_id,
+                                data={
+                                    "queue_id": group_id,
+                                    "elapsed_time": elapsed,
+                                    "elapsed_time_last_updated": time.time(),
+                                    "active": True,
+                                    "state": "playing",
+                                },
+                            )
+
 
                             
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
