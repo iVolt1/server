@@ -730,6 +730,17 @@ class SpotifyConnectGoProvider(PluginProvider):
                         self._source_details.metadata.elapsed_time = position_sec
                         self._source_details.metadata.elapsed_time_last_updated = time.time()
                     self._trigger_update()
+                    # Debug: check what player sees
+                    player = self.mass.players.get_player(
+                        self._source_details.in_use_by or self._active_player_id
+                    )
+                    if player:
+                        self.logger.info(
+                            "SEEK DEBUG: player active_source=%s, state.active_source=%s, elapsed=%.1f",
+                            player.active_source,
+                            player.state.active_source,
+                            player.state.elapsed_time or 0,
+                        )
                     self.logger.debug("Seek confirmed at position: %.1f seconds", position_sec)
                     
         elif event_type == "end_of_track":
