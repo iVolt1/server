@@ -700,6 +700,21 @@ class SpotifyConnectGoProvider(PluginProvider):
             if not self._source_details.in_use_by:
                 self.logger.info("Selecting source on player %s", self.mass_player_id)
                 await self.mass.players.select_source(self.mass_player_id, self.instance_id)
+            elif self._active_player_id:
+                # Check if player is now in an active group and update in_use_by
+                # active_group is None at _on_source_selected time but populated once playing
+                player = self.mass.players.get_player(self._active_player_id)
+                if player and player.state.active_group:
+                    group_id = player.state.active_group
+                    if self._source_details.in_use_by != group_id:
+                        self.logger.debug(
+                            "Updating in_use_by from %s to group %s",
+                            self._source_details.in_use_by,
+                            group_id,
+                        )
+                        self._source_details.in_use_by = group_id
+                        self._add_seek_to_player(group_id)
+                        self._force_update()
 
         elif event_type in ("playback_paused", "paused", "inactive"):
             self.logger.debug("Playback paused")
