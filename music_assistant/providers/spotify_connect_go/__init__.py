@@ -491,7 +491,6 @@ class SpotifyConnectGoProvider(PluginProvider):
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
-        self._force_update()
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Called by MA when volume change is requested."""
