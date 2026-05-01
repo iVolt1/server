@@ -205,26 +205,16 @@ class SpotifyConnectGoProvider(PluginProvider):
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
-        if player_id:
+        if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
             if player:
-                self.logger.info(
-                    "FORCE_UPDATE: player=%s, metadata_elapsed=%.1f, state_elapsed=%.1f",
-                    player_id,
-                    self._source_details.metadata.elapsed_time if self._source_details.metadata else -1,
-                    player.state.elapsed_time or 0,
+                # Update player's raw elapsed_time attributes so they get serialized
+                # correctly in the PLAYER_UPDATED event sent to the frontend
+                player._attr_elapsed_time = self._source_details.metadata.elapsed_time
+                player._attr_elapsed_time_last_updated = (
+                    self._source_details.metadata.elapsed_time_last_updated
                 )
                 player.update_state(force_update=True)
-                self.logger.info(
-                    "FORCE_UPDATE AFTER: state_elapsed=%.1f",
-                    player.state.elapsed_time or 0,
-                )
-                # Also force group player if in one
-                group_id = getattr(player, "active_group", None)
-                if group_id:
-                    group_player = self.mass.players.get_player(group_id)
-                    if group_player:
-                        group_player.update_state(force_update=True)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
