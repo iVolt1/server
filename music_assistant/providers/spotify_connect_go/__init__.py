@@ -147,6 +147,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._pipe_fd: int | None = None
         self._active_player_id: str | None = None
         self._current_track_uri: str | None = None
+        self._last_seek_time: float = 0.0
         self._metadata_update_task: asyncio.Task | None = None
 
         # Create the source details
@@ -199,7 +200,15 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Trigger player update on the correct player — the one with in_use_by set."""
         player_id = self._source_details.in_use_by or self._active_player_id
         if player_id:
-            self.mass.players.trigger_player_update(player_id, force_update=True)
+            self.mass.players.trigger_player_update(player_id)
+
+    def _force_update(self) -> None:
+        """Force immediate player state update bypassing debounce and change detection."""
+        player_id = self._source_details.in_use_by or self._active_player_id
+        if player_id:
+            player = self.mass.players.get_player(player_id)
+            if player:
+                player.update_state(force_update=True)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -278,6 +287,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._source_details.in_use_by = None
         self._source_details.metadata = None
         self._current_track_uri = None
+        self._last_seek_time = 0.0
         if self._position_poll_task and not self._position_poll_task.done():
             self._position_poll_task.cancel()
             self._position_poll_task = None
@@ -291,6 +301,10 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Poll go-librespot /status and correct position if it drifts significantly."""
         while not self._stop_called and self._active_player_id:
             try:
+                # Skip polling for 3 seconds after a seek to avoid overwriting seek position
+                if time.time() - self._last_seek_time < 3:
+                    await asyncio.sleep(1)
+                    continue
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"{self._api_base_url}/status") as response:
                         if response.status == 200:
@@ -349,16 +363,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Called by MA when seek is requested (position in seconds)."""
         self.logger.debug("Seek requested to position: %s seconds", position)
         position_ms = int(position * 1000)
+        self._last_seek_time = time.time()
         await self._send_api_json("player/seek", {"position": position_ms})
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
-        # Force immediate state update bypassing debounce and change detection
-        player_id = self._source_details.in_use_by or self._active_player_id
-        if player_id:
-            player = self.mass.players.get_player(player_id)
-            if player:
-                player.update_state(force_update=True)
+        self._force_update()
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Called by MA when volume change is requested."""
@@ -557,7 +567,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.logger.info("go-librespot runner cancelled")
         except Exception as e:
             self.logger.error("Error running go-librespot: %s", e)
-   
         finally:
             if self._pipe_fd is not None:
                 with suppress(OSError):
@@ -565,13 +574,13 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._pipe_fd = None
             if self._go_librespot_proc:
                 await self._go_librespot_proc.close()
-            # Cancel websocket task on crash/restart
+            # Cancel websocket task on crash/restart to prevent accumulation
             if self._websocket_task and not self._websocket_task.done():
                 self._websocket_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._websocket_task
                 self._websocket_task = None
-                self._go_librespot_started.clear() 
+            self._go_librespot_started.clear()
             self.logger.info(
                 "Spotify Connect Go background daemon stopped for %s", self.name
             )
@@ -581,7 +590,7 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.unload_with_error("Unable to initialize go-librespot daemon.")
             return
 
-        if not self._stop_called and self._go_librespot_started.is_set():
+        if not self._stop_called:
             self.logger.warning(
                 "go-librespot exited unexpectedly, restarting in 5 seconds..."
             )
@@ -690,7 +699,6 @@ class SpotifyConnectGoProvider(PluginProvider):
                 self._clear_active_player()
             else:
                 # Delay clearing on 'stopped' to handle Spotify Connect transfer sequences
-                # where go-librespot briefly stops before restarting on the new device
                 stopped_player_id = self._active_player_id
 
                 async def _delayed_clear() -> None:
@@ -728,14 +736,9 @@ class SpotifyConnectGoProvider(PluginProvider):
                             return
                         self._source_details.metadata.elapsed_time = position_sec
                         self._source_details.metadata.elapsed_time_last_updated = time.time()
-                    # Force immediate state update bypassing debounce and change detection
-                    player_id = self._source_details.in_use_by or self._active_player_id
-                    if player_id:
-                        player = self.mass.players.get_player(player_id)
-                        if player:
-                            player.update_state(force_update=True)
+                    self._force_update()
                     self.logger.debug("Seek confirmed at position: %.1f seconds", position_sec)
-                    
+
         elif event_type == "end_of_track":
             self.logger.debug("Track ended")
 
@@ -770,6 +773,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         if is_new_track:
             self.logger.info("New track detected: %s", track_uri)
             self._current_track_uri = track_uri
+            self._last_seek_time = 0.0
 
         title = track_info.get("name", "Unknown")
         artist = "Unknown"
