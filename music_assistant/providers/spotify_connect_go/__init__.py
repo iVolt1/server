@@ -199,7 +199,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Trigger player update on the correct player — the one with in_use_by set."""
         player_id = self._source_details.in_use_by or self._active_player_id
         if player_id:
-            self.mass.players.trigger_player_update(player_id)
+            self.mass.players.trigger_player_update(player_id, force_update=True)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
