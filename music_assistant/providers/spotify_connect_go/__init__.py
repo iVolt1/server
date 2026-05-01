@@ -281,6 +281,14 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._active_player_id = new_player_id
         self.logger.info("Active player set to: %s", self._active_player_id)
         self._add_seek_to_player(new_player_id)
+        # If player is in an active group, set in_use_by to the group player
+        # so __final_active_source finds our plugin source for the displayed player
+        player = self.mass.players.get_player(new_player_id)
+        if player and player.state.active_group:
+            group_id = player.state.active_group
+            self._source_details.in_use_by = group_id
+            self._add_seek_to_player(group_id)
+            self.logger.debug("Updated in_use_by to group player: %s", group_id)
         # Start position polling for accurate progress bar
         if self._position_poll_task and not self._position_poll_task.done():
             self._position_poll_task.cancel()
