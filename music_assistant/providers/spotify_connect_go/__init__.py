@@ -35,6 +35,7 @@ from music_assistant_models.player import PlayerMedia
 from music_assistant.constants import CONF_ENTRY_WARN_PREVIEW
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.models.plugin import PluginProvider, PluginSource
+from music_assistant.models.event import EventType
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
@@ -206,36 +207,43 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player._attr_elapsed_time_last_updated = updated
             self.mass.players.trigger_player_update(player_id)
 
-    def _force_update(self) -> None:
-        """Force immediate player state update bypassing debounce and change detection."""
-        player_id = self._source_details.in_use_by or self._active_player_id
-        if player_id and self._source_details.metadata:
-            player = self.mass.players.get_player(player_id)
-            if player:
-                if self._source_details.metadata.elapsed_time is not None:
-                    elapsed = self._source_details.metadata.elapsed_time
-                    updated = self._source_details.metadata.elapsed_time_last_updated
-                    player._attr_elapsed_time = elapsed
-                    player._attr_elapsed_time_last_updated = updated
-                    if player._attr_current_media:
-                        player._attr_current_media.elapsed_time = elapsed
-                        player._attr_current_media.elapsed_time_last_updated = updated
-                player.update_state(force_update=True)
-                # Also force group player if in one
-                group_id = player.state.active_group
-                if group_id:
-                    group_player = self.mass.players.get_player(group_id)
-                    if group_player:
-                        if self._source_details.metadata.elapsed_time is not None:
-                            group_player._attr_elapsed_time = elapsed
-                            group_player._attr_elapsed_time_last_updated = updated
-                        group_player.update_state(force_update=True)# Debug: check if _attr_elapsed_time survived
-                self.mass.call_later(
-                    0.1,
-                    self._check_elapsed_after_update,
-                    player_id,
-                    elapsed,
-                )
+        def _force_update(self) -> None:
+       """Force immediate player state update bypassing debounce and change detection."""
+       player_id = self._source_details.in_use_by or self._active_player_id
+       if player_id and self._source_details.metadata:
+           player = self.mass.players.get_player(player_id)
+           if player:
+               if self._source_details.metadata.elapsed_time is not None:
+                   elapsed = self._source_details.metadata.elapsed_time
+                   updated = self._source_details.metadata.elapsed_time_last_updated
+                   player._attr_elapsed_time = elapsed
+                   player._attr_elapsed_time_last_updated = updated
+                   if player._attr_current_media:
+                       player._attr_current_media.elapsed_time = elapsed
+                       player._attr_current_media.elapsed_time_last_updated = updated
+               player.update_state(force_update=True)
+               # Signal QUEUE_TIME_UPDATED directly so frontend progress bar updates
+               if self._source_details.metadata.elapsed_time is not None:
+                   self.mass.signal_event(
+                       EventType.QUEUE_TIME_UPDATED,
+                       object_id=player_id,
+                       data=elapsed,
+                   )
+               # Also force group player if in one
+               group_id = player.state.active_group
+               if group_id:
+                   group_player = self.mass.players.get_player(group_id)
+                   if group_player:
+                       if self._source_details.metadata.elapsed_time is not None:
+                           group_player._attr_elapsed_time = elapsed
+                           group_player._attr_elapsed_time_last_updated = updated
+                       group_player.update_state(force_update=True)
+                       self.mass.signal_event(
+                           EventType.QUEUE_TIME_UPDATED,
+                           object_id=group_id,
+                           data=elapsed,
+                       )
+                       
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
         """Debug: check if _attr_elapsed_time was overwritten after force_update."""
         player = self.mass.players.get_player(player_id)
