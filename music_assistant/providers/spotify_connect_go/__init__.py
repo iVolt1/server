@@ -209,6 +209,12 @@ class SpotifyConnectGoProvider(PluginProvider):
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
+        self.logger.debug(
+            "FORCE_UPDATE called: in_use_by=%s active_player=%s resolved=%s",
+            self._source_details.in_use_by,
+            self._active_player_id,
+            player_id,
+        )
         if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
             if player:
@@ -223,6 +229,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player.update_state(force_update=True)
                 # Signal QUEUE_TIME_UPDATED directly so frontend progress bar updates
                 if self._source_details.metadata.elapsed_time is not None:
+                    self.logger.debug(
+                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: player_id=%s elapsed=%.1f",
+                        player_id,
+                        elapsed,
+                    )
                     self.mass.signal_event(
                         EventType.QUEUE_TIME_UPDATED,
                         object_id=player_id,
@@ -237,6 +248,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
                         group_player.update_state(force_update=True)
+                        self.logger.debug(
+                            "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: group_id=%s elapsed=%.1f",
+                            group_id,
+                            elapsed,
+                        )
                         self.mass.signal_event(
                             EventType.QUEUE_TIME_UPDATED,
                             object_id=group_id,
