@@ -54,13 +54,11 @@ DEFAULT_SERVER_PORT = 3678
 
 SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
 
-
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
     return SpotifyConnectGoProvider(mass, manifest, config)
-
 
 async def get_config_entries(
     mass: MusicAssistant,
@@ -202,28 +200,17 @@ class SpotifyConnectGoProvider(PluginProvider):
         if player_id:
             self.mass.players.trigger_player_update(player_id)
 
-    def _force_update(self) -> None:
-        """Force immediate player state update bypassing debounce and change detection."""
+    def _trigger_update(self) -> None:
+        """Trigger player update on the correct player — the one with in_use_by set."""
         player_id = self._source_details.in_use_by or self._active_player_id
         if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
-            if player:
+            if player and self._source_details.metadata.elapsed_time is not None:
                 elapsed = self._source_details.metadata.elapsed_time
                 updated = self._source_details.metadata.elapsed_time_last_updated
-                # Update raw player attributes so PLAYER_UPDATED event has correct position
                 player._attr_elapsed_time = elapsed
                 player._attr_elapsed_time_last_updated = updated
-                # Also update _attr_current_media if it exists
-                if player._attr_current_media:
-                    player._attr_current_media.elapsed_time = elapsed
-                    player._attr_current_media.elapsed_time_last_updated = updated
-                player.update_state(force_update=True)
-                # Also force group player if in one
-                group_id = getattr(player, "active_group", None)
-                if group_id:
-                    group_player = self.mass.players.get_player(group_id)
-                    if group_player:
-                        group_player.update_state(force_update=True)
+            self.mass.players.trigger_player_update(player_id)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
