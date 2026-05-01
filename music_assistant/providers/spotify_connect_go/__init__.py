@@ -715,14 +715,18 @@ class SpotifyConnectGoProvider(PluginProvider):
             if data := event_data.get("data", {}):
                 if "position" in data:
                     position_sec = data.get("position") / 1000
+                    self.logger.info(
+                        "SEEK EVENT: position=%.1f, metadata=%s, in_use_by=%s",
+                        position_sec,
+                        self._source_details.metadata is not None,
+                        self._source_details.in_use_by,
+                    )
                     if self._source_details.metadata:
-                        # Cap to duration to prevent bar sticking at 100%
                         if (
                             self._source_details.metadata.duration
                             and position_sec >= self._source_details.metadata.duration
                         ):
                             return
-                    if self._source_details.metadata:
                         self._source_details.metadata.elapsed_time = position_sec
                         self._source_details.metadata.elapsed_time_last_updated = time.time()
                     self._trigger_update()
