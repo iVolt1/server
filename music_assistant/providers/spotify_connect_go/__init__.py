@@ -235,7 +235,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self.logger.debug("Activated real queue for player %s", player_id)
 
 
-        def _force_update(self) -> None:
+    def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
         self.logger.debug(
