@@ -353,7 +353,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         if self._source_details.metadata:
             self._source_details.metadata.elapsed_time = position
             self._source_details.metadata.elapsed_time_last_updated = time.time()
-        self._trigger_update()
+        # Force immediate state update bypassing debounce and change detection
+        player_id = self._source_details.in_use_by or self._active_player_id
+        if player_id:
+            player = self.mass.players.get_player(player_id)
+            if player:
+                player.update_state(force_update=True)
 
     async def _on_volume_callback(self, volume: int) -> None:
         """Called by MA when volume change is requested."""
@@ -715,12 +720,6 @@ class SpotifyConnectGoProvider(PluginProvider):
             if data := event_data.get("data", {}):
                 if "position" in data:
                     position_sec = data.get("position") / 1000
-                    self.logger.info(
-                        "SEEK EVENT: position=%.1f, metadata=%s, in_use_by=%s",
-                        position_sec,
-                        self._source_details.metadata is not None,
-                        self._source_details.in_use_by,
-                    )
                     if self._source_details.metadata:
                         if (
                             self._source_details.metadata.duration
@@ -729,18 +728,12 @@ class SpotifyConnectGoProvider(PluginProvider):
                             return
                         self._source_details.metadata.elapsed_time = position_sec
                         self._source_details.metadata.elapsed_time_last_updated = time.time()
-                    self._trigger_update()
-                    # Debug: check what player sees
-                    player = self.mass.players.get_player(
-                        self._source_details.in_use_by or self._active_player_id
-                    )
-                    if player:
-                        self.logger.info(
-                            "SEEK DEBUG: player active_source=%s, state.active_source=%s, elapsed=%.1f",
-                            player.active_source,
-                            player.state.active_source,
-                            player.state.elapsed_time or 0,
-                        )
+                    # Force immediate state update bypassing debounce and change detection
+                    player_id = self._source_details.in_use_by or self._active_player_id
+                    if player_id:
+                        player = self.mass.players.get_player(player_id)
+                        if player:
+                            player.update_state(force_update=True)
                     self.logger.debug("Seek confirmed at position: %.1f seconds", position_sec)
                     
         elif event_type == "end_of_track":
