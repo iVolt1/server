@@ -209,6 +209,12 @@ class SpotifyConnectGoProvider(PluginProvider):
             player = self.mass.players.get_player(player_id)
             if player:
                 player.update_state(force_update=True)
+            # Also force update the group player if this player is in a group
+            group_id = getattr(player, "active_group", None) if player else None
+            if group_id:
+                group_player = self.mass.players.get_player(group_id)
+                if group_player:
+                    group_player.update_state(force_update=True)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
