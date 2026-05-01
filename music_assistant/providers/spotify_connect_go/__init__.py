@@ -229,7 +229,23 @@ class SpotifyConnectGoProvider(PluginProvider):
                         if self._source_details.metadata.elapsed_time is not None:
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
-                        group_player.update_state(force_update=True)
+                        group_player.update_state(force_update=True)# Debug: check if _attr_elapsed_time survived
+                self.mass.call_later(
+                    0.1,
+                    self._check_elapsed_after_update,
+                    player_id,
+                    elapsed,
+                )
+    def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
+        """Debug: check if _attr_elapsed_time was overwritten after force_update."""
+        player = self.mass.players.get_player(player_id)
+        if player:
+            self.logger.info(
+                "ELAPSED CHECK 100ms later: _attr=%.1f expected=%.1f state=%.1f",
+                player._attr_elapsed_time or 0,
+                expected,
+                player.state.elapsed_time or 0,
+            )                
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
