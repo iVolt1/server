@@ -207,11 +207,15 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(player_id)
 
     def _register_fake_queue(self, player_id: str) -> None:
-        """Register a synthetic queue entry so the frontend accepts QUEUE_TIME_UPDATED."""
+        """Register a synthetic queue entry so the frontend accepts QUEUE_TIME_UPDATED.
+ 
+        The frontend resolves activePlayerQueue by looking up active_source (our instance_id)
+        in p.queues, so we must register under instance_id, not player_id.
+        """
         player = self.mass.players.get_player(player_id)
         display_name = player.display_name if player else player_id
         fake_queue = {
-            "queue_id": player_id,
+            "queue_id": self.instance_id,
             "active": True,
             "display_name": display_name,
             "available": True,
@@ -233,10 +237,14 @@ class SpotifyConnectGoProvider(PluginProvider):
         }
         self.mass.signal_event(
             EventType.QUEUE_ADDED,
-            object_id=player_id,
+            object_id=self.instance_id,
             data=fake_queue,
         )
-        self.logger.debug("Registered fake queue for player %s", player_id)
+        self.logger.debug(
+            "Registered fake queue for instance_id=%s (player=%s)",
+            self.instance_id,
+            player_id,
+        )
 
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
@@ -263,22 +271,22 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player.update_state(force_update=True)
                 if elapsed is not None:
                     self.logger.debug(
-                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: player_id=%s elapsed=%.1f",
-                        player_id,
+                        "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: instance_id=%s elapsed=%.1f",
+                        self.instance_id,
                         elapsed,
                     )
+                    # Signal under instance_id — frontend looks up activePlayerQueue
+                    # via active_source which equals our instance_id, not player_id
                     self.mass.signal_event(
                         EventType.QUEUE_TIME_UPDATED,
-                        object_id=player_id,
+                        object_id=self.instance_id,
                         data=elapsed,
                     )
-                    # Also send QUEUE_UPDATED to force reactive reassignment of
-                    # queueElapsedTime in the frontend (plain mutation isn't enough)
                     self.mass.signal_event(
                         EventType.QUEUE_UPDATED,
-                        object_id=player_id,
+                        object_id=self.instance_id,
                         data={
-                            "queue_id": player_id,
+                            "queue_id": self.instance_id,
                             "elapsed_time": elapsed,
                             "elapsed_time_last_updated": time.time(),
                             "active": True,
@@ -294,28 +302,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                             group_player._attr_elapsed_time = elapsed
                             group_player._attr_elapsed_time_last_updated = updated
                         group_player.update_state(force_update=True)
-                        if elapsed is not None:
-                            self.logger.debug(
-                                "FORCE_UPDATE signaling QUEUE_TIME_UPDATED: group_id=%s elapsed=%.1f",
-                                group_id,
-                                elapsed,
-                            )
-                            self.mass.signal_event(
-                                EventType.QUEUE_TIME_UPDATED,
-                                object_id=group_id,
-                                data=elapsed,
-                            )
-                            self.mass.signal_event(
-                                EventType.QUEUE_UPDATED,
-                                object_id=group_id,
-                                data={
-                                    "queue_id": group_id,
-                                    "elapsed_time": elapsed,
-                                    "elapsed_time_last_updated": time.time(),
-                                    "active": True,
-                                    "state": "playing",
-                                },
-                            )
+
                             
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
         """Debug: check if _attr_elapsed_time was overwritten after force_update."""
