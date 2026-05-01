@@ -293,7 +293,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         if self._position_poll_task and not self._position_poll_task.done():
             self._position_poll_task.cancel()
         self._position_poll_task = self.mass.create_task(self._position_poll_loop())
-
+        player = self.mass.players.get_player(new_player_id)
+        self.logger.info(
+            "SOURCE SELECTED DEBUG: player=%s, state.active_group=%s",
+            new_player_id,
+            player.state.active_group if player else "NO PLAYER",
+        )
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
         prev_player_id = self._active_player_id
