@@ -922,16 +922,13 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Update metadata from go-librespot events."""
         if not metadata:
             return
-
         track_info = metadata.get("track", metadata)
         track_uri = track_info.get("uri", "")
         is_new_track = track_uri != self._current_track_uri
-
         if is_new_track:
             self.logger.info("New track detected: %s", track_uri)
             self._current_track_uri = track_uri
             self._last_seek_time = 0.0
-
         title = track_info.get("name", "Unknown")
         artist = "Unknown"
         if artist_names := track_info.get("artist_names"):
@@ -943,14 +940,11 @@ class SpotifyConnectGoProvider(PluginProvider):
                 )
             elif isinstance(artist_names, str):
                 artist = artist_names
-
         album_name = track_info.get("album_name", "Unknown")
         image_url = track_info.get("album_cover_url")
-
         self.logger.info(
             "Creating PlayerMedia: title=%s, artist=%s, album=%s", title, artist, album_name
         )
-
         media = PlayerMedia(
             uri=track_uri.replace("spotify:", "spotifyconnect:"),
             title=title,
@@ -958,15 +952,12 @@ class SpotifyConnectGoProvider(PluginProvider):
             album=album_name,
             media_type=MediaType.TRACK,
         )
-
         if image_url:
             media.image_url = image_url
-
         # Duration comes in milliseconds from go-librespot
         if raw_duration := track_info.get("duration"):
             media.duration = raw_duration / 1000
             self.logger.debug("Track duration: %s seconds", media.duration)
-
         # Set elapsed time and start the progress clock
         if is_new_track:
             reported_position = (
@@ -984,25 +975,30 @@ class SpotifyConnectGoProvider(PluginProvider):
             media.elapsed_time = track_info.get("position") / 1000
         else:
             media.elapsed_time = 0
-
         # Always set the timestamp so MA's progress bar starts advancing
         media.elapsed_time_last_updated = time.time()
-
         if track_number := track_info.get("track_number"):
             media.track_number = track_number
         if disc_number := track_info.get("disc_number"):
             media.disc_number = disc_number
-
         self._source_details.metadata = media
         self.logger.info(
             "Updated source metadata: %s - %s (uri: %s)", media.title, media.artist, media.uri
         )
-
-        self._trigger_update()        
+        # Push media onto the player directly so the frontend sees title/duration
+        if self._active_player_id:
+            player = self.mass.players.get_player(self._active_player_id)
+            if player:
+                player._attr_current_media = media
+                self.logger.debug(
+                    "SET current_media on player: title=%s duration=%s",
+                    media.title,
+                    media.duration,
+                )
+        self._trigger_update()
         # Re-register queue now that metadata (including duration) is fully available
         if self._active_player_id:
             self._register_fake_queue(self._active_player_id)
-
 
     # ---------------------------------------------------------------------------
     # Player daemon management
