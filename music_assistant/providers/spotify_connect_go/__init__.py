@@ -856,7 +856,24 @@ class SpotifyConnectGoProvider(PluginProvider):
                         self._source_details.metadata.elapsed_time = position_sec
                 # Freeze progress by clearing elapsed_time_last_updated
                 self._source_details.metadata.elapsed_time_last_updated = None
-                self._trigger_update()
+                elapsed = self._source_details.metadata.elapsed_time or 0
+                # Freeze the frontend queue at the current position
+                self.mass.signal_event(
+                    EventType.QUEUE_TIME_UPDATED,
+                    object_id=self.instance_id,
+                    data=elapsed,
+                )
+                self.mass.signal_event(
+                    EventType.QUEUE_UPDATED,
+                    object_id=self.instance_id,
+                    data={
+                        "queue_id": self.instance_id,
+                        "state": "paused",
+                        "elapsed_time": elapsed,
+                        "elapsed_time_last_updated": time.time(),
+                    },
+                )
+            self._force_update()
 
         elif event_type in ("stopped", "session_disconnected"):
             self.logger.info("Playback stopped/disconnected event: %s", event_type)
