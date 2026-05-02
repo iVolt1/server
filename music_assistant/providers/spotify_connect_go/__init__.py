@@ -25,10 +25,13 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
+    PlaybackState,
     PlayerFeature,
     ProviderFeature,
     StreamType,
 )
+from music_assistant_models.player_queue import PlayerQueue
+from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import PlayerMedia
 
@@ -206,27 +209,46 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player._attr_elapsed_time_last_updated = updated
             self.mass.players.trigger_player_update(player_id)
 
-    def _register_fake_queue(self, player_id: str) -> None:
-        """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works."""
+    def _register_plugin_queue(self, player_id: str) -> None:
+        """Register a real PlayerQueue in the backend under our instance_id.
+
+        The frontend resolves activePlayerQueue via active_source (our instance_id).
+        By registering a real queue in the backend _queues dict under instance_id,
+        both the frontend p.queues lookup AND the backend play_media handler work correctly.
+        """
+        player = self.mass.players.get_player(player_id)
         metadata = self._source_details.metadata
-        self.mass.signal_event(
-            EventType.QUEUE_UPDATED,
-            object_id=player_id,
-            data={
-                "queue_id": player_id,
-                "active": True,
-                "elapsed_time": metadata.elapsed_time if metadata else 0,
-                "elapsed_time_last_updated": time.time(),
-                "state": "playing",
-                "current_item": {
-                    "queue_id": player_id,
-                    "queue_item_id": "spotify_connect_go_current",
-                    "duration": int(metadata.duration) if metadata and metadata.duration else 0,
-                    "name": metadata.title if metadata else "",
-                },
-            },
+        current_item = None
+        if metadata:
+            current_item = QueueItem(
+                queue_id=self.instance_id,
+                queue_item_id="spotify_connect_go_current",
+                duration=int(metadata.duration) if metadata.duration else 0,
+                name=metadata.title or "",
+            )
+        queue = PlayerQueue(
+            queue_id=self.instance_id,
+            active=True,
+            display_name=player.display_name if player else player_id,
+            available=True,
+            items=1 if current_item else 0,
+            state=PlaybackState.PLAYING,
+            elapsed_time=metadata.elapsed_time if metadata else 0,
+            elapsed_time_last_updated=time.time(),
+            current_item=current_item,
         )
-        self.logger.debug("Activated real queue for player %s", player_id)
+        self.mass.player_queues._queues[self.instance_id] = queue
+        self.mass.signal_event(
+            EventType.QUEUE_ADDED,
+            object_id=self.instance_id,
+            data=queue,
+        )
+        self.logger.debug(
+            "Registered plugin queue: instance_id=%s player=%s duration=%s",
+            self.instance_id,
+            player_id,
+            current_item.duration if current_item else None,
+        )
 
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
@@ -269,22 +291,14 @@ class SpotifyConnectGoProvider(PluginProvider):
                         object_id=player_id,
                         data=elapsed,
                     )
+                    # Update the registered plugin queue with current elapsed time
+                    if self.instance_id in self.mass.player_queues._queues:
+                        self.mass.player_queues._queues[self.instance_id].elapsed_time = elapsed
+                        self.mass.player_queues._queues[self.instance_id].elapsed_time_last_updated = time.time()
                     self.mass.signal_event(
-                        EventType.QUEUE_UPDATED,
-                        object_id=player_id,
-                        data={
-                            "queue_id": player_id,
-                            "active": True,
-                            "elapsed_time": elapsed,
-                            "elapsed_time_last_updated": time.time(),
-                            "state": "playing",
-                            "current_item": {
-                                "queue_id": player_id,
-                                "queue_item_id": "spotify_connect_go_current",
-                                "duration": int(metadata.duration) if metadata.duration else 0,
-                                "name": metadata.title if metadata else "",
-                            },
-                        },
+                        EventType.QUEUE_TIME_UPDATED,
+                        object_id=self.instance_id,
+                        data=elapsed,
                     )
                 # Also force group player if in one
                 group_id = player.state.active_group
@@ -306,23 +320,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 object_id=group_id,
                                 data=elapsed,
                             )
-                            self.mass.signal_event(
-                                EventType.QUEUE_UPDATED,
-                                object_id=group_id,
-                                data={
-                                    "queue_id": group_id,
-                                    "active": True,
-                                    "elapsed_time": elapsed,
-                                    "elapsed_time_last_updated": time.time(),
-                                    "state": "playing",
-                                    "current_item": {
-                                        "queue_id": group_id,
-                                        "queue_item_id": "spotify_connect_go_current",
-                                        "duration": int(metadata.duration) if metadata.duration else 0,
-                                        "name": metadata.title if metadata else "",
-                                    },
-                                },
-                            )
+                            pass  # group queue update handled by instance_id queue
                             
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
         """Debug: check if _attr_elapsed_time was overwritten after force_update."""
@@ -419,9 +417,9 @@ class SpotifyConnectGoProvider(PluginProvider):
             player.state.active_group if player else "NO PLAYER",
         )
         # Register a fake queue so the frontend accepts QUEUE_TIME_UPDATED for this player
-        self._register_fake_queue(new_player_id)
+        self._register_plugin_queue(new_player_id)
         if player and player.state.active_group:
-            self._register_fake_queue(player.state.active_group)
+            self._register_plugin_queue(player.state.active_group)
 
     def _clear_active_player(self) -> None:
         """Clear the active player when playback ends."""
@@ -998,7 +996,7 @@ class SpotifyConnectGoProvider(PluginProvider):
         self._trigger_update()
         # Re-register queue now that metadata (including duration) is fully available
         if self._active_player_id:
-            self._register_fake_queue(self._active_player_id)
+            self._register_plugin_queue(self._active_player_id)
 
     # ---------------------------------------------------------------------------
     # Player daemon management
