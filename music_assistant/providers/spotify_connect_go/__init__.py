@@ -992,7 +992,11 @@ class SpotifyConnectGoProvider(PluginProvider):
             "Updated source metadata: %s - %s (uri: %s)", media.title, media.artist, media.uri
         )
 
-        self._trigger_update()
+        self._trigger_update()        
+        # Re-register queue now that metadata (including duration) is fully available
+        if self._active_player_id:
+            self._register_fake_queue(self._active_player_id)
+
 
     # ---------------------------------------------------------------------------
     # Player daemon management
