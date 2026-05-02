@@ -206,7 +206,7 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player._attr_elapsed_time_last_updated = updated
             self.mass.players.trigger_player_update(player_id)
 
-def _register_fake_queue(self, player_id: str) -> None:
+    def _register_fake_queue(self, player_id: str) -> None:
         """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works."""
         metadata = self._source_details.metadata
         self.mass.signal_event(
