@@ -210,44 +210,54 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(player_id)
 
     def _register_plugin_queue(self, player_id: str) -> None:
-        """Register a real PlayerQueue in the backend under our instance_id.
+        """Register a queue in the frontend under our instance_id.
 
         The frontend resolves activePlayerQueue via active_source (our instance_id).
-        By registering a real queue in the backend _queues dict under instance_id,
-        both the frontend p.queues lookup AND the backend play_media handler work correctly.
+        We fire QUEUE_ADDED frontend-only (no backend _queues entry) so the frontend
+        can resolve activePlayerQueue and render the seek bar correctly, without
+        causing the backend to route play/pause/play_media commands to us.
         """
         player = self.mass.players.get_player(player_id)
         metadata = self._source_details.metadata
         current_item = None
         if metadata:
-            current_item = QueueItem(
-                queue_id=self.instance_id,
-                queue_item_id="spotify_connect_go_current",
-                duration=int(metadata.duration) if metadata.duration else 0,
-                name=metadata.title or "",
-            )
-        queue = PlayerQueue(
-            queue_id=self.instance_id,
-            active=True,
-            display_name=player.display_name if player else player_id,
-            available=True,
-            items=1 if current_item else 0,
-            state=PlaybackState.PLAYING,
-            elapsed_time=metadata.elapsed_time if metadata else 0,
-            elapsed_time_last_updated=time.time(),
-            current_item=current_item,
-        )
-        self.mass.player_queues._queues[self.instance_id] = queue
+            current_item = {
+                "queue_id": self.instance_id,
+                "queue_item_id": "spotify_connect_go_current",
+                "duration": int(metadata.duration) if metadata.duration else 0,
+                "name": metadata.title or "",
+            }
+        fake_queue = {
+            "queue_id": self.instance_id,
+            "active": True,
+            "display_name": player.display_name if player else player_id,
+            "available": True,
+            "items": 1 if current_item else 0,
+            "shuffle_enabled": False,
+            "repeat_mode": "off",
+            "dont_stop_the_music_enabled": False,
+            "current_index": 0,
+            "index_in_buffer": None,
+            "elapsed_time": metadata.elapsed_time if metadata else 0,
+            "elapsed_time_last_updated": time.time(),
+            "state": "playing",
+            "current_item": current_item,
+            "next_item": None,
+            "radio_source": [],
+            "flow_mode": False,
+            "resume_pos": 0,
+            "extra_attributes": {},
+        }
         self.mass.signal_event(
             EventType.QUEUE_ADDED,
             object_id=self.instance_id,
-            data=queue,
+            data=fake_queue,
         )
         self.logger.debug(
-            "Registered plugin queue: instance_id=%s player=%s duration=%s",
+            "Registered frontend queue: instance_id=%s player=%s duration=%s",
             self.instance_id,
             player_id,
-            current_item.duration if current_item else None,
+            current_item["duration"] if current_item else None,
         )
 
     def _force_update(self) -> None:
