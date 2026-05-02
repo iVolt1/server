@@ -449,50 +449,50 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(prev_player_id)
 
     async def _position_poll_loop(self) -> None:
-        """Poll go-librespot /status and correct position if it drifts significantly."""
-        while not self._stop_called and self._active_player_id:
-            try:
-                # Skip polling for 3 seconds after a seek to avoid overwriting seek position
-                if time.time() - self._last_seek_time < 3:
-                    await asyncio.sleep(1)
-                    continue
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self._api_base_url}/status") as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if (
-                                not data.get("stopped")
-                                and not data.get("paused")
-                                and (track := data.get("track"))
-                                and self._source_details.metadata
-                            ):
-                                actual_position = track.get("position", 0) / 1000
-                                meta = self._source_details.metadata
-                                # Skip if position equals or exceeds duration (track ending)
-                                if not (meta.duration and actual_position >= meta.duration):
-                                    # Calculate what MA thinks the position is right now
-                                    if meta.elapsed_time_last_updated is not None:
-                                        expected_position = (
-                                            (meta.elapsed_time or 0)
-                                            + (time.time() - meta.elapsed_time_last_updated)
-                                        )
-                                    else:
-                                        expected_position = meta.elapsed_time or 0
-                                    # Only correct if drift exceeds 3 seconds
-                                    if abs(actual_position - expected_position) > 3:
-                                        self.logger.debug(
-                                            "Position drift: expected=%.1f actual=%.1f, correcting",
-                                            expected_position,
-                                            actual_position,
-                                        )
-                                        meta.elapsed_time = actual_position
-                                        meta.elapsed_time_last_updated = time.time()
-                                        self._trigger_update()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.debug("Position poll error: %s", e)
-            await asyncio.sleep(1)
+    """Poll go-librespot /status and correct position if it drifts significantly."""
+    while not self._stop_called and self._active_player_id:
+        try:
+            # Skip polling for 3 seconds after a seek to avoid overwriting seek position
+            if time.time() - self._last_seek_time < 3:
+                await asyncio.sleep(1)
+                continue
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self._api_base_url}/status") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if (
+                            not data.get("stopped")
+                            and not data.get("paused")
+                            and (track := data.get("track"))
+                            and self._source_details.metadata
+                        ):
+                            actual_position = track.get("position", 0) / 1000
+                            meta = self._source_details.metadata
+                            if not (meta.duration and actual_position >= meta.duration):
+                                # Compute expected position BEFORE updating metadata
+                                if meta.elapsed_time_last_updated is not None:
+                                    expected_position = (
+                                        (meta.elapsed_time or 0)
+                                        + (time.time() - meta.elapsed_time_last_updated)
+                                    )
+                                else:
+                                    expected_position = meta.elapsed_time or 0
+                                # Always keep metadata current so pause handler reads correct position
+                                meta.elapsed_time = actual_position
+                                meta.elapsed_time_last_updated = time.time()
+                                # Only trigger a state update if drift is significant
+                                if abs(actual_position - expected_position) > 3:
+                                    self.logger.debug(
+                                        "Position drift: expected=%.1f actual=%.1f, correcting",
+                                        expected_position,
+                                        actual_position,
+                                    )
+                                    self._trigger_update()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            self.logger.debug("Position poll error: %s", e)
+        await asyncio.sleep(1)
 
     async def _on_play_callback(self) -> None:
         """Called by MA when play is requested."""
