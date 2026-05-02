@@ -206,21 +206,28 @@ class SpotifyConnectGoProvider(PluginProvider):
                 player._attr_elapsed_time_last_updated = updated
             self.mass.players.trigger_player_update(player_id)
 
-    def _register_fake_queue(self, player_id: str) -> None:
+def _register_fake_queue(self, player_id: str) -> None:
         """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works."""
+        metadata = self._source_details.metadata
         self.mass.signal_event(
             EventType.QUEUE_UPDATED,
             object_id=player_id,
             data={
                 "queue_id": player_id,
                 "active": True,
-                "elapsed_time": self._source_details.metadata.elapsed_time if self._source_details.metadata else 0,
+                "elapsed_time": metadata.elapsed_time if metadata else 0,
                 "elapsed_time_last_updated": time.time(),
                 "state": "playing",
+                "current_item": {
+                    "queue_id": player_id,
+                    "queue_item_id": "spotify_connect_go_current",
+                    "duration": int(metadata.duration) if metadata and metadata.duration else 0,
+                    "name": metadata.title if metadata else "",
+                },
             },
         )
         self.logger.debug("Activated real queue for player %s", player_id)
- 
+
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
@@ -233,8 +240,9 @@ class SpotifyConnectGoProvider(PluginProvider):
         if player_id and self._source_details.metadata:
             player = self.mass.players.get_player(player_id)
             if player:
-                elapsed = self._source_details.metadata.elapsed_time
-                updated = self._source_details.metadata.elapsed_time_last_updated
+                metadata = self._source_details.metadata
+                elapsed = metadata.elapsed_time
+                updated = metadata.elapsed_time_last_updated
                 if elapsed is not None:
                     player._attr_elapsed_time = elapsed
                     player._attr_elapsed_time_last_updated = updated
@@ -264,6 +272,12 @@ class SpotifyConnectGoProvider(PluginProvider):
                             "elapsed_time": elapsed,
                             "elapsed_time_last_updated": time.time(),
                             "state": "playing",
+                            "current_item": {
+                                "queue_id": player_id,
+                                "queue_item_id": "spotify_connect_go_current",
+                                "duration": int(metadata.duration) if metadata.duration else 0,
+                                "name": metadata.title if metadata else "",
+                            },
                         },
                     )
                 # Also force group player if in one
@@ -295,6 +309,12 @@ class SpotifyConnectGoProvider(PluginProvider):
                                     "elapsed_time": elapsed,
                                     "elapsed_time_last_updated": time.time(),
                                     "state": "playing",
+                                    "current_item": {
+                                        "queue_id": group_id,
+                                        "queue_item_id": "spotify_connect_go_current",
+                                        "duration": int(metadata.duration) if metadata.duration else 0,
+                                        "name": metadata.title if metadata else "",
+                                    },
                                 },
                             )
                             
