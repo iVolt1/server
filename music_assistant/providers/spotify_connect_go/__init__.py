@@ -207,34 +207,20 @@ class SpotifyConnectGoProvider(PluginProvider):
             self.mass.players.trigger_player_update(player_id)
 
     def _register_fake_queue(self, player_id: str) -> None:
-        """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works.
- 
-        We signal QUEUE_UPDATED for the real player_id queue with active=True.
-        The frontend's activePlayerQueue has two branches:
-          1. active_source in p.queues  → our instance_id (not a real queue, causes play_media errors)
-          2. !active_source && player_id in p.queues && queue.active  → player_id real queue
-        By forcing active=True on the real queue via QUEUE_UPDATED, branch 2 works correctly.
-        We then use player_id for all QUEUE_TIME_UPDATED signals.
-        """
-        player = self.mass.players.get_player(player_id)
-        display_name = player.display_name if player else player_id
+        """Activate the real player queue in the frontend so QUEUE_TIME_UPDATED works."""
         self.mass.signal_event(
             EventType.QUEUE_UPDATED,
             object_id=player_id,
             data={
                 "queue_id": player_id,
                 "active": True,
-                "display_name": display_name,
-                "available": True,
-                "items": 0,
-                "state": "playing",
                 "elapsed_time": self._source_details.metadata.elapsed_time if self._source_details.metadata else 0,
                 "elapsed_time_last_updated": time.time(),
+                "state": "playing",
             },
         )
         self.logger.debug("Activated real queue for player %s", player_id)
-
-
+ 
     def _force_update(self) -> None:
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
@@ -274,9 +260,9 @@ class SpotifyConnectGoProvider(PluginProvider):
                         object_id=player_id,
                         data={
                             "queue_id": player_id,
+                            "active": True,
                             "elapsed_time": elapsed,
                             "elapsed_time_last_updated": time.time(),
-                            "active": True,
                             "state": "playing",
                         },
                     )
@@ -305,14 +291,12 @@ class SpotifyConnectGoProvider(PluginProvider):
                                 object_id=group_id,
                                 data={
                                     "queue_id": group_id,
+                                    "active": True,
                                     "elapsed_time": elapsed,
                                     "elapsed_time_last_updated": time.time(),
-                                    "active": True,
                                     "state": "playing",
                                 },
                             )
-
-
                             
     def _check_elapsed_after_update(self, player_id: str, expected: float) -> None:
         """Debug: check if _attr_elapsed_time was overwritten after force_update."""
