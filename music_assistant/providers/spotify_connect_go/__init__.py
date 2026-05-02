@@ -232,6 +232,12 @@ class SpotifyConnectGoProvider(PluginProvider):
         """Force immediate player state update bypassing debounce and change detection."""
         player_id = self._source_details.in_use_by or self._active_player_id
         self.logger.debug(
+            "FORCE_UPDATE: current_media=%s duration=%s elapsed=%s",
+            player._attr_current_media,
+            player._attr_current_media.duration if player._attr_current_media else None,
+            elapsed,
+        )        
+        self.logger.debug(
             "FORCE_UPDATE called: in_use_by=%s active_player=%s resolved=%s",
             self._source_details.in_use_by,
             self._active_player_id,
