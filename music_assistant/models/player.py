@@ -1678,7 +1678,7 @@ class Player(ABC):
         ):
             return PlayerMedia(
                 uri=source.metadata.uri or source.id,
-                media_type=MediaType.PLUGIN_SOURCE,
+                media_type=source.metadata.media_type,
                 title=source.metadata.title,
                 artist=source.metadata.artist,
                 album=source.metadata.album,
