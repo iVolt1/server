@@ -524,7 +524,7 @@ class PlayerQueuesController(CoreController):
             # player's real MA queue and let the player controller handle source takeover
             # Log what we see for debugging
             for player in self.mass.players.all_players():
-                self.logger.debug(
+                self.logger.warning(
                     "play_media reroute check: player=%s active_source=%s queue_id=%s",
                     player.player_id,
                     player.active_source,
