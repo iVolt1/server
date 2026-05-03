@@ -837,6 +837,25 @@ class SpotifyConnectProvider(PluginProvider):
             if self._source_details.metadata is not None:
                 self._source_details.metadata.elapsed_time = int(json_data["position_ms"]) // 1000
                 self._source_details.metadata.elapsed_time_last_updated = int(time.time())
+                
+        if "position_ms" in json_data:
+            if self._source_details.metadata is not None:
+                self._source_details.metadata.elapsed_time = int(json_data["position_ms"]) // 1000
+                self._source_details.metadata.elapsed_time_last_updated = int(time.time())
+
+        if event_name == "seeked" and self._source_details.in_use_by:
+            player = self.mass.players.get_player(self._source_details.in_use_by)
+            if player and self._source_details.metadata:
+                elapsed = self._source_details.metadata.elapsed_time or 0
+                player._attr_elapsed_time = elapsed
+                player.update_state(force_update=True)
+                self.mass.signal_event(
+                    EventType.QUEUE_TIME_UPDATED,
+                    object_id=self.instance_id,
+                    data=elapsed,
+                )
+
+        if event_name == "volume_changed" and (volume := json_data.get("volume")):                
 
         if event_name == "volume_changed" and (volume := json_data.get("volume")):
             # Ignore volume_changed events that fire immediately after session_connect
