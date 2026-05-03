@@ -533,7 +533,7 @@ class PlayerQueuesController(CoreController):
             # Check if queue_id is an active plugin source...            
             for player in self.mass.players.all_players():
                 if player.active_source == queue_id and player.player_id in self._queues:
-                    self.logger.debug(
+                    self.logger.warning(
                         "Rerouting play_media from plugin source %s to player queue %s",
                         queue_id,
                         player.player_id,
