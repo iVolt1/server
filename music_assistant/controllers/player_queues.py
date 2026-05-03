@@ -494,8 +494,6 @@ class PlayerQueuesController(CoreController):
             await self.resume(queue_id)
 
     @api_command("player_queues/play_media")
-    @api_command("player_queues/play_media")
-    
     async def play_media(
         self,
         queue_id: str,
