@@ -334,15 +334,16 @@ class SpotifyConnectProvider(PluginProvider):
                 self.logger.debug(
                     "Failed to stop previous player %s: %s", self._active_player_id, err
                 )
-
         # Update the active player
         self._active_player_id = new_player_id
         self.logger.debug("Active player set to: %s", new_player_id)
 
         # Only persist the selected player as the new default if not in auto mode
         if self._default_player_id != PLAYER_ID_AUTO:
-            self._save_last_player_id(new_player_id)
-
+            self._save_last_player_id(new_player_id)  
+            
+        self._register_plugin_queue(new_player_id)
+        
     def _clear_active_player(self) -> None:
         """
         Clear the active player and revert to default if configured.
@@ -818,6 +819,8 @@ class SpotifyConnectProvider(PluginProvider):
             # from previous track
             self._source_details.metadata.elapsed_time = 0
             self._source_details.metadata.elapsed_time_last_updated = int(time.time())
+            if self._source_details.in_use_by:
+                self._register_plugin_queue(self._source_details.in_use_by)
 
         if track_meta := json_data.get("track_metadata_fields", {}):
             if artists := track_meta.get("artists"):
