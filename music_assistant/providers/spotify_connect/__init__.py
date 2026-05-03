@@ -850,8 +850,6 @@ class SpotifyConnectProvider(PluginProvider):
                     data=elapsed,
                 )
 
-        if event_name == "volume_changed" and (volume := json_data.get("volume")):                
-
         if event_name == "volume_changed" and (volume := json_data.get("volume")):
             # Ignore volume_changed events that fire immediately after session_connect
             # We want to use the volume from MA in that case
