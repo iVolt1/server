@@ -837,11 +837,6 @@ class SpotifyConnectProvider(PluginProvider):
             if self._source_details.metadata is not None:
                 self._source_details.metadata.elapsed_time = int(json_data["position_ms"]) // 1000
                 self._source_details.metadata.elapsed_time_last_updated = int(time.time())
-                
-        if "position_ms" in json_data:
-            if self._source_details.metadata is not None:
-                self._source_details.metadata.elapsed_time = int(json_data["position_ms"]) // 1000
-                self._source_details.metadata.elapsed_time_last_updated = int(time.time())
 
         if event_name == "seeked" and self._source_details.in_use_by:
             player = self.mass.players.get_player(self._source_details.in_use_by)
