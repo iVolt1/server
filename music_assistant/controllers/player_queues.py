@@ -522,18 +522,9 @@ class PlayerQueuesController(CoreController):
         if not self.get(queue_id):
             # Check if queue_id is an active plugin source - if so, reroute to the
             # player's real MA queue and let the player controller handle source takeover
-            # Log what we see for debugging
             for player in self.mass.players.all_players():
-                self.logger.warning(
-                    "play_media reroute check: player=%s active_source=%s queue_id=%s",
-                    player.player_id,
-                    player.active_source,
-                    queue_id,
-                )
-            # Check if queue_id is an active plugin source...            
-            for player in self.mass.players.all_players():
-                if player.active_source == queue_id and player.player_id in self._queues:
-                    self.logger.warning(
+                if player.state.active_source == queue_id and player.player_id in self._queues:
+                    self.logger.debug(
                         "Rerouting play_media from plugin source %s to player queue %s",
                         queue_id,
                         player.player_id,
