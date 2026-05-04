@@ -746,18 +746,6 @@ class SpotifyConnectProvider(PluginProvider):
             if prev_player_id:
                 self.mass.create_task(self.mass.players.deselect_source(prev_player_id))
 
-        # handle paused event - clear in_use_by so UI shows correct active source
-        # this happens when MA starts playing while Spotify Connect was active
-        # Note: we don't call _clear_active_player here because pause is temporary
-        # and we want to resume on the same player when playback resumes
-        if event_name == "paused" and self._source_details.in_use_by:
-            current_player = self._source_details.in_use_by
-            self.logger.debug(
-                "Spotify Connect paused, releasing player UI state for %s", current_player
-            )
-            self._source_details.in_use_by = None
-            self.mass.players.trigger_player_update(current_player)
-
         # handle session connected event
         # this player has become the active spotify connect player
         # we need to start the playback
