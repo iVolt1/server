@@ -351,6 +351,7 @@ class SpotifyConnectProvider(PluginProvider):
                 bit_depth=16,
                 channels=2,
             )
+            self.mass.players.trigger_player_update(new_player_id)
 
         self._register_plugin_queue(new_player_id)
 
