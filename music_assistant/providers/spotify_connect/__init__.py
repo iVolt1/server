@@ -488,7 +488,7 @@ class SpotifyConnectProvider(PluginProvider):
                 "Playback control requires a matching Spotify music provider"
             )
         try:
-            await self._spotify_provider._post_data("me/player/previous")
+            await self._spotify_provider._post_data("me/player/previous", want_result=False)
         except Exception as err:
             self.logger.warning("Failed to send previous command via Spotify Web API: %s", err)
             raise
