@@ -890,6 +890,14 @@ class SpotifyConnectProvider(PluginProvider):
         """
         player = self.mass.players.get_player(player_id)
         metadata = self._source_details.metadata
+
+        # Build DSP details for signal chain display
+        dsp = None
+        try:
+            dsp = self.mass.streams.audio.get_stream_dsp_details(player_id)
+        except Exception:
+            pass
+
         current_item = None
         if metadata:
             current_item = {
@@ -897,6 +905,15 @@ class SpotifyConnectProvider(PluginProvider):
                 "queue_item_id": "spotify_connect_current",
                 "duration": int(metadata.duration) if metadata.duration else 0,
                 "name": metadata.title or "",
+                "streamdetails": {
+                    "audio_format": {
+                        "content_type": "pcm_s16le",
+                        "sample_rate": 44100,
+                        "bit_depth": 16,
+                        "channels": 2,
+                    },
+                    "dsp": dsp,
+                },
             }
         fake_queue = {
             "queue_id": self.instance_id,
