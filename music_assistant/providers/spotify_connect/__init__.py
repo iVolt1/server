@@ -340,10 +340,20 @@ class SpotifyConnectProvider(PluginProvider):
 
         # Only persist the selected player as the new default if not in auto mode
         if self._default_player_id != PLAYER_ID_AUTO:
-            self._save_last_player_id(new_player_id)  
-            
+            self._save_last_player_id(new_player_id)
+
+        # Set output_format on the player so the frontend can display signal chain info
+        if player := self.mass.players.get_player(new_player_id):
+            player.extra_data["output_format"] = AudioFormat(
+                content_type=ContentType.PCM_S16LE,
+                codec_type=ContentType.PCM_S16LE,
+                sample_rate=44100,
+                bit_depth=16,
+                channels=2,
+            )
+
         self._register_plugin_queue(new_player_id)
-        
+
     def _clear_active_player(self) -> None:
         """
         Clear the active player and revert to default if configured.
@@ -356,6 +366,9 @@ class SpotifyConnectProvider(PluginProvider):
 
         if prev_player_id:
             self.logger.debug("Playback ended on player %s, clearing active player", prev_player_id)
+            # Clear output_format so the signal chain display reverts to MA queue format
+            if player := self.mass.players.get_player(prev_player_id):
+                player.extra_data.pop("output_format", None)
             # Trigger update for the player that was using this source
             self.mass.players.trigger_player_update(prev_player_id)
 
