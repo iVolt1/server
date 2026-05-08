@@ -877,7 +877,7 @@ class SpotifyConnectProvider(PluginProvider):
 
         # signal update to connected player
         if self._source_details.in_use_by:
-            self.mass.players.trigger_player_update(self._source_details.in_use_by)
+            self.mass.call_later(0.5, self._register_plugin_queue, self._source_details.in_use_by)
 
         return Response()
 
