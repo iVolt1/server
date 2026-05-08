@@ -941,6 +941,14 @@ class SpotifyConnectProvider(PluginProvider):
             object_id=self.instance_id,
             data=fake_queue,
         )
+        # Fire QUEUE_UPDATED to ensure the frontend refreshes current_item
+        # including streamdetails for the quality indicator display
+        if current_item:
+            self.mass.signal_event(
+                EventType.QUEUE_UPDATED,
+                object_id=self.instance_id,
+                data=fake_queue,
+            )
         self.logger.debug(
             "Registered frontend queue: instance_id=%s player=%s duration=%s",
             self.instance_id,
