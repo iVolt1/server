@@ -354,6 +354,8 @@ class SpotifyConnectProvider(PluginProvider):
             self.mass.players.trigger_player_update(new_player_id)
 
         self._register_plugin_queue(new_player_id)
+        # Trigger player update after queue registration so output_format is picked up
+        self.mass.call_later(1, self.mass.players.trigger_player_update, new_player_id)
 
     def _clear_active_player(self) -> None:
         """
