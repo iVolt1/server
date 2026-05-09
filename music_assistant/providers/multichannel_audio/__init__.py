@@ -12,14 +12,15 @@ from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant.mass import MusicAssistant
 
 from .constants import (
+    CHANNEL_MAP_CUSTOM,
+    CHANNEL_MAP_DVD,
+    CHANNEL_MAP_FLAC,
+    CONF_CHANNEL_MAP,
+    CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
     CONF_PA_SINK_NAME,
-    CONF_VOLUME_CONTROL,
     MULTICHANNEL_LAYOUT_51,
     MULTICHANNEL_LAYOUT_71,
-    VOLUME_CONTROL_DISABLED,
-    VOLUME_CONTROL_HARDWARE,
-    VOLUME_CONTROL_SOFTWARE,
 )
 from .provider import MultiChannelAudioProvider
 
@@ -64,6 +65,8 @@ async def get_config_entries(
     """Return Config entries to setup this provider."""
     # ruff: noqa: ARG001
     sink_options = await mass.loop.run_in_executor(None, _get_pa_sink_options)
+    selected_map = str((values or {}).get(CONF_CHANNEL_MAP, CHANNEL_MAP_FLAC))
+    show_custom = selected_map == CHANNEL_MAP_CUSTOM
     return (
         ConfigEntry(
             key=CONF_PA_SINK_NAME,
@@ -92,19 +95,42 @@ async def get_config_entries(
             ),
         ),
         ConfigEntry(
-            key=CONF_VOLUME_CONTROL,
+            key=CONF_CHANNEL_MAP,
             type=ConfigEntryType.STRING,
-            label="Volume control mode",
+            label="Channel map",
             options=[
-                ConfigValueOption(title="Hardware (preferred)", value=VOLUME_CONTROL_HARDWARE),
-                ConfigValueOption(title="Software", value=VOLUME_CONTROL_SOFTWARE),
-                ConfigValueOption(title="Disabled", value=VOLUME_CONTROL_DISABLED),
+                ConfigValueOption(
+                    title="FLAC / PCM standard (default)",
+                    value=CHANNEL_MAP_FLAC,
+                ),
+                ConfigValueOption(
+                    title="DVD / AC3 (FC\u2194LFE swapped)",
+                    value=CHANNEL_MAP_DVD,
+                ),
+                ConfigValueOption(
+                    title="Custom (enter index pairs below)",
+                    value=CHANNEL_MAP_CUSTOM,
+                ),
             ],
-            default_value=VOLUME_CONTROL_HARDWARE,
+            default_value=CHANNEL_MAP_FLAC,
             description=(
-                "Hardware uses PulseAudio sink volume control. "
-                "Software applies volume scaling to the PCM stream. "
-                "Disabled passes audio at full volume."
+                "Channel ordering of the PCM stream delivered by Music Assistant. "
+                "FLAC/PCM standard is correct for the vast majority of sources. "
+                "Use DVD/AC3 if center and LFE channels are swapped on playback. "
+                "Custom allows manual specification as a comma-separated flat index list."
+            ),
+        ),
+        ConfigEntry(
+            key=CONF_CUSTOM_CHANNEL_MAP,
+            type=ConfigEntryType.STRING,
+            label="Custom channel map (index pairs)",
+            default_value="",
+            required=False,
+            hidden=not show_custom,
+            description=(
+                "Flat comma-separated channel indices for each sink pair in order: "
+                "front_stereo, center_sub, rear_stereo[, side_stereo]. "
+                "Example FLAC 5.1: 0,1,2,3,4,5  \u2014  DVD 5.1: 0,1,3,2,4,5"
             ),
         ),
     )
