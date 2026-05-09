@@ -85,7 +85,7 @@ class MultiChannelAudioProvider(PlayerProvider):
             custom_channel_map=custom_map,
         )
         await self._player.restore_state()
-        await self._player.apply_hardware_ceiling()
+        await self._player.apply_restored_volume()
         await self.mass.players.register_or_update(self._player)
         self.logger.info(
             "Registered multichannel player: %s (%s, %dch, %dHz, %dbit) -> pairs: %s",
