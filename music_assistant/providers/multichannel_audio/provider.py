@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
+    CONF_CHANNEL_MAP,
+    CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
     CONF_PA_SINK_NAME,
     MULTICHANNEL_CHANNELS,
@@ -58,6 +60,8 @@ class MultiChannelAudioProvider(PlayerProvider):
         layout = str(self.config.get_value(CONF_MULTICHANNEL_LAYOUT) or MULTICHANNEL_LAYOUT_51)
         channels = MULTICHANNEL_CHANNELS[layout]
         player_id = get_player_uuid(sink_name)
+        channel_map = str(self.config.get_value(CONF_CHANNEL_MAP) or "flac")
+        custom_map = str(self.config.get_value(CONF_CUSTOM_CHANNEL_MAP) or "")
 
         # Query native format from the surround sink via pactl
         sample_rate, bit_depth, _ = await self.mass.loop.run_in_executor(
@@ -77,6 +81,8 @@ class MultiChannelAudioProvider(PlayerProvider):
             layout=layout,
             sample_rate=sample_rate,
             bit_depth=bit_depth,
+            channel_map=channel_map,
+            custom_channel_map=custom_map,
         )
         await self._player.restore_state()
         await self._player.apply_hardware_ceiling()
