@@ -65,8 +65,6 @@ async def get_config_entries(
     """Return Config entries to setup this provider."""
     # ruff: noqa: ARG001
     sink_options = await mass.loop.run_in_executor(None, _get_pa_sink_options)
-    selected_map = str((values or {}).get(CONF_CHANNEL_MAP, CHANNEL_MAP_FLAC))
-    show_custom = selected_map == CHANNEL_MAP_CUSTOM
     return (
         ConfigEntry(
             key=CONF_PA_SINK_NAME,
@@ -130,9 +128,11 @@ async def get_config_entries(
                 "Only used when 'Custom' is selected above. "
                 "Flat comma-separated indices for each sink pair in order: "
                 "front_stereo, center_sub, rear_stereo[, side_stereo]. "
-                "Example FLAC 5.1: 0,1,2,3,4,5  —  DVD 5.1: 0,1,3,2,4,5"
+                "Example FLAC 5.1: 0,1,2,3,4,5  \u2014  DVD 5.1: 0,1,3,2,4,5"
             ),
-        )
+        ),
+    )
+
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
