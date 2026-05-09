@@ -23,10 +23,12 @@ from music_assistant.models.player import Player, PlayerMedia
 
 from .constants import (
     CACHE_CATEGORY_PREV_STATE,
-    CONF_VOLUME_CONTROL,
+    CHANNEL_MAP_CUSTOM,
+    CHANNEL_MAP_FLAC,
     DEFAULT_HARDWARE_VOLUME_CEILING,
     DEFAULT_PLAYER_VOLUME,
     DEVICE_UUID_NAMESPACE,
+    PAIR_INDICES_BY_MAP,
     VOLUME_CONTROL_HARDWARE,
     VOLUME_CONTROL_SOFTWARE,
 )
@@ -41,23 +43,6 @@ if TYPE_CHECKING:
     from .provider import MultiChannelAudioProvider
 
 
-# Channel pair definitions for demuxing interleaved multichannel PCM.
-# Each entry maps a PA sink name suffix to the channel indices it carries.
-# FLAC channel ordering per spec:
-# 5.1: FL=0, FR=1, FC=2, LFE=3, RL=4, RR=5
-# 7.1: FL=0, FR=1, FC=2, LFE=3, RL=4, RR=5, SL=6, SR=7
-_PAIR_CHANNEL_INDICES_71 = {
-    "front_stereo":  (0, 1),   # FL, FR
-    "rear_stereo":   (4, 5),   # RL, RR
-    "center_sub":    (2, 3),   # FC, LFE
-    "side_stereo":   (6, 7),   # SL, SR
-}
-_PAIR_CHANNEL_INDICES_51 = {
-    "front_stereo":  (0, 1),   # FL, FR
-    "rear_stereo":   (4, 5),   # RL, RR
-    "center_sub":    (2, 3),   # FC, LFE
-}
-
 
 def get_player_uuid(pa_sink_name: str) -> str:
     """
@@ -68,14 +53,61 @@ def get_player_uuid(pa_sink_name: str) -> str:
     return str(uuid.uuid5(DEVICE_UUID_NAMESPACE, pa_sink_name))
 
 
-def _build_pair_sinks(card_name: str, layout: str) -> dict[str, tuple[int, int]]:
+def _parse_custom_map(
+    card_name: str, layout: str, custom_str: str
+) -> dict[str, tuple[int, int]] | None:
     """
-    Build mapping of PA sink name -> (ch_index_left, ch_index_right) for a card.
+    Parse a custom channel map string into a pair-sinks dict.
+
+    Expected format: flat comma-separated indices, two per sink pair, in order:
+    front_stereo, center_sub, rear_stereo[, side_stereo].
+    e.g. "0,1,2,3,4,5" for FLAC 5.1  or  "0,1,3,2,4,5" for DVD 5.1.
+
+    Returns None if the string is empty or malformed.
+    """
+    if not custom_str.strip():
+        return None
+    try:
+        indices = [int(x.strip()) for x in custom_str.split(",")]
+    except ValueError:
+        return None
+    suffixes_51 = ["front_stereo", "center_sub", "rear_stereo"]
+    suffixes_71 = ["front_stereo", "center_sub", "rear_stereo", "side_stereo"]
+    suffixes = suffixes_71 if layout == "7.1" else suffixes_51
+    expected = len(suffixes) * 2
+    if len(indices) < expected:
+        return None
+    return {
+        f"{card_name}_{suffix}": (indices[i * 2], indices[i * 2 + 1])
+        for i, suffix in enumerate(suffixes)
+    }
+
+
+def _build_pair_sinks(
+    card_name: str,
+    layout: str,
+    channel_map: str = CHANNEL_MAP_FLAC,
+    custom_channel_map: str = "",
+) -> dict[str, tuple[int, int]]:
+    """
+    Build mapping of PA sink name -> (ch_index_left, ch_index_right).
+
+    Resolves the channel index map from the configured preset or custom string.
 
     :param card_name: Card name prefix used in remap sink names e.g. 'Creative_X_Fi'.
     :param layout: Layout string '5.1' or '7.1'.
+    :param channel_map: Channel map preset identifier ('flac', 'dvd', 'custom').
+    :param custom_channel_map: Custom flat index string, used when channel_map='custom'.
     """
-    pairs = _PAIR_CHANNEL_INDICES_71 if layout == "7.1" else _PAIR_CHANNEL_INDICES_51
+    if channel_map == CHANNEL_MAP_CUSTOM:
+        parsed = _parse_custom_map(card_name, layout, custom_channel_map)
+        if parsed is not None:
+            return parsed
+        # Fall through to FLAC default if custom string is missing/invalid
+
+    pairs = PAIR_INDICES_BY_MAP.get(channel_map, {}).get(
+        layout, PAIR_INDICES_BY_MAP[CHANNEL_MAP_FLAC][layout]
+    )
     return {f"{card_name}_{pair}": indices for pair, indices in pairs.items()}
 
 
@@ -99,6 +131,8 @@ class MultiChannelPlayer(Player):
         layout: str,
         sample_rate: int,
         bit_depth: int,
+        channel_map: str = CHANNEL_MAP_FLAC,
+        custom_channel_map: str = "",
     ) -> None:
         """
         Initialize the Multichannel Audio player.
@@ -111,6 +145,8 @@ class MultiChannelPlayer(Player):
         :param layout: Layout identifier '5.1' or '7.1'.
         :param sample_rate: Native sample rate of the PA sinks.
         :param bit_depth: Bit depth (16, 24, or 32).
+        :param channel_map: Channel map preset ('flac', 'dvd', 'custom').
+        :param custom_channel_map: Custom flat index string when channel_map='custom'.
         """
         super().__init__(provider, player_id)
         self._attr_type = PlayerType.PLAYER
@@ -137,7 +173,9 @@ class MultiChannelPlayer(Player):
         self.bit_depth = bit_depth
 
         # Map of PA sink name -> (left_ch_index, right_ch_index)
-        self._pair_sinks: dict[str, tuple[int, int]] = _build_pair_sinks(card_name, layout)
+        self._pair_sinks: dict[str, tuple[int, int]] = _build_pair_sinks(
+            card_name, layout, channel_map, custom_channel_map
+        )
 
         self._hardware_volume_fallback = False
         self._playback_task: asyncio.Task[None] | None = None
@@ -150,12 +188,15 @@ class MultiChannelPlayer(Player):
 
     @property
     def volume_control_mode(self) -> str:
-        """Return the effective volume control mode for this player."""
+        """Return the effective volume control mode.
+
+        Always attempts hardware (pulsectl) volume control. Falls back to
+        software automatically if pulsectl is unavailable or a sink operation
+        fails. Not user-configurable.
+        """
         if self._hardware_volume_fallback:
             return VOLUME_CONTROL_SOFTWARE
-        return str(
-            self._provider.config.get_value(CONF_VOLUME_CONTROL) or VOLUME_CONTROL_HARDWARE
-        )
+        return VOLUME_CONTROL_HARDWARE
 
     # --- MA mandatory player interface ---
 
