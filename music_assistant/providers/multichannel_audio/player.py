@@ -522,19 +522,37 @@ class MultiChannelPlayer(Player):
         await self._save_state()
         self.update_state()
 
-    async def apply_hardware_ceiling(self) -> None:
-        """Set PA sink hardware volume ceiling on all stereo pair sinks."""
+    async def apply_restored_volume(self) -> None:
+        """Push restored volume/mute state out to PA sinks after startup.
+
+        Uses the cached volume level, clamped to DEFAULT_HARDWARE_VOLUME_CEILING
+        so a corrupt or missing cache entry never causes full-blast output on restart.
+        Also re-applies mute state so a muted player stays muted across restarts.
+        """
+        volume = min(
+            self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
+            DEFAULT_HARDWARE_VOLUME_CEILING,
+        )
+        self._attr_volume_level = volume
         for sink_name in self._pair_sinks:
             loop = asyncio.get_running_loop()
             ok = await loop.run_in_executor(
-                None, self._set_pulse_volume, sink_name, DEFAULT_HARDWARE_VOLUME_CEILING
+                None, self._set_pulse_volume, sink_name, volume
             )
-            if ok:
-                self.logger.debug(
-                    "Hardware ceiling set to %d%% for sink %s",
-                    DEFAULT_HARDWARE_VOLUME_CEILING,
-                    sink_name,
+            if not ok:
+                self._hardware_volume_fallback = True
+                break
+        if self._attr_volume_muted:
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._set_pulse_mute, sink_name, True
                 )
+        self.logger.debug(
+            "Restored volume %d%% muted=%s to PA sinks",
+            volume,
+            self._attr_volume_muted,
+        )
 
     def _set_pulse_volume(self, pa_sink_name: str, volume: int) -> bool:
         """
