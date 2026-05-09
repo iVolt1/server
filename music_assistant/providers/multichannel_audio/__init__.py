@@ -126,14 +126,13 @@ async def get_config_entries(
             label="Custom channel map (index pairs)",
             default_value="",
             required=False,
-            hidden=not show_custom,
             description=(
-                "Flat comma-separated channel indices for each sink pair in order: "
+                "Only used when 'Custom' is selected above. "
+                "Flat comma-separated indices for each sink pair in order: "
                 "front_stereo, center_sub, rear_stereo[, side_stereo]. "
-                "Example FLAC 5.1: 0,1,2,3,4,5  \u2014  DVD 5.1: 0,1,3,2,4,5"
+                "Example FLAC 5.1: 0,1,2,3,4,5  —  DVD 5.1: 0,1,3,2,4,5"
             ),
         ),
-    )
 
 
 async def setup(
