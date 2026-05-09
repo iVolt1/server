@@ -132,8 +132,7 @@ async def get_config_entries(
                 "front_stereo, center_sub, rear_stereo[, side_stereo]. "
                 "Example FLAC 5.1: 0,1,2,3,4,5  —  DVD 5.1: 0,1,3,2,4,5"
             ),
-        ),
-
+        )
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
