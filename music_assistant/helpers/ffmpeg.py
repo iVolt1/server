@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from music_assistant_models.enums import ContentType
@@ -28,47 +26,21 @@ LOGGER = logging.getLogger("ffmpeg")
 MINIMAL_FFMPEG_VERSION = 6
 CACHE_ATTR_LIBSOXR_PRESENT: Final[str] = "libsoxr_present"
 
-# Regex patterns to extract audio format details from ffmpeg's stderr output.
-# Examples of the lines we parse:
-#   Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 320 kb/s
-#   Stream #0:0(eng): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 254 kb/s
-#   Stream #0:0: Audio: flac, 96000 Hz, stereo, s32 (24 bit)
-#   Duration: 00:03:25.78, start: 0.000000, bitrate: 320 kb/s
-_FFMPEG_SAMPLE_RATE_RE: Final = re.compile(r"(\d+) Hz")
-_FFMPEG_BIT_RATE_RE: Final = re.compile(r"(\d+) kb/s")
-_FFMPEG_EXPLICIT_BIT_DEPTH_RE: Final = re.compile(r"\((\d+) bit\)")
-_FFMPEG_SAMPLE_FMT_RE: Final = re.compile(r"\b(u8p?|s16p?|s24p?|s32p?|fltp?|dblp?)\b")
-_FFMPEG_DURATION_RE: Final = re.compile(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)")
-
-# Mapping from ffmpeg sample format token to bit depth.
-# Note: planar variants (suffix 'p') describe memory layout only.
-# Floating point formats (flt/fltp/dbl/dblp) are typically the decoder's internal
-# representation for lossy codecs and do not reflect source bit depth, so the
-# caller decides whether to apply them based on the codec.
-_SAMPLE_FMT_BIT_DEPTH: Final[dict[str, int]] = {
-    "u8": 8,
-    "u8p": 8,
-    "s16": 16,
-    "s16p": 16,
-    "s24": 24,
-    "s24p": 24,
-    "s32": 32,
-    "s32p": 32,
-    "flt": 32,
-    "fltp": 32,
-    "dbl": 64,
-    "dblp": 64,
+_CHANNEL_LAYOUT_MAP: Final[dict[int, str]] = {
+    1: "mono",
+    2: "stereo",
+    3: "2.1",
+    4: "quad",
+    5: "4.1",
+    6: "5.1",
+    7: "6.1",
+    8: "7.1",
 }
 
 
-@dataclass
-class FFMpegStreamInfo:
-    """Audio format details parsed from an ffmpeg 'Stream #' log line."""
-
-    codec: ContentType
-    sample_rate: int | None = None
-    bit_depth: int | None = None
-    bit_rate: int | None = None
+def _channel_layout_str(channels: int) -> str:
+    """Return the ffmpeg channel layout string for a given channel count."""
+    return _CHANNEL_LAYOUT_MAP.get(channels, "stereo")
 
 
 class FFMpeg(AsyncProcess):
@@ -76,7 +48,7 @@ class FFMpeg(AsyncProcess):
 
     def __init__(
         self,
-        audio_input: AsyncGenerator[bytes] | str | int,
+        audio_input: AsyncGenerator[bytes, None] | str | int,
         input_format: AudioFormat,
         output_format: AudioFormat,
         filter_params: list[str] | None = None,
@@ -104,21 +76,9 @@ class FFMpeg(AsyncProcess):
         self.collect_log_history = collect_log_history
         self.log_history: deque[str] = deque(maxlen=100)
         self.concat_error = False  # switch to True if concat demuxer fails on MultiPartFiles
-        # Audio format details for the input and output stream as detected from ffmpeg's
-        # own stderr probe output. input_stream_info is also mirrored onto self.input_format
-        # so callers that share the AudioFormat (e.g. streamdetails) pick up the corrected
-        # values; output_stream_info is informational (useful for logging / future UI use).
-        self.input_stream_info: FFMpegStreamInfo | None = None
-        self.output_stream_info: FFMpegStreamInfo | None = None
-        # Source duration in (whole) seconds as detected from the ffmpeg input log line,
-        # or None if not yet parsed / not reported (e.g. live radio streams).
-        self.parsed_duration: int | None = None
         self._stdin_feeder_task: asyncio.Task[None] | None = None
         self._stderr_reader_task: asyncio.Task[None] | None = None
-        # ffmpeg emits 'Input #N, ...' and 'Output #N, ...' headers before each block of
-        # 'Stream #' lines; we track which block the next stream line belongs to.
-        # Defaults to "input" so a stray Stream # line before any header still routes there.
-        self._current_log_section: str = "input"
+        self._input_codec_parsed = False
         stdin: bool | int
         if audio_input == "-" or isinstance(audio_input, AsyncGenerator):
             stdin = True
@@ -210,33 +170,22 @@ class FFMpeg(AsyncProcess):
                 # and should raise an exception to prevent false progress logging
                 self.concat_error = True
 
-            # Track which ffmpeg block we're currently parsing so the next 'Stream #'
-            # audio line is routed to the correct slot (input vs output).
-            if line.startswith("Input #"):
-                self._current_log_section = "input"
-            elif line.startswith("Output #"):
-                self._current_log_section = "output"
-
-            # Capture the first audio stream line per section. Provider-supplied input
-            # details are often incomplete (e.g. defaults to 44.1/16) or missing for
-            # lossy codecs, so we mirror the parsed input values onto input_format too.
-            if self._current_log_section == "input" and self.input_stream_info is None:
-                if stream_info := parse_ffmpeg_stream_info(line):
-                    self.input_stream_info = stream_info
-                    self._log_stream_info("input", stream_info)
-                    self._apply_input_stream_info(stream_info)
-            elif self._current_log_section == "output" and self.output_stream_info is None:
-                if stream_info := parse_ffmpeg_stream_info(line):
-                    self.output_stream_info = stream_info
-                    self._log_stream_info("output", stream_info)
-
-            # Source duration is reported separately from the stream info. Useful when
-            # the provider didn't supply one (some podcast feeds report total_time=0).
-            if self.parsed_duration is None:
-                duration = parse_ffmpeg_duration(line)
-                if duration is not None:
-                    self.parsed_duration = duration
-                    self.logger.debug("Detected input duration: %s seconds", duration)
+            # if streamdetails contenttype is unknown, try parse it from the ffmpeg log
+            if line.startswith("Stream #") and ": Audio: " in line:
+                if not self._input_codec_parsed:
+                    content_type_raw = line.split(": Audio: ")[1].split(" ")[0]
+                    content_type_raw = content_type_raw.split(",")[0]
+                    content_type = ContentType.try_parse(content_type_raw)
+                    self.logger.log(
+                        VERBOSE_LOG_LEVEL,
+                        "Detected (input) content type: %s (%s)",
+                        content_type,
+                        content_type_raw,
+                    )
+                    if self.input_format.content_type == ContentType.UNKNOWN:
+                        self.input_format.content_type = content_type
+                    self.input_format.codec_type = content_type
+                    self._input_codec_parsed = True
             del line
 
     async def _feed_stdin(self) -> None:
@@ -276,84 +225,9 @@ class FFMpeg(AsyncProcess):
             if not generator_exhausted:
                 await close_async_generator(self.audio_input)
 
-    def _apply_input_stream_info(self, info: FFMpegStreamInfo) -> None:
-        """Mirror values from a parsed ffmpeg input stream line onto self.input_format."""
-        # content_type is the container format; only fill it in if the provider didn't
-        # specify one. codec_type is the audio codec ffmpeg detected; only override
-        # if we actually parsed a known codec (don't clobber a provider value with UNKNOWN).
-        if info.codec != ContentType.UNKNOWN:
-            if self.input_format.content_type == ContentType.UNKNOWN:
-                self.input_format.content_type = info.codec
-            self.input_format.codec_type = info.codec
-        if info.sample_rate:
-            self.input_format.sample_rate = info.sample_rate
-        if info.bit_depth:
-            self.input_format.bit_depth = info.bit_depth
-        if info.bit_rate:
-            self.input_format.bit_rate = info.bit_rate
-
-    def _log_stream_info(self, label: str, info: FFMpegStreamInfo) -> None:
-        """Log a parsed FFMpegStreamInfo object at debug level."""
-        self.logger.debug(
-            "Detected %s stream info: codec=%s sample_rate=%s bit_depth=%s bit_rate=%s kb/s",
-            label,
-            info.codec,
-            info.sample_rate,
-            info.bit_depth,
-            info.bit_rate,
-        )
-
-
-def parse_ffmpeg_stream_info(line: str) -> FFMpegStreamInfo | None:
-    """
-    Extract audio format details from an ffmpeg 'Stream #X: Audio: ...' log line.
-
-    :param line: A single ffmpeg stderr log line.
-    :returns: FFMpegStreamInfo when the line describes an audio stream,
-        otherwise None.
-    """
-    if not (line.startswith("Stream #") and ": Audio: " in line):
-        return None
-
-    # the codec name is the first token right after "Audio: ", stripping
-    # any trailing profile annotation like "(LC)" or container suffix
-    codec_part = line.split(": Audio: ", 1)[1].split(" ", 1)[0].split(",", maxsplit=1)[0]
-    codec = ContentType.try_parse(codec_part)
-
-    info = FFMpegStreamInfo(codec=codec)
-    if match := _FFMPEG_SAMPLE_RATE_RE.search(line):
-        info.sample_rate = int(match.group(1))
-    if match := _FFMPEG_BIT_RATE_RE.search(line):
-        info.bit_rate = int(match.group(1))
-    # Bit depth: an explicit "(N bit)" annotation wins (this is how ffmpeg reports
-    # 24-bit FLAC stored in an s32 sample format), otherwise infer from the sample
-    # format token. Lossy codecs report the decoder's internal precision (typically
-    # fltp), so we ignore the sample format token for those.
-    if match := _FFMPEG_EXPLICIT_BIT_DEPTH_RE.search(line):
-        info.bit_depth = int(match.group(1))
-    elif codec.is_lossless() and (match := _FFMPEG_SAMPLE_FMT_RE.search(line)):
-        info.bit_depth = _SAMPLE_FMT_BIT_DEPTH.get(match.group(1))
-
-    return info
-
-
-def parse_ffmpeg_duration(line: str) -> int | None:
-    """
-    Extract the source duration in seconds from an ffmpeg 'Duration: ...' log line.
-
-    :param line: A single ffmpeg stderr log line.
-    :returns: Duration in whole seconds, or None if the line does not contain
-        a parseable duration (e.g. 'Duration: N/A' on live streams).
-    """
-    match = _FFMPEG_DURATION_RE.search(line)
-    if not match:
-        return None
-    hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + int(float(seconds))
-
 
 async def get_ffmpeg_stream(
-    audio_input: AsyncGenerator[bytes] | str,
+    audio_input: AsyncGenerator[bytes, None] | str,
     input_format: AudioFormat,
     output_format: AudioFormat,
     filter_params: list[str] | None = None,
@@ -361,7 +235,7 @@ async def get_ffmpeg_stream(
     chunk_size: int | None = None,
     extra_input_args: list[str] | None = None,
     extra_output_args: list[str] | None = None,
-) -> AsyncGenerator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     """
     Get the ffmpeg audio stream as async generator.
 
@@ -453,7 +327,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
                 "-ac",
                 str(input_format.channels),
                 "-channel_layout",
-                "mono" if input_format.channels == 1 else "stereo",
+                _channel_layout_str(input_format.channels),
                 "-ar",
                 str(input_format.sample_rate),
                 "-acodec",
@@ -472,7 +346,7 @@ def get_ffmpeg_args(  # noqa: PLR0915
         "-ac",
         str(output_format.channels),
         "-channel_layout",
-        "mono" if output_format.channels == 1 else "stereo",
+        _channel_layout_str(output_format.channels),
     ]
     if output_path.upper() == "NULL":
         # devnull stream
