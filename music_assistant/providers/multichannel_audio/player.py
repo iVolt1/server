@@ -239,10 +239,14 @@ class MultiChannelPlayer(Player):
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
-        Opens one PASimpleStream per stereo pair whose channel indices
-        exist in the source, then for each PCM chunk extracts the two
-        relevant channels and writes them sequentially to the corresponding
-        sink. All writes happen in the same executor thread.
+        Uses a producer/consumer architecture:
+        - Producer: asyncio task reads ffmpeg output, demuxes each chunk into
+          per-sink sub-chunks, and puts them onto per-sink asyncio.Queues.
+        - Consumers: one executor thread per sink drains its queue, writing
+          sub-chunks to PA as fast as PA can accept them.
+
+        This decouples the bursty ffmpeg delivery from the steady PA write rate
+        so pa_simple_write never blocks the event loop or starves other sinks.
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
         from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
@@ -266,20 +270,38 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # Request large chunks from ffmpeg — the flow stream delivers in bursts
-        # of ~700ms worth of data regardless of requested size. We split each
-        # received chunk into write-sized sub-chunks in _demux_and_write so PA
-        # never receives more data than its buffer can absorb in one write call.
-        # write_size targets 20ms per sub-chunk for smooth PA buffer filling.
-        write_size = int(self.sample_rate * 0.020) * source_channels * 4
-        write_size = max((write_size // (source_channels * 4)) * (source_channels * 4),
-                         source_channels * 4)
-        chunk_size = write_size * 16  # request ~320ms worth from ffmpeg at a time
+        # Sub-chunk size: 20ms worth of stereo PCM per PA write
+        bytes_per_frame_src = 4 * source_channels  # always s32le from ffmpeg
+        frames_per_write = max(1, int(self.sample_rate * 0.020))
+        write_size = frames_per_write * bytes_per_frame_src
 
         streams: dict[str, PASimpleStream] = {}
+        queues: dict[str, threading.Queue[bytes | None]] = {}
         ffmpeg_proc: FFMpeg | None = None
+        writer_tasks: list[asyncio.Task] = []
+
+        def _sink_writer(
+            stream: PASimpleStream, q: "threading.Queue[bytes | None]"
+        ) -> None:
+            """Blocking sink writer — runs in its own executor thread.
+
+            Blocks on q.get() so no CPU is wasted spinning. Exits when
+            it receives the None sentinel.
+            """
+            while True:
+                buf = q.get()
+                if buf is None:
+                    break
+                stream.write(buf)
+
+        async def _writer_coro(
+            stream: PASimpleStream, q: "threading.Queue[bytes | None]"
+        ) -> None:
+            """Async wrapper that runs _sink_writer in an executor thread."""
+            await self.mass.loop.run_in_executor(None, _sink_writer, stream, q)
+
         try:
-            # Only open PA streams for pairs whose channel indices exist in the source
+            # Open PA streams and create per-sink queues
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= source_channels or right_idx >= source_channels:
                     continue
@@ -296,7 +318,9 @@ class MultiChannelPlayer(Player):
                     ),
                 )
                 streams[sink_name] = stream
+                queues[sink_name] = threading.Queue(maxsize=64)
                 self.logger.debug("Opened PA stream for %s", sink_name)
+
             self.logger.info(
                 "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
                 len(streams),
@@ -304,6 +328,13 @@ class MultiChannelPlayer(Player):
                 self.sample_rate,
                 self.bit_depth,
             )
+
+            # Start per-sink writer coroutines
+            for sink_name, stream in streams.items():
+                t = self.mass.create_task(
+                    _writer_coro(stream, queues[sink_name])
+                )
+                writer_tasks.append(t)
 
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
@@ -315,55 +346,51 @@ class MultiChannelPlayer(Player):
             await ffmpeg_proc.start()
 
             first_chunk = True
-            last_chunk_time = 0.0
-            async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
+            ct_val: str | None = None
+            is_float = False
+            async for chunk in ffmpeg_proc.iter_chunked(write_size * 32):
                 if first_chunk:
+                    ct_val = str(output_format.content_type.value).lower()
+                    is_float = "f32" in ct_val or "float" in ct_val
                     self.logger.debug(
                         "First PCM chunk: len=%d channels=%d content_type=%s",
-                        len(chunk),
-                        source_channels,
-                        output_format.content_type,
+                        len(chunk), source_channels, output_format.content_type,
                     )
                     first_chunk = False
-                    last_chunk_time = asyncio.get_event_loop().time()
-                else:
-                    now = asyncio.get_event_loop().time()
-                    gap = now - last_chunk_time
-                    last_chunk_time = now
-                    chunk_duration = len(chunk) / (4 * source_channels * self.sample_rate)
-                    if gap > chunk_duration * 5.0:
-                        self.logger.warning(
-                            "Chunk delivery gap: %.1fms (expected %.1fms)",
-                            gap * 1000, chunk_duration * 1000,
-                        )
 
                 if self._paused:
                     await asyncio.sleep(0.05)
                     continue
 
                 chunk = self._apply_software_volume(chunk)
-                ct_val = str(output_format.content_type.value).lower()
-                is_float = "f32" in ct_val or "float" in ct_val
 
-                # Demux once in executor, then write all sinks in parallel.
-                # Each sink gets its own executor thread so pa_simple_write
-                # calls don't serialize — all pairs advance together.
+                # Demux chunk into per-sink sub-chunk lists, then enqueue.
+                # Both demux and enqueue run in an executor so blocking queue.put()
+                # (when queue is full) doesn't stall the event loop.
                 pair_buffers = await self.mass.loop.run_in_executor(
-                    None, self._demux_chunk_split, chunk, is_float, source_channels, write_size
+                    None, self._demux_chunk_split, chunk, is_float,
+                    source_channels, write_size,
                 )
-                await asyncio.gather(*[
-                    self.mass.loop.run_in_executor(
-                        None, self._write_pair_buffers, streams[sink_name], buffers
-                    )
-                    for sink_name, buffers in pair_buffers.items()
-                    if sink_name in streams
-                ])
+                def _enqueue(pb=pair_buffers):
+                    for sname, bufs in pb.items():
+                        if sname in queues:
+                            for buf in bufs:
+                                queues[sname].put(buf)
+                await self.mass.loop.run_in_executor(None, _enqueue)
 
         except asyncio.CancelledError:
             pass
         except Exception as err:
             self.logger.error("Playback error: %s", err)
         finally:
+            # Send sentinel to each writer queue to stop writer threads
+            for q in queues.values():
+                with suppress(Exception):
+                    q.put(None)
+            # Wait for writers to drain and finish
+            if writer_tasks:
+                with suppress(Exception):
+                    await asyncio.gather(*writer_tasks)
             if ffmpeg_proc is not None:
                 with suppress(Exception):
                     await ffmpeg_proc.close()
