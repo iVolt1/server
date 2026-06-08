@@ -268,9 +268,9 @@ class MultiChannelPlayer(Player):
         if source_sample_rate == 0:
             source_sample_rate = self.sample_rate
 
-        # Request ffmpeg output at hardware sample rate (self.sample_rate) so
-        # PA streams run at the native sink rate. ffmpeg resamples from source
-        # rate to hardware rate. Use source bit depth to avoid format conversion.
+        # Request ffmpeg output at hardware sample rate via explicit resample.
+        # MA's flow stream may deliver at source rate regardless of output_format,
+        # so we force resampling with an explicit ffmpeg filter.
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(source_bit_depth),
             sample_rate=self.sample_rate,
@@ -327,7 +327,11 @@ class MultiChannelPlayer(Player):
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
-                extra_output_args=["-flush_packets", "1"],
+                extra_output_args=[
+                    "-flush_packets", "1",
+                    "-af", f"aresample={self.sample_rate}",
+                    "-ar", str(self.sample_rate),
+                ],
                 collect_log_history=True,
             )
             await ffmpeg_proc.start()
