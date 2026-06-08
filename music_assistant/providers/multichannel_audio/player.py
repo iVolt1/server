@@ -408,14 +408,22 @@ class MultiChannelPlayer(Player):
             if num_frames == 0:
                 return
             samples = samples[: num_frames * channels].reshape(num_frames, channels)
+            debug_first = not getattr(self, "_demux_debug_done", False)
+            if debug_first:
+                self._demux_debug_done = True
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if sink_name not in streams:
                     continue
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                if debug_first:
+                    self.logger.debug(
+                        "demux %s: idx=(%d,%d) frames=%d max_abs=%d",
+                        sink_name, left_idx, right_idx,
+                        len(pair), int(np.abs(pair).max()),
+                    )
                 if source_bit_depth == 16:
-                    # Shift s16 into upper 16 bits of s32 for full amplitude
                     streams[sink_name].write((pair.astype(np.int32) << 16).tobytes())
                 elif source_bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
