@@ -334,12 +334,6 @@ class MultiChannelPlayer(Player):
                         "First PCM chunk: len=%d channels=%d content_type=%s",
                         len(chunk), source_channels, output_format.content_type,
                     )
-                    # DEBUG: dump first 4096 bytes for offline inspection
-                    try:
-                        with open("/tmp/first_chunk.bin", "wb") as _f:
-                            _f.write(chunk[:4096])
-                    except Exception:
-                        pass
                     first_chunk = False
 
                 if self._paused:
@@ -407,7 +401,7 @@ class MultiChannelPlayer(Player):
                     .tobytes()
                 )
         else:
-            # ffmpeg always delivers s32le — treat as int32 regardless of source
+            # MA delivers s32le PCM regardless of source bit depth.
             samples = np.frombuffer(pcm_data, dtype=np.int32)
             num_frames = len(samples) // channels
             if num_frames == 0:
