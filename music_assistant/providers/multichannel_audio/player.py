@@ -191,9 +191,10 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Get source channel count and bit depth from active queue streamdetails
+        # Get source channel count, bit depth, and sample rate from streamdetails
         source_channels = self.channels
         source_bit_depth = self.bit_depth
+        source_sample_rate = self.sample_rate
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
@@ -209,6 +210,8 @@ class MultiChannelPlayer(Player):
                     source_channels = sd.audio_format.channels
                 if sd.audio_format.bit_depth > 0:
                     source_bit_depth = sd.audio_format.bit_depth
+                if sd.audio_format.sample_rate > 0:
+                    source_sample_rate = sd.audio_format.sample_rate
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
@@ -216,7 +219,7 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(
-            self._playback_loop(url, source_channels, source_bit_depth)
+            self._playback_loop(url, source_channels, source_bit_depth, source_sample_rate)
         )
 
     async def stop(self) -> None:
@@ -240,7 +243,13 @@ class MultiChannelPlayer(Player):
 
     # --- Playback loop ---
 
-    async def _playback_loop(self, url: str, source_channels: int = 0, source_bit_depth: int = 0) -> None:
+    async def _playback_loop(
+        self,
+        url: str,
+        source_channels: int = 0,
+        source_bit_depth: int = 0,
+        source_sample_rate: int = 0,
+    ) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
@@ -256,14 +265,15 @@ class MultiChannelPlayer(Player):
             source_channels = self.channels
         if source_bit_depth == 0:
             source_bit_depth = self.bit_depth
+        if source_sample_rate == 0:
+            source_sample_rate = self.sample_rate
 
-        # Always request s32le output from ffmpeg — MA's pipeline converts
-        # internally regardless of source bit depth. The PA remap sinks are
-        # s32le so this is the correct format end-to-end.
+        # Request ffmpeg output matching the actual source format — MA delivers
+        # the native stream format as shown in the signal chain UI.
         output_format = AudioFormat(
-            content_type=ContentType.from_bit_depth(32),
-            sample_rate=self.sample_rate,
-            bit_depth=32,
+            content_type=ContentType.from_bit_depth(source_bit_depth),
+            sample_rate=source_sample_rate,
+            bit_depth=source_bit_depth,
             channels=source_channels,
         )
         self.logger.debug(
@@ -276,13 +286,11 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # PA buffer sized to 2× the expected ffmpeg burst (~640ms at 8ch/96kHz).
-        # This ensures pa_simple_write returns immediately without blocking for
-        # drain, keeping all sink writes synchronous and in phase.
+        # PA buffer sized to 2× the expected ffmpeg burst.
         buffer_msec = 1500
 
-        # Request chunks sized to ~640ms — matches flow stream burst size.
-        chunk_size = int(self.sample_rate * 0.640) * source_channels * 4
+        # Chunk size based on source sample rate
+        chunk_size = int(source_sample_rate * 0.640) * source_channels * (source_bit_depth // 8)
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
@@ -296,9 +304,9 @@ class MultiChannelPlayer(Player):
                     lambda s=sname: PASimpleStream(
                         sink_name=s,
                         app_name="music-assistant-multichannel",
-                        rate=self.sample_rate,
+                        rate=source_sample_rate,
                         channels=2,
-                        bit_depth=self.bit_depth,
+                        bit_depth=source_bit_depth,
                         buffer_msec=buffer_msec,
                     ),
                 )
@@ -306,11 +314,10 @@ class MultiChannelPlayer(Player):
                 self.logger.debug("Opened PA stream for %s", sink_name)
 
             self.logger.info(
-                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit (src %dbit)",
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
                 len(streams),
                 source_channels,
-                self.sample_rate,
-                32,
+                source_sample_rate,
                 source_bit_depth,
             )
 
@@ -340,7 +347,7 @@ class MultiChannelPlayer(Player):
                     await asyncio.sleep(0.05)
                     continue
 
-                chunk = self._apply_software_volume(chunk)
+                chunk = self._apply_software_volume(chunk, source_bit_depth)
                 await self.mass.loop.run_in_executor(
                     None, self._demux_and_write_all, chunk, streams, is_float, source_channels, source_bit_depth
                 )
@@ -401,8 +408,9 @@ class MultiChannelPlayer(Player):
                     .tobytes()
                 )
         else:
-            # MA delivers s32le PCM regardless of source bit depth.
-            samples = np.frombuffer(pcm_data, dtype=np.int32)
+            # Read PCM at source bit depth
+            dtype = np.int16 if source_bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
             num_frames = len(samples) // channels
             if num_frames == 0:
                 return
@@ -413,7 +421,11 @@ class MultiChannelPlayer(Player):
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                streams[sink_name].write(pair.tobytes())
+                if source_bit_depth == 24:
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                    streams[sink_name].write(pair_bytes)
+                else:
+                    streams[sink_name].write(pair.tobytes())
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
@@ -458,7 +470,7 @@ class MultiChannelPlayer(Player):
             self._attr_volume_muted,
         )
 
-    def _apply_software_volume(self, pcm_data: bytes) -> bytes:
+    def _apply_software_volume(self, pcm_data: bytes, bit_depth: int | None = None) -> bytes:
         """Apply software volume scaling to PCM data."""
         if self.volume_control_mode != VOLUME_CONTROL_SOFTWARE:
             return pcm_data
@@ -468,19 +480,21 @@ class MultiChannelPlayer(Player):
         if volume is None or volume >= 100:
             return pcm_data
         scale = volume / 100.0
-        if self.bit_depth == 32:
-            samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
-            scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
-            return scaled.astype(np.int32).tobytes()
-        if self.bit_depth == 24:
+        effective_depth = bit_depth if bit_depth is not None else self.bit_depth
+        if effective_depth == 16:
+            samples = np.frombuffer(pcm_data, dtype=np.int16).copy()
+            scaled = np.clip(samples.astype(np.float64) * scale, -32768, 32767)
+            return scaled.astype(np.int16).tobytes()
+        if effective_depth == 24:
             samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
             scaled = np.clip(
                 samples.astype(np.float64) * scale, -2147483648, 2147483647
             ).astype(np.int32)
             return scaled.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-        samples_16 = np.frombuffer(pcm_data, dtype=np.int16).copy()
-        scaled = np.clip(samples_16.astype(np.float64) * scale, -32768, 32767)
-        return scaled.astype(np.int16).tobytes()
+        # 32-bit
+        samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
+        scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
+        return scaled.astype(np.int32).tobytes()
 
     # --- State persistence ---
 
