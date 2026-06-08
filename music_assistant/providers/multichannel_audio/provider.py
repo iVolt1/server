@@ -16,7 +16,78 @@ from .constants import (
     MULTICHANNEL_CHANNELS,
     MULTICHANNEL_LAYOUT_51,
 )
+from .pa_simple import enumerate_pa_sinks
 from .player import MultiChannelPlayer, get_player_uuid
+
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.provider import ProviderManifest
+    from music_assistant.mass import MusicAssistant
+
+
+_PAIR_SUFFIXES_51 = {"_front_stereo", "_center_sub", "_rear_stereo"}
+_PAIR_SUFFIXES_71 = _PAIR_SUFFIXES_51 | {"_side_stereo"}
+
+
+def _derive_card_name(sink_name: str, layout: str) -> str | None:
+    """Auto-detect the stereo pair sink prefix by scanning PulseAudio remap sinks.
+
+    For each candidate prefix, checks whether the remap sinks' master sink
+    matches the configured surround sink name — giving an exact match rather
+    than a string similarity heuristic.
+
+    :param sink_name: The configured surround sink name.
+    :param layout: Layout string '5.1' or '7.1'.
+    :returns: The detected prefix string, or None if no match found.
+    """
+    import json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    required = _PAIR_SUFFIXES_71 if layout == "7.1" else _PAIR_SUFFIXES_51
+    try:
+        sinks = enumerate_pa_sinks()
+    except Exception:
+        return None
+
+    remap_names = {s["pa_sink_name"] for s in sinks if s.get("is_remap")}
+
+    # Build candidate prefixes from remap sink names
+    candidates: dict[str, set[str]] = {}
+    for name in remap_names:
+        for suffix in required:
+            if name.endswith(suffix):
+                prefix = name[: -len(suffix)]
+                candidates.setdefault(prefix, set()).add(suffix)
+
+    matches = [p for p, found in candidates.items() if required.issubset(found)]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    # Multiple candidates — look up master sink for each via pactl to find
+    # the one whose remap sinks point at our configured surround sink.
+    try:
+        result = subprocess.run(
+            ["pactl", "--format=json", "list", "modules"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0:
+            for mod in json.loads(result.stdout):
+                arg = mod.get("argument", "") or ""
+                if f"master={sink_name}" in arg:
+                    for prefix in matches:
+                        if any(
+                            f"sink_name={prefix}{suffix.lstrip('_')}" in arg
+                            or f"sink_name={prefix}{suffix}" in arg
+                            for suffix in required
+                        ):
+                            return prefix
+    except Exception:
+        pass
+
+    # Fallback: prefer shorter prefix (less likely to be a generic name)
+    return min(matches, key=len)
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -68,9 +139,19 @@ class MultiChannelAudioProvider(PlayerProvider):
             None, _query_sink_format, sink_name
         )
 
-        # Derive card name from sink name for stereo pair lookup.
-        # e.g. "Creative_X_Fi_surround" -> "Creative_X_Fi"
-        card_name = sink_name.replace("_surround", "")
+        # Auto-detect the stereo pair sink prefix from PA remap sinks
+        card_name = await self.mass.loop.run_in_executor(
+            None, _derive_card_name, sink_name, layout
+        )
+        if not card_name:
+            self.logger.error(
+                "Could not auto-detect stereo pair sink prefix for layout %s — "
+                "no matching remap sinks found via pactl. "
+                "Ensure the Stereo Pairs addon is running and has created remap sinks.",
+                layout,
+            )
+            return
+        self.logger.info("Auto-detected stereo pair sink prefix: %s", card_name)
 
         self._player = MultiChannelPlayer(
             provider=self,
