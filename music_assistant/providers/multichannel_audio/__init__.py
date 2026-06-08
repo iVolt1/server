@@ -15,7 +15,6 @@ from .constants import (
     CHANNEL_MAP_CUSTOM,
     CHANNEL_MAP_DVD,
     CHANNEL_MAP_FLAC,
-    CONF_CARD_NAME,
     CONF_CHANNEL_MAP,
     CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
@@ -76,18 +75,6 @@ async def get_config_entries(
             description=(
                 "Select the PulseAudio surround sink to use for multichannel output. "
                 "This should be a 5.1 or 7.1 profile sink on your sound card."
-            ),
-            required=True,
-        ),
-        ConfigEntry(
-            key=CONF_CARD_NAME,
-            type=ConfigEntryType.STRING,
-            label="Stereo pair sink prefix",
-            default_value="",
-            description=(
-                "Prefix of the stereo pair remap sinks created by the Stereo Pairs addon. "
-                "For example, if your remap sinks are named 'Creative_X_Fi_front_stereo', "
-                "'Creative_X_Fi_rear_stereo', etc., enter 'Creative_X_Fi' here."
             ),
             required=True,
         ),

@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
-    CONF_CARD_NAME,
     CONF_CHANNEL_MAP,
     CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
@@ -69,14 +68,9 @@ class MultiChannelAudioProvider(PlayerProvider):
             None, _query_sink_format, sink_name
         )
 
-        # Card name prefix for stereo pair remap sinks — explicit config value,
-        # e.g. "Creative_X_Fi" for sinks named "Creative_X_Fi_front_stereo" etc.
-        card_name = str(self.config.get_value(CONF_CARD_NAME) or "").strip()
-        if not card_name:
-            self.logger.error(
-                "No stereo pair sink prefix configured — cannot build pair sink names"
-            )
-            return
+        # Derive card name from sink name for stereo pair lookup.
+        # e.g. "Creative_X_Fi_surround" -> "Creative_X_Fi"
+        card_name = sink_name.replace("_surround", "")
 
         self._player = MultiChannelPlayer(
             provider=self,

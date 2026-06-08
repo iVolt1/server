@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
@@ -30,8 +29,15 @@ from .constants import (
     DEFAULT_PLAYER_VOLUME,
     DEVICE_UUID_NAMESPACE,
     PAIR_INDICES_BY_MAP,
+    VOLUME_CONTROL_HARDWARE,
     VOLUME_CONTROL_SOFTWARE,
 )
+
+try:
+    import pulsectl
+    _PULSECTL_AVAILABLE = True
+except ImportError:
+    _PULSECTL_AVAILABLE = False
 
 if TYPE_CHECKING:
     from .provider import MultiChannelAudioProvider
@@ -171,6 +177,7 @@ class MultiChannelPlayer(Player):
             card_name, layout, channel_map, custom_channel_map
         )
 
+        self._hardware_volume_fallback = False
         self._playback_task: asyncio.Task[None] | None = None
         self._paused = False
 
@@ -181,8 +188,15 @@ class MultiChannelPlayer(Player):
 
     @property
     def volume_control_mode(self) -> str:
-        """Return the volume control mode. Always software (numpy PCM scaling)."""
-        return VOLUME_CONTROL_SOFTWARE
+        """Return the effective volume control mode.
+
+        Always attempts hardware (pulsectl) volume control. Falls back to
+        software automatically if pulsectl is unavailable or a sink operation
+        fails. Not user-configurable.
+        """
+        if self._hardware_volume_fallback:
+            return VOLUME_CONTROL_SOFTWARE
+        return VOLUME_CONTROL_HARDWARE
 
     # --- MA mandatory player interface ---
 
@@ -191,27 +205,20 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Get source channel count, bit depth, and sample rate from streamdetails
+        # Get source channel count from active queue streamdetails
         source_channels = self.channels
-        source_bit_depth = self.bit_depth
-        source_sample_rate = self.sample_rate
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
                 sd = queue.current_item.streamdetails
                 self.logger.debug(
-                    "streamdetails: channels=%d sample_rate=%d bit_depth=%d uri=%s",
+                    "streamdetails: channels=%d sample_rate=%d uri=%s",
                     sd.audio_format.channels,
                     sd.audio_format.sample_rate,
-                    sd.audio_format.bit_depth,
                     sd.uri,
                 )
                 if sd.audio_format.channels > 0:
                     source_channels = sd.audio_format.channels
-                if sd.audio_format.bit_depth > 0:
-                    source_bit_depth = sd.audio_format.bit_depth
-                if sd.audio_format.sample_rate > 0:
-                    source_sample_rate = sd.audio_format.sample_rate
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
@@ -219,7 +226,7 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(
-            self._playback_loop(url, source_channels, source_bit_depth, source_sample_rate)
+            self._playback_loop(url, source_channels)
         )
 
     async def stop(self) -> None:
@@ -243,38 +250,25 @@ class MultiChannelPlayer(Player):
 
     # --- Playback loop ---
 
-    async def _playback_loop(
-        self,
-        url: str,
-        source_channels: int = 0,
-        source_bit_depth: int = 0,
-        source_sample_rate: int = 0,
-    ) -> None:
+    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
-        Sequential architecture: for each ffmpeg chunk, demux into per-sink
-        buffers then write all sinks in a single executor thread, one sink at
-        a time. PA buffers are sized to absorb the full chunk so pa_simple_write
-        returns immediately without blocking for drain.
+        Opens one PASimpleStream per stereo pair whose channel indices
+        exist in the source, then for each PCM chunk extracts the two
+        relevant channels and writes them sequentially to the corresponding
+        sink. All writes happen in the same executor thread.
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
         from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
 
         if source_channels == 0:
             source_channels = self.channels
-        if source_bit_depth == 0:
-            source_bit_depth = self.bit_depth
-        if source_sample_rate == 0:
-            source_sample_rate = self.sample_rate
 
-        # Request ffmpeg output at hardware sample rate via explicit resample.
-        # MA's flow stream may deliver at source rate regardless of output_format,
-        # so we force resampling with an explicit ffmpeg filter.
         output_format = AudioFormat(
-            content_type=ContentType.from_bit_depth(source_bit_depth),
+            content_type=ContentType.from_bit_depth(self.bit_depth),
             sample_rate=self.sample_rate,
-            bit_depth=source_bit_depth,
+            bit_depth=self.bit_depth,
             channels=source_channels,
         )
         self.logger.debug(
@@ -287,15 +281,15 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # PA buffer sized to 2× the expected ffmpeg burst.
-        buffer_msec = 1500
-
-        # Chunk size based on hardware sample rate
-        chunk_size = int(self.sample_rate * 0.640) * source_channels * (source_bit_depth // 8)
+        # Target 10ms chunks to ensure steady delivery to PA sinks.
+        # Default get_ffmpeg_stream chunks are too large causing delivery gaps.
+        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
         try:
+            # Only open PA streams for pairs whose channel indices exist in the source
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= source_channels or right_idx >= source_channels:
                     continue
@@ -308,54 +302,60 @@ class MultiChannelPlayer(Player):
                         rate=self.sample_rate,
                         channels=2,
                         bit_depth=self.bit_depth,
-                        buffer_msec=buffer_msec,
+                        buffer_msec=80,
                     ),
                 )
                 streams[sink_name] = stream
                 self.logger.debug("Opened PA stream for %s", sink_name)
-
             self.logger.info(
-                "Multichannel playback started: %d active pairs, %dch source, %dHz→%dHz, %dbit",
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
                 len(streams),
                 source_channels,
-                source_sample_rate,
                 self.sample_rate,
-                source_bit_depth,
+                self.bit_depth,
             )
 
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
                 input_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 output_format=output_format,
-                extra_output_args=[
-                    "-flush_packets", "1",
-                    "-af", f"aresample={self.sample_rate}",
-                    "-ar", str(self.sample_rate),
-                ],
+                extra_output_args=["-flush_packets", "1"],
                 collect_log_history=True,
             )
             await ffmpeg_proc.start()
 
             first_chunk = True
-            ct_val: str = ""
-            is_float = False
+            last_chunk_time = 0.0
             async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
                 if first_chunk:
-                    ct_val = str(output_format.content_type.value).lower()
-                    is_float = "f32" in ct_val or "float" in ct_val
                     self.logger.debug(
                         "First PCM chunk: len=%d channels=%d content_type=%s",
-                        len(chunk), source_channels, output_format.content_type,
+                        len(chunk),
+                        source_channels,
+                        output_format.content_type,
                     )
                     first_chunk = False
+                    last_chunk_time = asyncio.get_event_loop().time()
+                else:
+                    now = asyncio.get_event_loop().time()
+                    gap = now - last_chunk_time
+                    last_chunk_time = now
+                    chunk_duration = len(chunk) / (4 * source_channels * self.sample_rate)
+                    if gap > chunk_duration * 5.0:
+                        self.logger.warning(
+                            "Chunk delivery gap: %.1fms (expected %.1fms)",
+                            gap * 1000, chunk_duration * 1000,
+                        )
 
                 if self._paused:
                     await asyncio.sleep(0.05)
                     continue
 
-                chunk = self._apply_software_volume(chunk, source_bit_depth)
+                chunk = self._apply_software_volume(chunk)
+                ct_val = str(output_format.content_type.value).lower()
+                is_float = "f32" in ct_val or "float" in ct_val
                 await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write_all, chunk, streams, is_float, source_channels, source_bit_depth
+                    None, self._demux_and_write, chunk, streams, is_float, source_channels
                 )
 
         except asyncio.CancelledError:
@@ -376,24 +376,24 @@ class MultiChannelPlayer(Player):
             if self._playback_task is asyncio.current_task():
                 self._playback_task = None
 
-    def _demux_and_write_all(
+
+    def _demux_and_write(
         self,
         pcm_data: bytes,
         streams: dict[str, PASimpleStream],
         is_float: bool,
         source_channels: int,
-        source_bit_depth: int = 32,
     ) -> None:
-        """Demux interleaved PCM and write each pair to its PA sink sequentially.
+        """
+        Demux interleaved multichannel PCM and write each pair sequentially.
 
-        PA buffers are sized to absorb the full chunk so each write returns
-        immediately. Sequential writes keep all sinks frame-aligned.
+        Combines demux and write in a single executor call to minimize thread
+        pool overhead and keep all PA writes in one thread.
 
-        :param pcm_data: Interleaved multichannel PCM bytes (s32le, s16le, or f32).
-        :param streams: Map of sink_name -> open PASimpleStream.
+        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param streams: Map of sink name to open PASimpleStream.
         :param is_float: True if pcm_data is float32.
-        :param source_channels: Channel count in pcm_data.
-        :param source_bit_depth: Bit depth of pcm_data (16, 24, or 32).
+        :param source_channels: Actual channel count in pcm_data.
         """
         channels = source_channels if source_channels > 0 else self.channels
         if is_float:
@@ -401,39 +401,84 @@ class MultiChannelPlayer(Player):
             num_frames = len(samples) // channels
             if num_frames == 0:
                 return
-            samples = samples[: num_frames * channels].reshape(num_frames, channels)
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if sink_name not in streams:
                     continue
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                streams[sink_name].write(
-                    np.clip(pair * 2147483647.0, -2147483648, 2147483647)
-                    .astype(np.int32)
-                    .tobytes()
-                )
+                pair_i32 = np.clip(
+                    pair * 2147483647.0, -2147483648, 2147483647
+                ).astype(np.int32)
+                streams[sink_name].write(pair_i32.tobytes())
         else:
-            dtype = np.int16 if source_bit_depth == 16 else np.int32
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
             num_frames = len(samples) // channels
             if num_frames == 0:
                 return
-            samples = samples[: num_frames * channels].reshape(num_frames, channels)
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if sink_name not in streams:
                     continue
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                if source_bit_depth == 16:
-                    # Shift s16 into upper 16 bits of s32 for full amplitude
-                    streams[sink_name].write((pair.astype(np.int32) << 16).tobytes())
-                elif source_bit_depth == 24:
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                    streams[sink_name].write(pair_bytes)
-                else:
-                    streams[sink_name].write(pair.tobytes())
+                streams[sink_name].write(pair_bytes)
+
+    def _demux_chunk(
+        self,
+        pcm_data: bytes,
+        is_float: bool,
+        source_channels: int,
+    ) -> dict[str, bytes]:
+        """
+        Demux interleaved multichannel PCM into per-pair byte buffers.
+
+        Returns a dict of sink_name -> stereo PCM bytes without writing to PA.
+        Caller writes each pair in parallel.
+
+        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param is_float: True if pcm_data is float32.
+        :param source_channels: Actual channel count in pcm_data.
+        """
+        channels = source_channels if source_channels > 0 else self.channels
+        result: dict[str, bytes] = {}
+
+        if is_float:
+            samples = np.frombuffer(pcm_data, dtype=np.float32)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_i32 = np.clip(
+                    pair * 2147483647.0, -2147483648, 2147483647
+                ).astype(np.int32)
+                result[sink_name] = pair_i32.tobytes()
+        else:
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                result[sink_name] = pair_bytes
+        return result
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
@@ -450,35 +495,106 @@ class MultiChannelPlayer(Player):
     # --- Volume control ---
 
     async def volume_set(self, volume_level: int) -> None:
-        """Handle VOLUME_SET command. Volume applied via software PCM scaling."""
+        """Handle VOLUME_SET command."""
         self._attr_volume_level = volume_level
+        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
+            # Set volume on all stereo pair sinks
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                ok = await loop.run_in_executor(
+                    None, self._set_pulse_volume, sink_name, volume_level
+                )
+                if not ok:
+                    self._hardware_volume_fallback = True
+                    break
         await self._save_state()
         self.update_state()
 
     async def volume_mute(self, muted: bool) -> None:
-        """Handle VOLUME_MUTE command. Mute applied via software PCM scaling."""
+        """Handle VOLUME_MUTE command."""
         self._attr_volume_muted = muted
+        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._set_pulse_mute, sink_name, muted
+                )
         await self._save_state()
         self.update_state()
 
     async def apply_restored_volume(self) -> None:
-        """Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
+        """Push restored volume/mute state out to PA sinks after startup.
 
-        Ensures a corrupt or missing cache entry never causes full-blast output.
-        Volume is applied to the PCM stream via software scaling during playback.
+        Uses the cached volume level, clamped to DEFAULT_HARDWARE_VOLUME_CEILING
+        so a corrupt or missing cache entry never causes full-blast output on restart.
+        Also re-applies mute state so a muted player stays muted across restarts.
         """
         volume = min(
             self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
             DEFAULT_HARDWARE_VOLUME_CEILING,
         )
         self._attr_volume_level = volume
+        for sink_name in self._pair_sinks:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(
+                None, self._set_pulse_volume, sink_name, volume
+            )
+            if not ok:
+                self._hardware_volume_fallback = True
+                break
+        if self._attr_volume_muted:
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._set_pulse_mute, sink_name, True
+                )
         self.logger.debug(
-            "Restored volume %d%% muted=%s",
+            "Restored volume %d%% muted=%s to PA sinks",
             volume,
             self._attr_volume_muted,
         )
 
-    def _apply_software_volume(self, pcm_data: bytes, bit_depth: int | None = None) -> bytes:
+    def _set_pulse_volume(self, pa_sink_name: str, volume: int) -> bool:
+        """
+        Set PulseAudio sink volume via pulsectl. Returns True on success.
+
+        :param pa_sink_name: The PulseAudio sink name.
+        :param volume: Volume level 0-100.
+        """
+        if not _PULSECTL_AVAILABLE:
+            return False
+        try:
+            with pulsectl.Pulse("ma-multichannel") as pulse:
+                for sink in pulse.sink_list():
+                    if sink.name == pa_sink_name:
+                        pulse.volume_set_all_chans(sink, volume / 100.0)
+                        return True
+            return False
+        except Exception as err:
+            self.logger.warning("pulsectl volume error for %s: %s", pa_sink_name, err)
+            return False
+
+    def _set_pulse_mute(self, pa_sink_name: str, muted: bool) -> bool:
+        """
+        Set PulseAudio sink mute state via pulsectl. Returns True on success.
+
+        :param pa_sink_name: The PulseAudio sink name.
+        :param muted: Whether to mute or unmute.
+        """
+        if not _PULSECTL_AVAILABLE:
+            return False
+        try:
+            with pulsectl.Pulse("ma-multichannel") as pulse:
+                for sink in pulse.sink_list():
+                    if sink.name == pa_sink_name:
+                        pulse.mute(sink, muted)
+                        return True
+            return False
+        except Exception as err:
+            self.logger.warning("pulsectl mute error for %s: %s", pa_sink_name, err)
+            return False
+
+    def _apply_software_volume(self, pcm_data: bytes) -> bytes:
         """Apply software volume scaling to PCM data."""
         if self.volume_control_mode != VOLUME_CONTROL_SOFTWARE:
             return pcm_data
@@ -488,21 +604,19 @@ class MultiChannelPlayer(Player):
         if volume is None or volume >= 100:
             return pcm_data
         scale = volume / 100.0
-        effective_depth = bit_depth if bit_depth is not None else self.bit_depth
-        if effective_depth == 16:
-            samples = np.frombuffer(pcm_data, dtype=np.int16).copy()
-            scaled = np.clip(samples.astype(np.float64) * scale, -32768, 32767)
-            return scaled.astype(np.int16).tobytes()
-        if effective_depth == 24:
+        if self.bit_depth == 32:
+            samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
+            scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
+            return scaled.astype(np.int32).tobytes()
+        if self.bit_depth == 24:
             samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
             scaled = np.clip(
                 samples.astype(np.float64) * scale, -2147483648, 2147483647
             ).astype(np.int32)
             return scaled.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-        # 32-bit
-        samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
-        scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
-        return scaled.astype(np.int32).tobytes()
+        samples_16 = np.frombuffer(pcm_data, dtype=np.int16).copy()
+        scaled = np.clip(samples_16.astype(np.float64) * scale, -32768, 32767)
+        return scaled.astype(np.int16).tobytes()
 
     # --- State persistence ---
 

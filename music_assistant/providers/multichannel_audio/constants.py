@@ -78,7 +78,6 @@ PAIR_INDICES_BY_MAP: dict[str, dict[str, dict[str, tuple[int, int]]]] = {
 
 # Config entry keys
 CONF_PA_SINK_NAME = "pa_sink_name"
-CONF_CARD_NAME = "card_name"
 CONF_MULTICHANNEL_LAYOUT = "multichannel_layout"
 CONF_CHANNEL_MAP = "channel_map"
 CONF_CUSTOM_CHANNEL_MAP = "custom_channel_map"
