@@ -29,15 +29,8 @@ from .constants import (
     DEFAULT_PLAYER_VOLUME,
     DEVICE_UUID_NAMESPACE,
     PAIR_INDICES_BY_MAP,
-    VOLUME_CONTROL_HARDWARE,
     VOLUME_CONTROL_SOFTWARE,
 )
-
-try:
-    import pulsectl
-    _PULSECTL_AVAILABLE = True
-except ImportError:
-    _PULSECTL_AVAILABLE = False
 
 if TYPE_CHECKING:
     from .provider import MultiChannelAudioProvider
@@ -177,7 +170,6 @@ class MultiChannelPlayer(Player):
             card_name, layout, channel_map, custom_channel_map
         )
 
-        self._hardware_volume_fallback = False
         self._playback_task: asyncio.Task[None] | None = None
         self._paused = False
 
@@ -188,15 +180,8 @@ class MultiChannelPlayer(Player):
 
     @property
     def volume_control_mode(self) -> str:
-        """Return the effective volume control mode.
-
-        Always attempts hardware (pulsectl) volume control. Falls back to
-        software automatically if pulsectl is unavailable or a sink operation
-        fails. Not user-configurable.
-        """
-        if self._hardware_volume_fallback:
-            return VOLUME_CONTROL_SOFTWARE
-        return VOLUME_CONTROL_HARDWARE
+        """Return the volume control mode. Always software (numpy PCM scaling)."""
+        return VOLUME_CONTROL_SOFTWARE
 
     # --- MA mandatory player interface ---
 
@@ -495,104 +480,33 @@ class MultiChannelPlayer(Player):
     # --- Volume control ---
 
     async def volume_set(self, volume_level: int) -> None:
-        """Handle VOLUME_SET command."""
+        """Handle VOLUME_SET command. Volume applied via software PCM scaling."""
         self._attr_volume_level = volume_level
-        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
-            # Set volume on all stereo pair sinks
-            for sink_name in self._pair_sinks:
-                loop = asyncio.get_running_loop()
-                ok = await loop.run_in_executor(
-                    None, self._set_pulse_volume, sink_name, volume_level
-                )
-                if not ok:
-                    self._hardware_volume_fallback = True
-                    break
         await self._save_state()
         self.update_state()
 
     async def volume_mute(self, muted: bool) -> None:
-        """Handle VOLUME_MUTE command."""
+        """Handle VOLUME_MUTE command. Mute applied via software PCM scaling."""
         self._attr_volume_muted = muted
-        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
-            for sink_name in self._pair_sinks:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None, self._set_pulse_mute, sink_name, muted
-                )
         await self._save_state()
         self.update_state()
 
     async def apply_restored_volume(self) -> None:
-        """Push restored volume/mute state out to PA sinks after startup.
+        """Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
 
-        Uses the cached volume level, clamped to DEFAULT_HARDWARE_VOLUME_CEILING
-        so a corrupt or missing cache entry never causes full-blast output on restart.
-        Also re-applies mute state so a muted player stays muted across restarts.
+        Ensures a corrupt or missing cache entry never causes full-blast output.
+        Volume is applied to the PCM stream via software scaling during playback.
         """
         volume = min(
             self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
             DEFAULT_HARDWARE_VOLUME_CEILING,
         )
         self._attr_volume_level = volume
-        for sink_name in self._pair_sinks:
-            loop = asyncio.get_running_loop()
-            ok = await loop.run_in_executor(
-                None, self._set_pulse_volume, sink_name, volume
-            )
-            if not ok:
-                self._hardware_volume_fallback = True
-                break
-        if self._attr_volume_muted:
-            for sink_name in self._pair_sinks:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None, self._set_pulse_mute, sink_name, True
-                )
         self.logger.debug(
-            "Restored volume %d%% muted=%s to PA sinks",
+            "Restored volume %d%% muted=%s",
             volume,
             self._attr_volume_muted,
         )
-
-    def _set_pulse_volume(self, pa_sink_name: str, volume: int) -> bool:
-        """
-        Set PulseAudio sink volume via pulsectl. Returns True on success.
-
-        :param pa_sink_name: The PulseAudio sink name.
-        :param volume: Volume level 0-100.
-        """
-        if not _PULSECTL_AVAILABLE:
-            return False
-        try:
-            with pulsectl.Pulse("ma-multichannel") as pulse:
-                for sink in pulse.sink_list():
-                    if sink.name == pa_sink_name:
-                        pulse.volume_set_all_chans(sink, volume / 100.0)
-                        return True
-            return False
-        except Exception as err:
-            self.logger.warning("pulsectl volume error for %s: %s", pa_sink_name, err)
-            return False
-
-    def _set_pulse_mute(self, pa_sink_name: str, muted: bool) -> bool:
-        """
-        Set PulseAudio sink mute state via pulsectl. Returns True on success.
-
-        :param pa_sink_name: The PulseAudio sink name.
-        :param muted: Whether to mute or unmute.
-        """
-        if not _PULSECTL_AVAILABLE:
-            return False
-        try:
-            with pulsectl.Pulse("ma-multichannel") as pulse:
-                for sink in pulse.sink_list():
-                    if sink.name == pa_sink_name:
-                        pulse.mute(sink, muted)
-                        return True
-            return False
-        except Exception as err:
-            self.logger.warning("pulsectl mute error for %s: %s", pa_sink_name, err)
-            return False
 
     def _apply_software_volume(self, pcm_data: bytes) -> bytes:
         """Apply software volume scaling to PCM data."""
