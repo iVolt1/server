@@ -4,7 +4,7 @@
   "name": "Multichannel Audio Out",
   "description": "Play 5.1/7.1 surround audio through a multichannel PulseAudio sink (e.g. Creative X-Fi, HD Audio surround cards).",
   "codeowners": ["@iVolt1"],
-  "requirements": ["pulsectl; sys_platform == 'linux'", "numpy"],
+  "requirements": ["numpy"],
   "documentation": "",
   "builtin": false,
   "allow_disable": true,
