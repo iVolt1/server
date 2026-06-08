@@ -191,20 +191,24 @@ class MultiChannelPlayer(Player):
         await self._stop_playback()
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
-        # Get source channel count from active queue streamdetails
+        # Get source channel count and bit depth from active queue streamdetails
         source_channels = self.channels
+        source_bit_depth = self.bit_depth
         try:
             queue = self.mass.player_queues.get_active_queue(self.player_id)
             if queue and queue.current_item and queue.current_item.streamdetails:
                 sd = queue.current_item.streamdetails
                 self.logger.debug(
-                    "streamdetails: channels=%d sample_rate=%d uri=%s",
+                    "streamdetails: channels=%d sample_rate=%d bit_depth=%d uri=%s",
                     sd.audio_format.channels,
                     sd.audio_format.sample_rate,
+                    sd.audio_format.bit_depth,
                     sd.uri,
                 )
                 if sd.audio_format.channels > 0:
                     source_channels = sd.audio_format.channels
+                if sd.audio_format.bit_depth > 0:
+                    source_bit_depth = sd.audio_format.bit_depth
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         self._attr_current_media = media
@@ -212,7 +216,7 @@ class MultiChannelPlayer(Player):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(
-            self._playback_loop(url, source_channels)
+            self._playback_loop(url, source_channels, source_bit_depth)
         )
 
     async def stop(self) -> None:
@@ -236,7 +240,7 @@ class MultiChannelPlayer(Player):
 
     # --- Playback loop ---
 
-    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
+    async def _playback_loop(self, url: str, source_channels: int = 0, source_bit_depth: int = 0) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
@@ -250,11 +254,16 @@ class MultiChannelPlayer(Player):
 
         if source_channels == 0:
             source_channels = self.channels
+        if source_bit_depth == 0:
+            source_bit_depth = self.bit_depth
 
+        # Request ffmpeg output at source bit depth to avoid zero-padding artifacts
+        # that occur when MA expands s16 source into s32 containers.
+        # PA streams always open at self.bit_depth (hardware native).
         output_format = AudioFormat(
-            content_type=ContentType.from_bit_depth(self.bit_depth),
+            content_type=ContentType.from_bit_depth(source_bit_depth),
             sample_rate=self.sample_rate,
-            bit_depth=self.bit_depth,
+            bit_depth=source_bit_depth,
             channels=source_channels,
         )
         self.logger.debug(
@@ -289,7 +298,7 @@ class MultiChannelPlayer(Player):
                         app_name="music-assistant-multichannel",
                         rate=self.sample_rate,
                         channels=2,
-                        bit_depth=self.bit_depth,
+                        bit_depth=source_bit_depth,
                         buffer_msec=buffer_msec,
                     ),
                 )
@@ -301,7 +310,7 @@ class MultiChannelPlayer(Player):
                 len(streams),
                 source_channels,
                 self.sample_rate,
-                self.bit_depth,
+                source_bit_depth,
             )
 
             ffmpeg_proc = FFMpeg(
@@ -338,7 +347,7 @@ class MultiChannelPlayer(Player):
 
                 chunk = self._apply_software_volume(chunk)
                 await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write_all, chunk, streams, is_float, source_channels
+                    None, self._demux_and_write_all, chunk, streams, is_float, source_channels, source_bit_depth
                 )
 
         except asyncio.CancelledError:
@@ -365,16 +374,18 @@ class MultiChannelPlayer(Player):
         streams: dict[str, PASimpleStream],
         is_float: bool,
         source_channels: int,
+        source_bit_depth: int = 32,
     ) -> None:
         """Demux interleaved PCM and write each pair to its PA sink sequentially.
 
         PA buffers are sized to absorb the full chunk so each write returns
         immediately. Sequential writes keep all sinks frame-aligned.
 
-        :param pcm_data: Interleaved multichannel PCM bytes (s32le or f32).
+        :param pcm_data: Interleaved multichannel PCM bytes (s32le, s16le, or f32).
         :param streams: Map of sink_name -> open PASimpleStream.
         :param is_float: True if pcm_data is float32.
         :param source_channels: Channel count in pcm_data.
+        :param source_bit_depth: Bit depth of pcm_data (16, 24, or 32).
         """
         channels = source_channels if source_channels > 0 else self.channels
         if is_float:
@@ -395,7 +406,7 @@ class MultiChannelPlayer(Player):
                     .tobytes()
                 )
         else:
-            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            dtype = np.int16 if source_bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
             num_frames = len(samples) // channels
             if num_frames == 0:
@@ -408,7 +419,7 @@ class MultiChannelPlayer(Player):
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
-                if self.bit_depth == 24:
+                if source_bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                 streams[sink_name].write(pair_bytes)
 
