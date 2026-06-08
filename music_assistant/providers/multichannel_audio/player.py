@@ -266,11 +266,15 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # Target 50ms chunks — flow stream delivers at ~50ms intervals for
-        # multichannel sources at 96kHz. Smaller targets don't improve delivery
-        # rate since ffmpeg output is gated by the flow stream chunk period.
-        chunk_size = int(self.sample_rate * 0.050) * source_channels * 4
-        chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
+        # Request large chunks from ffmpeg — the flow stream delivers in bursts
+        # of ~700ms worth of data regardless of requested size. We split each
+        # received chunk into write-sized sub-chunks in _demux_and_write so PA
+        # never receives more data than its buffer can absorb in one write call.
+        # write_size targets 20ms per sub-chunk for smooth PA buffer filling.
+        write_size = int(self.sample_rate * 0.020) * source_channels * 4
+        write_size = max((write_size // (source_channels * 4)) * (source_channels * 4),
+                         source_channels * 4)
+        chunk_size = write_size * 16  # request ~320ms worth from ffmpeg at a time
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
@@ -288,7 +292,7 @@ class MultiChannelPlayer(Player):
                         rate=self.sample_rate,
                         channels=2,
                         bit_depth=self.bit_depth,
-                        buffer_msec=200,
+                        buffer_msec=500,
                     ),
                 )
                 streams[sink_name] = stream
@@ -341,7 +345,7 @@ class MultiChannelPlayer(Player):
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
                 await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write, chunk, streams, is_float, source_channels
+                    None, self._demux_and_write, chunk, streams, is_float, source_channels, write_size
                 )
 
         except asyncio.CancelledError:
@@ -369,19 +373,45 @@ class MultiChannelPlayer(Player):
         streams: dict[str, PASimpleStream],
         is_float: bool,
         source_channels: int,
+        write_size: int = 0,
     ) -> None:
         """
         Demux interleaved multichannel PCM and write each pair sequentially.
 
-        Combines demux and write in a single executor call to minimize thread
-        pool overhead and keep all PA writes in one thread.
+        Splits large chunks into sub-chunks of write_size bytes before writing
+        so that PA's buffer is never overwhelmed by a single large write, which
+        would cause pa_simple_write to block for hundreds of milliseconds.
 
         :param pcm_data: Interleaved multichannel PCM bytes.
         :param streams: Map of sink name to open PASimpleStream.
         :param is_float: True if pcm_data is float32.
         :param source_channels: Actual channel count in pcm_data.
+        :param write_size: Max bytes per sub-chunk (0 = no splitting).
         """
         channels = source_channels if source_channels > 0 else self.channels
+        bytes_per_frame = (4 if is_float or self.bit_depth >= 24 else 2) * channels
+
+        # Align write_size to a whole number of frames
+        if write_size > 0:
+            frames_per_write = max(1, write_size // bytes_per_frame)
+            sub_size = frames_per_write * bytes_per_frame
+        else:
+            sub_size = len(pcm_data)
+
+        offset = 0
+        while offset < len(pcm_data):
+            sub = pcm_data[offset: offset + sub_size]
+            offset += sub_size
+            self._demux_and_write_sub(sub, streams, is_float, channels)
+
+    def _demux_and_write_sub(
+        self,
+        pcm_data: bytes,
+        streams: dict[str, PASimpleStream],
+        is_float: bool,
+        channels: int,
+    ) -> None:
+        """Write a single sub-chunk — demux and write all pairs."""
         if is_float:
             samples = np.frombuffer(pcm_data, dtype=np.float32)
             num_frames = len(samples) // channels
