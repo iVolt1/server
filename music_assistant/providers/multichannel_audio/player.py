@@ -307,7 +307,7 @@ class MultiChannelPlayer(Player):
                         app_name="music-assistant-multichannel",
                         rate=self.sample_rate,
                         channels=2,
-                        bit_depth=source_bit_depth,
+                        bit_depth=self.bit_depth,
                         buffer_msec=buffer_msec,
                     ),
                 )
@@ -414,7 +414,6 @@ class MultiChannelPlayer(Player):
                     .tobytes()
                 )
         else:
-            # Read PCM at source bit depth
             dtype = np.int16 if source_bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
             num_frames = len(samples) // channels
@@ -427,7 +426,10 @@ class MultiChannelPlayer(Player):
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                if source_bit_depth == 24:
+                if source_bit_depth == 16:
+                    # PA remap sinks are s32le — convert s16 to s32
+                    streams[sink_name].write(pair.astype(np.int32).tobytes())
+                elif source_bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                     streams[sink_name].write(pair_bytes)
                 else:
