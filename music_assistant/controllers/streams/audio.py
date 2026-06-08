@@ -1194,6 +1194,9 @@ class StreamsAudio:
             channels=flow_channels,
         )
 
+    # Alias for compatibility with controller.py which calls select_flow_pcm_format
+    select_flow_pcm_format = select_flow_format
+
     async def select_pcm_format(
         self, player: Player, streamdetails: StreamDetails, smartfades_enabled: bool
     ) -> AudioFormat:
