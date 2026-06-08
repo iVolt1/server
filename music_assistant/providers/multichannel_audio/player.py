@@ -268,11 +268,12 @@ class MultiChannelPlayer(Player):
         if source_sample_rate == 0:
             source_sample_rate = self.sample_rate
 
-        # Request ffmpeg output matching the actual source format — MA delivers
-        # the native stream format as shown in the signal chain UI.
+        # Request ffmpeg output at hardware sample rate (self.sample_rate) so
+        # PA streams run at the native sink rate. ffmpeg resamples from source
+        # rate to hardware rate. Use source bit depth to avoid format conversion.
         output_format = AudioFormat(
             content_type=ContentType.from_bit_depth(source_bit_depth),
-            sample_rate=source_sample_rate,
+            sample_rate=self.sample_rate,
             bit_depth=source_bit_depth,
             channels=source_channels,
         )
@@ -289,8 +290,8 @@ class MultiChannelPlayer(Player):
         # PA buffer sized to 2× the expected ffmpeg burst.
         buffer_msec = 1500
 
-        # Chunk size based on source sample rate
-        chunk_size = int(source_sample_rate * 0.640) * source_channels * (source_bit_depth // 8)
+        # Chunk size based on hardware sample rate
+        chunk_size = int(self.sample_rate * 0.640) * source_channels * (source_bit_depth // 8)
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
@@ -304,7 +305,7 @@ class MultiChannelPlayer(Player):
                     lambda s=sname: PASimpleStream(
                         sink_name=s,
                         app_name="music-assistant-multichannel",
-                        rate=source_sample_rate,
+                        rate=self.sample_rate,
                         channels=2,
                         bit_depth=source_bit_depth,
                         buffer_msec=buffer_msec,
@@ -314,10 +315,11 @@ class MultiChannelPlayer(Player):
                 self.logger.debug("Opened PA stream for %s", sink_name)
 
             self.logger.info(
-                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
+                "Multichannel playback started: %d active pairs, %dch source, %dHz→%dHz, %dbit",
                 len(streams),
                 source_channels,
                 source_sample_rate,
+                self.sample_rate,
                 source_bit_depth,
             )
 
