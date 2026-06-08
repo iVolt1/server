@@ -427,8 +427,8 @@ class MultiChannelPlayer(Player):
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 if source_bit_depth == 16:
-                    # PA remap sinks are s32le — convert s16 to s32
-                    streams[sink_name].write(pair.astype(np.int32).tobytes())
+                    # Shift s16 into upper 16 bits of s32 for full amplitude
+                    streams[sink_name].write((pair.astype(np.int32) << 16).tobytes())
                 elif source_bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                     streams[sink_name].write(pair_bytes)
