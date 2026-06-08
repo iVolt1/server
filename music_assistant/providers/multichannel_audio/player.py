@@ -318,6 +318,7 @@ class MultiChannelPlayer(Player):
             first_chunk = True
             ct_val: str = ""
             is_float = False
+            first_demux_logged = False
             async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
                 if first_chunk:
                     ct_val = str(output_format.content_type.value).lower()
@@ -333,6 +334,14 @@ class MultiChannelPlayer(Player):
                     continue
 
                 chunk = self._apply_software_volume(chunk)
+                if not first_demux_logged:
+                    first_demux_logged = True
+                    self.logger.debug(
+                        "First demux: pair_sinks=%s streams=%s source_channels=%d",
+                        list(self._pair_sinks.keys()),
+                        list(streams.keys()),
+                        source_channels,
+                    )
                 await self.mass.loop.run_in_executor(
                     None, self._demux_and_write_all, chunk, streams, is_float, source_channels
                 )
