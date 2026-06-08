@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import queue as _queue_mod
 import threading
 import uuid
 from contextlib import suppress
@@ -241,14 +240,10 @@ class MultiChannelPlayer(Player):
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
-        Uses a producer/consumer architecture:
-        - Producer: asyncio task reads ffmpeg output, demuxes each chunk into
-          per-sink sub-chunks, and puts them onto per-sink asyncio.Queues.
-        - Consumers: one executor thread per sink drains its queue, writing
-          sub-chunks to PA as fast as PA can accept them.
-
-        This decouples the bursty ffmpeg delivery from the steady PA write rate
-        so pa_simple_write never blocks the event loop or starves other sinks.
+        Sequential architecture: for each ffmpeg chunk, demux into per-sink
+        buffers then write all sinks in a single executor thread, one sink at
+        a time. PA buffers are sized to absorb the full chunk so pa_simple_write
+        returns immediately without blocking for drain.
         """
         from .pa_simple import PASimpleStream  # noqa: PLC0415
         from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
@@ -272,38 +267,17 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # Sub-chunk size: 20ms worth of stereo PCM per PA write
-        bytes_per_frame_src = 4 * source_channels  # always s32le from ffmpeg
-        frames_per_write = max(1, int(self.sample_rate * 0.020))
-        write_size = frames_per_write * bytes_per_frame_src
+        # PA buffer sized to 2× the expected ffmpeg burst (~640ms at 8ch/96kHz).
+        # This ensures pa_simple_write returns immediately without blocking for
+        # drain, keeping all sink writes synchronous and in phase.
+        buffer_msec = 1500
+
+        # Request chunks sized to ~640ms — matches flow stream burst size.
+        chunk_size = int(self.sample_rate * 0.640) * source_channels * 4
 
         streams: dict[str, PASimpleStream] = {}
-        queues: dict[str, _queue_mod.Queue[bytes | None]] = {}
         ffmpeg_proc: FFMpeg | None = None
-        writer_tasks: list[asyncio.Task] = []
-
-        def _sink_writer(
-            stream: PASimpleStream, q: "_queue_mod.Queue[bytes | None]"
-        ) -> None:
-            """Blocking sink writer — runs in its own executor thread.
-
-            Blocks on q.get() so no CPU is wasted spinning. Exits when
-            it receives the None sentinel.
-            """
-            while True:
-                buf = q.get()
-                if buf is None:
-                    break
-                stream.write(buf)
-
-        async def _writer_coro(
-            stream: PASimpleStream, q: "_queue_mod.Queue[bytes | None]"
-        ) -> None:
-            """Async wrapper that runs _sink_writer in an executor thread."""
-            await self.mass.loop.run_in_executor(None, _sink_writer, stream, q)
-
         try:
-            # Open PA streams and create per-sink queues
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= source_channels or right_idx >= source_channels:
                     continue
@@ -316,11 +290,10 @@ class MultiChannelPlayer(Player):
                         rate=self.sample_rate,
                         channels=2,
                         bit_depth=self.bit_depth,
-                        buffer_msec=500,
+                        buffer_msec=buffer_msec,
                     ),
                 )
                 streams[sink_name] = stream
-                queues[sink_name] = _queue_mod.Queue(maxsize=64)
                 self.logger.debug("Opened PA stream for %s", sink_name)
 
             self.logger.info(
@@ -330,13 +303,6 @@ class MultiChannelPlayer(Player):
                 self.sample_rate,
                 self.bit_depth,
             )
-
-            # Start per-sink writer coroutines
-            for sink_name, stream in streams.items():
-                t = self.mass.create_task(
-                    _writer_coro(stream, queues[sink_name])
-                )
-                writer_tasks.append(t)
 
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
@@ -348,9 +314,9 @@ class MultiChannelPlayer(Player):
             await ffmpeg_proc.start()
 
             first_chunk = True
-            ct_val: str | None = None
+            ct_val: str = ""
             is_float = False
-            async for chunk in ffmpeg_proc.iter_chunked(write_size * 32):
+            async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
                 if first_chunk:
                     ct_val = str(output_format.content_type.value).lower()
                     is_float = "f32" in ct_val or "float" in ct_val
@@ -365,34 +331,15 @@ class MultiChannelPlayer(Player):
                     continue
 
                 chunk = self._apply_software_volume(chunk)
-
-                # Demux chunk into per-sink sub-chunk lists, then enqueue.
-                # Both demux and enqueue run in an executor so blocking queue.put()
-                # (when queue is full) doesn't stall the event loop.
-                pair_buffers = await self.mass.loop.run_in_executor(
-                    None, self._demux_chunk_split, chunk, is_float,
-                    source_channels, write_size,
+                await self.mass.loop.run_in_executor(
+                    None, self._demux_and_write_all, chunk, streams, is_float, source_channels
                 )
-                def _enqueue(pb=pair_buffers):
-                    for sname, bufs in pb.items():
-                        if sname in queues:
-                            for buf in bufs:
-                                queues[sname].put(buf)
-                await self.mass.loop.run_in_executor(None, _enqueue)
 
         except asyncio.CancelledError:
             pass
         except Exception as err:
             self.logger.error("Playback error: %s", err)
         finally:
-            # Send sentinel to each writer queue to stop writer threads
-            for q in queues.values():
-                with suppress(Exception):
-                    q.put(None)
-            # Wait for writers to drain and finish
-            if writer_tasks:
-                with suppress(Exception):
-                    await asyncio.gather(*writer_tasks)
             if ffmpeg_proc is not None:
                 with suppress(Exception):
                     await ffmpeg_proc.close()
@@ -406,86 +353,58 @@ class MultiChannelPlayer(Player):
             if self._playback_task is asyncio.current_task():
                 self._playback_task = None
 
-
-    def _demux_chunk_split(
+    def _demux_and_write_all(
         self,
         pcm_data: bytes,
+        streams: dict[str, PASimpleStream],
         is_float: bool,
         source_channels: int,
-        write_size: int,
-    ) -> dict[str, list[bytes]]:
-        """Demux interleaved PCM into per-sink lists of sub-chunk byte buffers.
+    ) -> None:
+        """Demux interleaved PCM and write each pair to its PA sink sequentially.
 
-        Splits the full chunk into write_size-aligned sub-chunks so that each
-        pa_simple_write call is small enough to return quickly without blocking
-        while PA drains its buffer.
+        PA buffers are sized to absorb the full chunk so each write returns
+        immediately. Sequential writes keep all sinks frame-aligned.
 
-        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param pcm_data: Interleaved multichannel PCM bytes (s32le or f32).
+        :param streams: Map of sink_name -> open PASimpleStream.
         :param is_float: True if pcm_data is float32.
         :param source_channels: Channel count in pcm_data.
-        :param write_size: Target sub-chunk size in source bytes.
-        :returns: Dict of sink_name -> list of stereo PCM sub-chunks.
         """
         channels = source_channels if source_channels > 0 else self.channels
-        bytes_per_frame = (4 if is_float or self.bit_depth >= 24 else 2) * channels
-        frames_per_write = max(1, write_size // bytes_per_frame)
-        sub_size = frames_per_write * bytes_per_frame
-
-        result: dict[str, list[bytes]] = {}
-        offset = 0
-        while offset < len(pcm_data):
-            sub = pcm_data[offset: offset + sub_size]
-            offset += sub_size
-            for sink_name, pair_bytes in self._demux_sub(sub, is_float, channels).items():
-                result.setdefault(sink_name, []).append(pair_bytes)
-        return result
-
-    def _demux_sub(
-        self,
-        pcm_data: bytes,
-        is_float: bool,
-        channels: int,
-    ) -> dict[str, bytes]:
-        """Demux one sub-chunk into per-sink stereo PCM bytes."""
-        result: dict[str, bytes] = {}
         if is_float:
             samples = np.frombuffer(pcm_data, dtype=np.float32)
             num_frames = len(samples) // channels
             if num_frames == 0:
-                return result
-            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+                return
+            samples = samples[: num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                result[sink_name] = np.clip(
-                    pair * 2147483647.0, -2147483648, 2147483647
-                ).astype(np.int32).tobytes()
+                streams[sink_name].write(
+                    np.clip(pair * 2147483647.0, -2147483648, 2147483647)
+                    .astype(np.int32)
+                    .tobytes()
+                )
         else:
             dtype = np.int16 if self.bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
             num_frames = len(samples) // channels
             if num_frames == 0:
-                return result
-            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+                return
+            samples = samples[: num_frames * channels].reshape(num_frames, channels)
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 pair_bytes = pair.astype(dtype).tobytes()
                 if self.bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                result[sink_name] = pair_bytes
-        return result
-
-    @staticmethod
-    def _write_pair_buffers(stream: PASimpleStream, buffers: list[bytes]) -> None:
-        """Write a list of sub-chunk buffers to a single PA stream sequentially.
-
-        Runs in its own executor thread per sink so all sinks write in parallel.
-        """
-        for buf in buffers:
-            stream.write(buf)
+                streams[sink_name].write(pair_bytes)
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
