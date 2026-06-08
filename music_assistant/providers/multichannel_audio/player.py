@@ -344,9 +344,20 @@ class MultiChannelPlayer(Player):
                 chunk = self._apply_software_volume(chunk)
                 ct_val = str(output_format.content_type.value).lower()
                 is_float = "f32" in ct_val or "float" in ct_val
-                await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write, chunk, streams, is_float, source_channels, write_size
+
+                # Demux once in executor, then write all sinks in parallel.
+                # Each sink gets its own executor thread so pa_simple_write
+                # calls don't serialize — all pairs advance together.
+                pair_buffers = await self.mass.loop.run_in_executor(
+                    None, self._demux_chunk_split, chunk, is_float, source_channels, write_size
                 )
+                await asyncio.gather(*[
+                    self.mass.loop.run_in_executor(
+                        None, self._write_pair_buffers, streams[sink_name], buffers
+                    )
+                    for sink_name, buffers in pair_buffers.items()
+                    if sink_name in streams
+                ])
 
         except asyncio.CancelledError:
             pass
@@ -367,104 +378,47 @@ class MultiChannelPlayer(Player):
                 self._playback_task = None
 
 
-    def _demux_and_write(
+    def _demux_chunk_split(
         self,
         pcm_data: bytes,
-        streams: dict[str, PASimpleStream],
         is_float: bool,
         source_channels: int,
-        write_size: int = 0,
-    ) -> None:
-        """
-        Demux interleaved multichannel PCM and write each pair sequentially.
+        write_size: int,
+    ) -> dict[str, list[bytes]]:
+        """Demux interleaved PCM into per-sink lists of sub-chunk byte buffers.
 
-        Splits large chunks into sub-chunks of write_size bytes before writing
-        so that PA's buffer is never overwhelmed by a single large write, which
-        would cause pa_simple_write to block for hundreds of milliseconds.
+        Splits the full chunk into write_size-aligned sub-chunks so that each
+        pa_simple_write call is small enough to return quickly without blocking
+        while PA drains its buffer.
 
         :param pcm_data: Interleaved multichannel PCM bytes.
-        :param streams: Map of sink name to open PASimpleStream.
         :param is_float: True if pcm_data is float32.
-        :param source_channels: Actual channel count in pcm_data.
-        :param write_size: Max bytes per sub-chunk (0 = no splitting).
+        :param source_channels: Channel count in pcm_data.
+        :param write_size: Target sub-chunk size in source bytes.
+        :returns: Dict of sink_name -> list of stereo PCM sub-chunks.
         """
         channels = source_channels if source_channels > 0 else self.channels
         bytes_per_frame = (4 if is_float or self.bit_depth >= 24 else 2) * channels
+        frames_per_write = max(1, write_size // bytes_per_frame)
+        sub_size = frames_per_write * bytes_per_frame
 
-        # Align write_size to a whole number of frames
-        if write_size > 0:
-            frames_per_write = max(1, write_size // bytes_per_frame)
-            sub_size = frames_per_write * bytes_per_frame
-        else:
-            sub_size = len(pcm_data)
-
+        result: dict[str, list[bytes]] = {}
         offset = 0
         while offset < len(pcm_data):
             sub = pcm_data[offset: offset + sub_size]
             offset += sub_size
-            self._demux_and_write_sub(sub, streams, is_float, channels)
+            for sink_name, pair_bytes in self._demux_sub(sub, is_float, channels).items():
+                result.setdefault(sink_name, []).append(pair_bytes)
+        return result
 
-    def _demux_and_write_sub(
+    def _demux_sub(
         self,
         pcm_data: bytes,
-        streams: dict[str, PASimpleStream],
         is_float: bool,
         channels: int,
-    ) -> None:
-        """Write a single sub-chunk — demux and write all pairs."""
-        if is_float:
-            samples = np.frombuffer(pcm_data, dtype=np.float32)
-            num_frames = len(samples) // channels
-            if num_frames == 0:
-                return
-            samples = samples[:num_frames * channels].reshape(num_frames, channels)
-            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams:
-                    continue
-                if left_idx >= channels or right_idx >= channels:
-                    continue
-                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                pair_i32 = np.clip(
-                    pair * 2147483647.0, -2147483648, 2147483647
-                ).astype(np.int32)
-                streams[sink_name].write(pair_i32.tobytes())
-        else:
-            dtype = np.int16 if self.bit_depth == 16 else np.int32
-            samples = np.frombuffer(pcm_data, dtype=dtype)
-            num_frames = len(samples) // channels
-            if num_frames == 0:
-                return
-            samples = samples[:num_frames * channels].reshape(num_frames, channels)
-            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
-                if sink_name not in streams:
-                    continue
-                if left_idx >= channels or right_idx >= channels:
-                    continue
-                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                pair_bytes = pair.astype(dtype).tobytes()
-                if self.bit_depth == 24:
-                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                streams[sink_name].write(pair_bytes)
-
-    def _demux_chunk(
-        self,
-        pcm_data: bytes,
-        is_float: bool,
-        source_channels: int,
     ) -> dict[str, bytes]:
-        """
-        Demux interleaved multichannel PCM into per-pair byte buffers.
-
-        Returns a dict of sink_name -> stereo PCM bytes without writing to PA.
-        Caller writes each pair in parallel.
-
-        :param pcm_data: Interleaved multichannel PCM bytes.
-        :param is_float: True if pcm_data is float32.
-        :param source_channels: Actual channel count in pcm_data.
-        """
-        channels = source_channels if source_channels > 0 else self.channels
+        """Demux one sub-chunk into per-sink stereo PCM bytes."""
         result: dict[str, bytes] = {}
-
         if is_float:
             samples = np.frombuffer(pcm_data, dtype=np.float32)
             num_frames = len(samples) // channels
@@ -475,10 +429,9 @@ class MultiChannelPlayer(Player):
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                pair_i32 = np.clip(
+                result[sink_name] = np.clip(
                     pair * 2147483647.0, -2147483648, 2147483647
-                ).astype(np.int32)
-                result[sink_name] = pair_i32.tobytes()
+                ).astype(np.int32).tobytes()
         else:
             dtype = np.int16 if self.bit_depth == 16 else np.int32
             samples = np.frombuffer(pcm_data, dtype=dtype)
@@ -495,6 +448,15 @@ class MultiChannelPlayer(Player):
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
                 result[sink_name] = pair_bytes
         return result
+
+    @staticmethod
+    def _write_pair_buffers(stream: PASimpleStream, buffers: list[bytes]) -> None:
+        """Write a list of sub-chunk buffers to a single PA stream sequentially.
+
+        Runs in its own executor thread per sink so all sinks write in parallel.
+        """
+        for buf in buffers:
+            stream.write(buf)
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
