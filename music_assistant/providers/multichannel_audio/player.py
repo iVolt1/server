@@ -257,13 +257,13 @@ class MultiChannelPlayer(Player):
         if source_bit_depth == 0:
             source_bit_depth = self.bit_depth
 
-        # Request ffmpeg output at source bit depth to avoid zero-padding artifacts
-        # that occur when MA expands s16 source into s32 containers.
-        # PA streams always open at self.bit_depth (hardware native).
+        # Always request s32le output from ffmpeg — MA's pipeline converts
+        # internally regardless of source bit depth. The PA remap sinks are
+        # s32le so this is the correct format end-to-end.
         output_format = AudioFormat(
-            content_type=ContentType.from_bit_depth(source_bit_depth),
+            content_type=ContentType.from_bit_depth(32),
             sample_rate=self.sample_rate,
-            bit_depth=source_bit_depth,
+            bit_depth=32,
             channels=source_channels,
         )
         self.logger.debug(
@@ -306,10 +306,11 @@ class MultiChannelPlayer(Player):
                 self.logger.debug("Opened PA stream for %s", sink_name)
 
             self.logger.info(
-                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit (src %dbit)",
                 len(streams),
                 source_channels,
                 self.sample_rate,
+                32,
                 source_bit_depth,
             )
 
@@ -406,8 +407,8 @@ class MultiChannelPlayer(Player):
                     .tobytes()
                 )
         else:
-            dtype = np.int16 if source_bit_depth == 16 else np.int32
-            samples = np.frombuffer(pcm_data, dtype=dtype)
+            # ffmpeg always delivers s32le — treat as int32 regardless of source
+            samples = np.frombuffer(pcm_data, dtype=np.int32)
             num_frames = len(samples) // channels
             if num_frames == 0:
                 return
@@ -418,15 +419,7 @@ class MultiChannelPlayer(Player):
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                if source_bit_depth == 16:
-                    # PA remap sinks are s32le — upscale s16 by shifting into high word
-                    pair_bytes = pair.astype(np.int32) << 16
-                    streams[sink_name].write(pair_bytes.tobytes())
-                elif source_bit_depth == 24:
-                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                    streams[sink_name].write(pair_bytes)
-                else:
-                    streams[sink_name].write(pair.astype(np.int32).tobytes())
+                streams[sink_name].write(pair.tobytes())
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
