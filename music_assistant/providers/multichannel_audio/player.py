@@ -408,9 +408,8 @@ class MultiChannelPlayer(Player):
             if num_frames == 0:
                 return
             samples = samples[: num_frames * channels].reshape(num_frames, channels)
-            debug_first = not getattr(self, "_demux_debug_done", False)
-            if debug_first:
-                self._demux_debug_done = True
+            # Always log on first chunk — local var, not instance state
+            debug_first = True
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if sink_name not in streams:
                     continue
