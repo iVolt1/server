@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue as _queue_mod
 import threading
 import uuid
 from contextlib import suppress
@@ -277,12 +278,12 @@ class MultiChannelPlayer(Player):
         write_size = frames_per_write * bytes_per_frame_src
 
         streams: dict[str, PASimpleStream] = {}
-        queues: dict[str, threading.Queue[bytes | None]] = {}
+        queues: dict[str, _queue_mod.Queue[bytes | None]] = {}
         ffmpeg_proc: FFMpeg | None = None
         writer_tasks: list[asyncio.Task] = []
 
         def _sink_writer(
-            stream: PASimpleStream, q: "threading.Queue[bytes | None]"
+            stream: PASimpleStream, q: "_queue_mod.Queue[bytes | None]"
         ) -> None:
             """Blocking sink writer — runs in its own executor thread.
 
@@ -296,7 +297,7 @@ class MultiChannelPlayer(Player):
                 stream.write(buf)
 
         async def _writer_coro(
-            stream: PASimpleStream, q: "threading.Queue[bytes | None]"
+            stream: PASimpleStream, q: "_queue_mod.Queue[bytes | None]"
         ) -> None:
             """Async wrapper that runs _sink_writer in an executor thread."""
             await self.mass.loop.run_in_executor(None, _sink_writer, stream, q)
@@ -319,7 +320,7 @@ class MultiChannelPlayer(Player):
                     ),
                 )
                 streams[sink_name] = stream
-                queues[sink_name] = threading.Queue(maxsize=64)
+                queues[sink_name] = _queue_mod.Queue(maxsize=64)
                 self.logger.debug("Opened PA stream for %s", sink_name)
 
             self.logger.info(
