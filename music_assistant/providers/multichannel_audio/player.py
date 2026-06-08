@@ -269,11 +269,13 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # PA buffer sized to absorb full ffmpeg burst (~640ms at 8ch/96kHz/32bit)
-        buffer_msec = 1500
-
-        # Chunk size: ~640ms of s32le at hardware rate
-        chunk_size = int(self.sample_rate * 0.640) * source_channels * 4
+        # Small chunks (10ms) with moderate PA buffer (300ms).
+        # Large chunks cause pa_simple_write to block on the first sink
+        # while the buffer fills, starving subsequent sinks of data.
+        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        chunk_size = max((chunk_size // (source_channels * 4)) * (source_channels * 4),
+                         source_channels * 4)
+        buffer_msec = 300
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
