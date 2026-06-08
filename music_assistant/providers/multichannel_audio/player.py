@@ -266,9 +266,10 @@ class MultiChannelPlayer(Player):
             self.channels,
         )
 
-        # Target 10ms chunks to ensure steady delivery to PA sinks.
-        # Default get_ffmpeg_stream chunks are too large causing delivery gaps.
-        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        # Target 50ms chunks — flow stream delivers at ~50ms intervals for
+        # multichannel sources at 96kHz. Smaller targets don't improve delivery
+        # rate since ffmpeg output is gated by the flow stream chunk period.
+        chunk_size = int(self.sample_rate * 0.050) * source_channels * 4
         chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
 
         streams: dict[str, PASimpleStream] = {}
@@ -287,7 +288,7 @@ class MultiChannelPlayer(Player):
                         rate=self.sample_rate,
                         channels=2,
                         bit_depth=self.bit_depth,
-                        buffer_msec=80,
+                        buffer_msec=200,
                     ),
                 )
                 streams[sink_name] = stream
