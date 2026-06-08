@@ -298,7 +298,7 @@ class MultiChannelPlayer(Player):
                         app_name="music-assistant-multichannel",
                         rate=self.sample_rate,
                         channels=2,
-                        bit_depth=source_bit_depth,
+                        bit_depth=self.bit_depth,
                         buffer_msec=buffer_msec,
                     ),
                 )
@@ -418,10 +418,15 @@ class MultiChannelPlayer(Player):
                 if left_idx >= channels or right_idx >= channels:
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
-                pair_bytes = pair.astype(dtype).tobytes()
-                if source_bit_depth == 24:
+                if source_bit_depth == 16:
+                    # PA remap sinks are s32le — upscale s16 by shifting into high word
+                    pair_bytes = pair.astype(np.int32) << 16
+                    streams[sink_name].write(pair_bytes.tobytes())
+                elif source_bit_depth == 24:
                     pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
-                streams[sink_name].write(pair_bytes)
+                    streams[sink_name].write(pair_bytes)
+                else:
+                    streams[sink_name].write(pair.astype(np.int32).tobytes())
 
     async def _stop_playback(self) -> None:
         """Cancel and await the playback task if running."""
