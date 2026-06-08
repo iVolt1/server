@@ -1,229 +1,643 @@
-"""Multichannel Audio player provider for Music Assistant."""
+"""Multichannel Audio Player implementation."""
 
 from __future__ import annotations
 
-import ctypes
+import asyncio
+import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from music_assistant.models.player_provider import PlayerProvider
+import numpy as np
+from music_assistant_models.enums import (
+    ContentType,
+    IdentifierType,
+    PlayerFeature,
+    PlayerType,
+    PlaybackState,
+)
+from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.player import DeviceInfo
+
+from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
+from music_assistant.models.player import Player, PlayerMedia
 
 from .constants import (
-    CONF_CHANNEL_MAP,
-    CONF_CUSTOM_CHANNEL_MAP,
-    CONF_MULTICHANNEL_LAYOUT,
-    CONF_PA_SINK_NAME,
-    MULTICHANNEL_CHANNELS,
-    MULTICHANNEL_LAYOUT_51,
+    CACHE_CATEGORY_PREV_STATE,
+    CHANNEL_MAP_CUSTOM,
+    CHANNEL_MAP_FLAC,
+    DEFAULT_HARDWARE_VOLUME_CEILING,
+    DEFAULT_PLAYER_VOLUME,
+    DEVICE_UUID_NAMESPACE,
+    PAIR_INDICES_BY_MAP,
+    VOLUME_CONTROL_HARDWARE,
+    VOLUME_CONTROL_SOFTWARE,
 )
-from .pa_simple import enumerate_pa_sinks
-from .player import MultiChannelPlayer, get_player_uuid
+
+try:
+    import pulsectl
+    _PULSECTL_AVAILABLE = True
+except ImportError:
+    _PULSECTL_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.provider import ProviderManifest
-    from music_assistant.mass import MusicAssistant
+    from .provider import MultiChannelAudioProvider
 
 
-_PAIR_SUFFIXES_51 = {"_front_stereo", "_center_sub", "_rear_stereo"}
-_PAIR_SUFFIXES_71 = _PAIR_SUFFIXES_51 | {"_side_stereo"}
+
+def get_player_uuid(pa_sink_name: str) -> str:
+    """
+    Generate a stable UUID for a multichannel player from its PA sink name.
+
+    :param pa_sink_name: The PulseAudio sink name.
+    """
+    return str(uuid.uuid5(DEVICE_UUID_NAMESPACE, pa_sink_name))
 
 
-def _derive_card_name(sink_name: str, layout: str) -> str | None:
-    """Auto-detect the stereo pair sink prefix by scanning PulseAudio remap sinks.
+def _parse_custom_map(
+    card_name: str, layout: str, custom_str: str
+) -> dict[str, tuple[int, int]] | None:
+    """
+    Parse a custom channel map string into a pair-sinks dict.
 
-    For each candidate prefix, checks whether the remap sinks' master sink
-    matches the configured surround sink name — giving an exact match rather
-    than a string similarity heuristic.
+    Expected format: flat comma-separated indices, two per sink pair, in order:
+    front_stereo, center_sub, rear_stereo[, side_stereo].
+    e.g. "0,1,2,3,4,5" for FLAC 5.1  or  "0,1,3,2,4,5" for DVD 5.1.
 
-    :param sink_name: The configured surround sink name.
+    Returns None if the string is empty or malformed.
+    """
+    if not custom_str.strip():
+        return None
+    try:
+        indices = [int(x.strip()) for x in custom_str.split(",")]
+    except ValueError:
+        return None
+    suffixes_51 = ["front_stereo", "center_sub", "rear_stereo"]
+    suffixes_71 = ["front_stereo", "center_sub", "rear_stereo", "side_stereo"]
+    suffixes = suffixes_71 if layout == "7.1" else suffixes_51
+    expected = len(suffixes) * 2
+    if len(indices) < expected:
+        return None
+    return {
+        f"{card_name}_{suffix}": (indices[i * 2], indices[i * 2 + 1])
+        for i, suffix in enumerate(suffixes)
+    }
+
+
+def _build_pair_sinks(
+    card_name: str,
+    layout: str,
+    channel_map: str = CHANNEL_MAP_FLAC,
+    custom_channel_map: str = "",
+) -> dict[str, tuple[int, int]]:
+    """
+    Build mapping of PA sink name -> (ch_index_left, ch_index_right).
+
+    Resolves the channel index map from the configured preset or custom string.
+
+    :param card_name: Card name prefix used in remap sink names e.g. 'Creative_X_Fi'.
     :param layout: Layout string '5.1' or '7.1'.
-    :returns: The detected prefix string, or None if no match found.
+    :param channel_map: Channel map preset identifier ('flac', 'dvd', 'custom').
+    :param custom_channel_map: Custom flat index string, used when channel_map='custom'.
     """
-    import json  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
+    if channel_map == CHANNEL_MAP_CUSTOM:
+        parsed = _parse_custom_map(card_name, layout, custom_channel_map)
+        if parsed is not None:
+            return parsed
+        # Fall through to FLAC default if custom string is missing/invalid
 
-    required = _PAIR_SUFFIXES_71 if layout == "7.1" else _PAIR_SUFFIXES_51
-    try:
-        sinks = enumerate_pa_sinks()
-    except Exception:
-        return None
+    pairs = PAIR_INDICES_BY_MAP.get(channel_map, {}).get(
+        layout, PAIR_INDICES_BY_MAP[CHANNEL_MAP_FLAC][layout]
+    )
+    return {f"{card_name}_{pair}": indices for pair, indices in pairs.items()}
 
-    remap_names = {s["pa_sink_name"] for s in sinks if s.get("is_remap")}
 
-    # Build candidate prefixes from remap sink names
-    candidates: dict[str, set[str]] = {}
-    for name in remap_names:
-        for suffix in required:
-            if name.endswith(suffix):
-                prefix = name[: -len(suffix)]
-                candidates.setdefault(prefix, set()).add(suffix)
+class MultiChannelPlayer(Player):
+    """
+    Player for a multichannel surround output via stereo PA remap sink pairs.
 
-    matches = [p for p, found in candidates.items() if required.issubset(found)]
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]
+    Receives an 8ch (7.1) or 6ch (5.1) PCM stream from MA, demuxes it into
+    stereo pairs, and writes each pair to its dedicated PA remap sink
+    simultaneously. All remap sinks share the same underlying ALSA hardware
+    clock so the pairs stay in sync.
+    """
 
-    # Multiple candidates — look up master sink for each via pactl to find
-    # the one whose remap sinks point at our configured surround sink.
-    try:
-        result = subprocess.run(
-            ["pactl", "--format=json", "list", "modules"],
-            capture_output=True, text=True, timeout=5, check=False,
+    def __init__(
+        self,
+        provider: MultiChannelAudioProvider,
+        player_id: str,
+        card_name: str,
+        display_name: str,
+        channels: int,
+        layout: str,
+        sample_rate: int,
+        bit_depth: int,
+        channel_map: str = CHANNEL_MAP_FLAC,
+        custom_channel_map: str = "",
+    ) -> None:
+        """
+        Initialize the Multichannel Audio player.
+
+        :param provider: The Multichannel Audio provider instance.
+        :param player_id: Stable player ID.
+        :param card_name: Card name prefix used in PA remap sink names.
+        :param display_name: Human-readable name shown in the MA UI.
+        :param channels: Number of source channels (6 for 5.1, 8 for 7.1).
+        :param layout: Layout identifier '5.1' or '7.1'.
+        :param sample_rate: Native sample rate of the PA sinks.
+        :param bit_depth: Bit depth (16, 24, or 32).
+        :param channel_map: Channel map preset ('flac', 'dvd', 'custom').
+        :param custom_channel_map: Custom flat index string when channel_map='custom'.
+        """
+        super().__init__(provider, player_id)
+        self._attr_type = PlayerType.PLAYER
+        self._attr_name = display_name
+        self._attr_available = True
+        self._attr_supported_features = {
+            PlayerFeature.PLAY_MEDIA,
+            PlayerFeature.VOLUME_SET,
+            PlayerFeature.VOLUME_MUTE,
+            PlayerFeature.PAUSE,
+        }
+        self._attr_device_info = DeviceInfo(
+            model=display_name,
+            manufacturer="Multichannel Audio",
         )
-        if result.returncode == 0:
-            for mod in json.loads(result.stdout):
-                arg = mod.get("argument", "") or ""
-                if f"master={sink_name}" in arg:
-                    for prefix in matches:
-                        if any(
-                            f"sink_name={prefix}{suffix.lstrip('_')}" in arg
-                            or f"sink_name={prefix}{suffix}" in arg
-                            for suffix in required
-                        ):
-                            return prefix
-    except Exception:
-        pass
+        self._attr_device_info.add_identifier(IdentifierType.UUID, player_id)
+        self._attr_can_group_with = set()
+        self._attr_volume_level = DEFAULT_PLAYER_VOLUME
 
-    # Fallback: prefer shorter prefix (less likely to be a generic name)
-    return min(matches, key=len)
+        self.card_name = card_name
+        self.channels = channels
+        self.layout = layout
+        self.sample_rate = sample_rate
+        self.bit_depth = bit_depth
 
-if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.provider import ProviderManifest
-    from music_assistant.mass import MusicAssistant
+        # Map of PA sink name -> (left_ch_index, right_ch_index)
+        self._pair_sinks: dict[str, tuple[int, int]] = _build_pair_sinks(
+            card_name, layout, channel_map, custom_channel_map
+        )
 
+        self._hardware_volume_fallback = False
+        self._playback_task: asyncio.Task[None] | None = None
+        self._paused = False
 
-class MultiChannelAudioProvider(PlayerProvider):
-    """Player provider that streams multichannel audio via stereo PA remap sink pairs."""
+    @property
+    def needs_poll(self) -> bool:
+        """Return if the player needs to be polled for state updates."""
+        return False
 
-    _player: MultiChannelPlayer | None
+    @property
+    def volume_control_mode(self) -> str:
+        """Return the effective volume control mode.
 
-    async def handle_async_init(self) -> None:
-        """Handle async initialization of the provider."""
+        Always attempts hardware (pulsectl) volume control. Falls back to
+        software automatically if pulsectl is unavailable or a sink operation
+        fails. Not user-configurable.
+        """
+        if self._hardware_volume_fallback:
+            return VOLUME_CONTROL_SOFTWARE
+        return VOLUME_CONTROL_HARDWARE
+
+    # --- MA mandatory player interface ---
+
+    async def play_media(self, media: PlayerMedia) -> None:
+        """Handle PLAY_MEDIA command."""
+        await self._stop_playback()
+        url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
+        self.logger.info("Starting multichannel playback from %s", url)
+        # Get source channel count from active queue streamdetails
+        source_channels = self.channels
         try:
-            ctypes.CDLL("libpulse-simple.so.0")
-        except OSError as err:
-            raise RuntimeError(
-                "libpulse-simple.so.0 not found — is PulseAudio installed?"
-            ) from err
-        self._player = None
-
-    async def loaded_in_mass(self) -> None:
-        """Handle provider fully loaded in Music Assistant."""
-        await self._register_player()
-
-    async def unload(self, is_removed: bool = False) -> None:
-        """Handle unload/removal of the provider."""
-        if self._player:
-            with suppress(Exception):
-                await self._player.stop_stream()
-            self._player = None
-
-    async def _register_player(self) -> None:
-        """Register a single multichannel player from provider configuration."""
-        sink_name = str(self.config.get_value(CONF_PA_SINK_NAME) or "")
-        if not sink_name:
-            self.logger.warning("No PA sink configured — skipping player registration")
-            return
-
-        layout = str(self.config.get_value(CONF_MULTICHANNEL_LAYOUT) or MULTICHANNEL_LAYOUT_51)
-        channels = MULTICHANNEL_CHANNELS[layout]
-        player_id = get_player_uuid(sink_name)
-        channel_map = str(self.config.get_value(CONF_CHANNEL_MAP) or "flac")
-        custom_map = str(self.config.get_value(CONF_CUSTOM_CHANNEL_MAP) or "")
-
-        # Query native format from the surround sink via pactl
-        sample_rate, bit_depth, _ = await self.mass.loop.run_in_executor(
-            None, _query_sink_format, sink_name
+            queue = self.mass.player_queues.get_active_queue(self.player_id)
+            if queue and queue.current_item and queue.current_item.streamdetails:
+                sd = queue.current_item.streamdetails
+                self.logger.debug(
+                    "streamdetails: channels=%d sample_rate=%d uri=%s",
+                    sd.audio_format.channels,
+                    sd.audio_format.sample_rate,
+                    sd.uri,
+                )
+                if sd.audio_format.channels > 0:
+                    source_channels = sd.audio_format.channels
+        except Exception as err:
+            self.logger.debug("Could not read streamdetails: %s", err)
+        self._attr_current_media = media
+        self._attr_playback_state = PlaybackState.PLAYING
+        self._paused = False
+        self.update_state()
+        self._playback_task = self.mass.create_task(
+            self._playback_loop(url, source_channels)
         )
 
-        # Auto-detect the stereo pair sink prefix from PA remap sinks
-        card_name = await self.mass.loop.run_in_executor(
-            None, _derive_card_name, sink_name, layout
+    async def stop(self) -> None:
+        """Handle STOP command."""
+        await self._stop_playback()
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_current_media = None
+        self.update_state()
+
+    async def pause(self) -> None:
+        """Handle PAUSE command."""
+        self._paused = True
+        self._attr_playback_state = PlaybackState.PAUSED
+        self.update_state()
+
+    async def play(self) -> None:
+        """Handle PLAY/resume command."""
+        self._paused = False
+        self._attr_playback_state = PlaybackState.PLAYING
+        self.update_state()
+
+    # --- Playback loop ---
+
+    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
+        """
+        Fetch the MA PCM stream and demux it to stereo PA sink pairs.
+
+        Opens one PASimpleStream per stereo pair whose channel indices
+        exist in the source, then for each PCM chunk extracts the two
+        relevant channels and writes them sequentially to the corresponding
+        sink. All writes happen in the same executor thread.
+        """
+        from .pa_simple import PASimpleStream  # noqa: PLC0415
+        from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
+
+        if source_channels == 0:
+            source_channels = self.channels
+
+        output_format = AudioFormat(
+            content_type=ContentType.from_bit_depth(self.bit_depth),
+            sample_rate=self.sample_rate,
+            bit_depth=self.bit_depth,
+            channels=source_channels,
         )
-        if not card_name:
-            self.logger.error(
-                "Could not auto-detect stereo pair sink prefix for layout %s — "
-                "no matching remap sinks found via pactl. "
-                "Ensure the Stereo Pairs addon is running and has created remap sinks.",
-                layout,
+        self.logger.debug(
+            "Requesting output format: %dch %dHz %dbit %s (source=%d player=%d)",
+            output_format.channels,
+            output_format.sample_rate,
+            output_format.bit_depth,
+            output_format.content_type,
+            source_channels,
+            self.channels,
+        )
+
+        # Target 10ms chunks to ensure steady delivery to PA sinks.
+        # Default get_ffmpeg_stream chunks are too large causing delivery gaps.
+        chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
+        chunk_size = max((chunk_size // 4) * 4, 4 * source_channels * 4)
+
+        streams: dict[str, PASimpleStream] = {}
+        ffmpeg_proc: FFMpeg | None = None
+        try:
+            # Only open PA streams for pairs whose channel indices exist in the source
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= source_channels or right_idx >= source_channels:
+                    continue
+                sname = sink_name
+                stream = await self.mass.loop.run_in_executor(
+                    None,
+                    lambda s=sname: PASimpleStream(
+                        sink_name=s,
+                        app_name="music-assistant-multichannel",
+                        rate=self.sample_rate,
+                        channels=2,
+                        bit_depth=self.bit_depth,
+                        buffer_msec=80,
+                    ),
+                )
+                streams[sink_name] = stream
+                self.logger.debug("Opened PA stream for %s", sink_name)
+            self.logger.info(
+                "Multichannel playback started: %d active pairs, %dch source, %dHz, %dbit",
+                len(streams),
+                source_channels,
+                self.sample_rate,
+                self.bit_depth,
             )
-            return
-        self.logger.info("Auto-detected stereo pair sink prefix: %s", card_name)
 
-        self._player = MultiChannelPlayer(
-            provider=self,
-            player_id=player_id,
-            card_name=card_name,
-            display_name=f"Multichannel Audio ({layout})",
-            channels=channels,
-            layout=layout,
-            sample_rate=sample_rate,
-            bit_depth=bit_depth,
-            channel_map=channel_map,
-            custom_channel_map=custom_map,
-        )
-        await self._player.restore_state()
-        await self._player.apply_restored_volume()
-        await self.mass.players.register_or_update(self._player)
-        self.logger.info(
-            "Registered multichannel player: %s (%s, %dch, %dHz, %dbit) -> pairs: %s",
-            sink_name,
-            layout,
-            channels,
-            sample_rate,
-            bit_depth,
-            list(self._player._pair_sinks.keys()),
-        )
+            ffmpeg_proc = FFMpeg(
+                audio_input=url,
+                input_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                output_format=output_format,
+                extra_output_args=["-flush_packets", "1"],
+                collect_log_history=True,
+            )
+            await ffmpeg_proc.start()
 
-    async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
-        """Set volume level (0-100) for the player."""
-        if self._player and self._player.player_id == player_id:
-            await self._player.volume_set(volume_level)
-
-    async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
-        """Mute/unmute the player."""
-        if self._player and self._player.player_id == player_id:
-            await self._player.volume_mute(muted)
-
-    async def cmd_stop(self, player_id: str) -> None:
-        """Send stop command to the player."""
-        if self._player and self._player.player_id == player_id:
-            await self._player.stop_stream()
-
-
-def _query_sink_format(sink_name: str) -> tuple[int, int, int]:
-    """
-    Query native sample rate, bit depth, and channel count for a PA sink via pactl.
-
-    :param sink_name: The PulseAudio sink name.
-    :returns: Tuple of (sample_rate, bit_depth, channels). Falls back to (48000, 16, 0).
-    """
-    import json  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["pactl", "--format=json", "list", "sinks"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if result.returncode == 0:
-            for sink in json.loads(result.stdout):
-                if sink.get("name") == sink_name:
-                    spec_str: str = sink.get("sample_specification", "")
-                    parts = spec_str.split()
-                    fmt = parts[0]
-                    channels = int(parts[1].replace("ch", ""))
-                    sample_rate = int(parts[2].replace("Hz", ""))
-                    bit_depth = int(
-                        "".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0]))
+            first_chunk = True
+            last_chunk_time = 0.0
+            async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
+                if first_chunk:
+                    self.logger.debug(
+                        "First PCM chunk: len=%d channels=%d content_type=%s",
+                        len(chunk),
+                        source_channels,
+                        output_format.content_type,
                     )
-                    return sample_rate, bit_depth, channels
-    except Exception:
-        pass
-    return 48000, 16, 0
+                    first_chunk = False
+                    last_chunk_time = asyncio.get_event_loop().time()
+                else:
+                    now = asyncio.get_event_loop().time()
+                    gap = now - last_chunk_time
+                    last_chunk_time = now
+                    chunk_duration = len(chunk) / (4 * source_channels * self.sample_rate)
+                    if gap > chunk_duration * 5.0:
+                        self.logger.warning(
+                            "Chunk delivery gap: %.1fms (expected %.1fms)",
+                            gap * 1000, chunk_duration * 1000,
+                        )
+
+                if self._paused:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                chunk = self._apply_software_volume(chunk)
+                ct_val = str(output_format.content_type.value).lower()
+                is_float = "f32" in ct_val or "float" in ct_val
+                await self.mass.loop.run_in_executor(
+                    None, self._demux_and_write, chunk, streams, is_float, source_channels
+                )
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:
+            self.logger.error("Playback error: %s", err)
+        finally:
+            if ffmpeg_proc is not None:
+                with suppress(Exception):
+                    await ffmpeg_proc.close()
+            for sink_name, stream in streams.items():
+                with suppress(Exception):
+                    await self.mass.loop.run_in_executor(None, stream.close)
+                self.logger.debug("Closed PA stream for %s", sink_name)
+            self._attr_playback_state = PlaybackState.IDLE
+            self._attr_current_media = None
+            self.update_state()
+            if self._playback_task is asyncio.current_task():
+                self._playback_task = None
+
+
+    def _demux_and_write(
+        self,
+        pcm_data: bytes,
+        streams: dict[str, PASimpleStream],
+        is_float: bool,
+        source_channels: int,
+    ) -> None:
+        """
+        Demux interleaved multichannel PCM and write each pair sequentially.
+
+        Combines demux and write in a single executor call to minimize thread
+        pool overhead and keep all PA writes in one thread.
+
+        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param streams: Map of sink name to open PASimpleStream.
+        :param is_float: True if pcm_data is float32.
+        :param source_channels: Actual channel count in pcm_data.
+        """
+        channels = source_channels if source_channels > 0 else self.channels
+        if is_float:
+            samples = np.frombuffer(pcm_data, dtype=np.float32)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_i32 = np.clip(
+                    pair * 2147483647.0, -2147483648, 2147483647
+                ).astype(np.int32)
+                streams[sink_name].write(pair_i32.tobytes())
+        else:
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if sink_name not in streams:
+                    continue
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                streams[sink_name].write(pair_bytes)
+
+    def _demux_chunk(
+        self,
+        pcm_data: bytes,
+        is_float: bool,
+        source_channels: int,
+    ) -> dict[str, bytes]:
+        """
+        Demux interleaved multichannel PCM into per-pair byte buffers.
+
+        Returns a dict of sink_name -> stereo PCM bytes without writing to PA.
+        Caller writes each pair in parallel.
+
+        :param pcm_data: Interleaved multichannel PCM bytes.
+        :param is_float: True if pcm_data is float32.
+        :param source_channels: Actual channel count in pcm_data.
+        """
+        channels = source_channels if source_channels > 0 else self.channels
+        result: dict[str, bytes] = {}
+
+        if is_float:
+            samples = np.frombuffer(pcm_data, dtype=np.float32)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_i32 = np.clip(
+                    pair * 2147483647.0, -2147483648, 2147483647
+                ).astype(np.int32)
+                result[sink_name] = pair_i32.tobytes()
+        else:
+            dtype = np.int16 if self.bit_depth == 16 else np.int32
+            samples = np.frombuffer(pcm_data, dtype=dtype)
+            num_frames = len(samples) // channels
+            if num_frames == 0:
+                return result
+            samples = samples[:num_frames * channels].reshape(num_frames, channels)
+            for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
+                if left_idx >= channels or right_idx >= channels:
+                    continue
+                pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
+                pair_bytes = pair.astype(dtype).tobytes()
+                if self.bit_depth == 24:
+                    pair_bytes = pair.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+                result[sink_name] = pair_bytes
+        return result
+
+    async def _stop_playback(self) -> None:
+        """Cancel and await the playback task if running."""
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._playback_task
+        self._playback_task = None
+
+    async def stop_stream(self) -> None:
+        """Stop streaming — alias for stop() used by provider unload."""
+        await self._stop_playback()
+
+    # --- Volume control ---
+
+    async def volume_set(self, volume_level: int) -> None:
+        """Handle VOLUME_SET command."""
+        self._attr_volume_level = volume_level
+        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
+            # Set volume on all stereo pair sinks
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                ok = await loop.run_in_executor(
+                    None, self._set_pulse_volume, sink_name, volume_level
+                )
+                if not ok:
+                    self._hardware_volume_fallback = True
+                    break
+        await self._save_state()
+        self.update_state()
+
+    async def volume_mute(self, muted: bool) -> None:
+        """Handle VOLUME_MUTE command."""
+        self._attr_volume_muted = muted
+        if self.volume_control_mode == VOLUME_CONTROL_HARDWARE:
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._set_pulse_mute, sink_name, muted
+                )
+        await self._save_state()
+        self.update_state()
+
+    async def apply_restored_volume(self) -> None:
+        """Push restored volume/mute state out to PA sinks after startup.
+
+        Uses the cached volume level, clamped to DEFAULT_HARDWARE_VOLUME_CEILING
+        so a corrupt or missing cache entry never causes full-blast output on restart.
+        Also re-applies mute state so a muted player stays muted across restarts.
+        """
+        volume = min(
+            self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
+            DEFAULT_HARDWARE_VOLUME_CEILING,
+        )
+        self._attr_volume_level = volume
+        for sink_name in self._pair_sinks:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(
+                None, self._set_pulse_volume, sink_name, volume
+            )
+            if not ok:
+                self._hardware_volume_fallback = True
+                break
+        if self._attr_volume_muted:
+            for sink_name in self._pair_sinks:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._set_pulse_mute, sink_name, True
+                )
+        self.logger.debug(
+            "Restored volume %d%% muted=%s to PA sinks",
+            volume,
+            self._attr_volume_muted,
+        )
+
+    def _set_pulse_volume(self, pa_sink_name: str, volume: int) -> bool:
+        """
+        Set PulseAudio sink volume via pulsectl. Returns True on success.
+
+        :param pa_sink_name: The PulseAudio sink name.
+        :param volume: Volume level 0-100.
+        """
+        if not _PULSECTL_AVAILABLE:
+            return False
+        try:
+            with pulsectl.Pulse("ma-multichannel") as pulse:
+                for sink in pulse.sink_list():
+                    if sink.name == pa_sink_name:
+                        pulse.volume_set_all_chans(sink, volume / 100.0)
+                        return True
+            return False
+        except Exception as err:
+            self.logger.warning("pulsectl volume error for %s: %s", pa_sink_name, err)
+            return False
+
+    def _set_pulse_mute(self, pa_sink_name: str, muted: bool) -> bool:
+        """
+        Set PulseAudio sink mute state via pulsectl. Returns True on success.
+
+        :param pa_sink_name: The PulseAudio sink name.
+        :param muted: Whether to mute or unmute.
+        """
+        if not _PULSECTL_AVAILABLE:
+            return False
+        try:
+            with pulsectl.Pulse("ma-multichannel") as pulse:
+                for sink in pulse.sink_list():
+                    if sink.name == pa_sink_name:
+                        pulse.mute(sink, muted)
+                        return True
+            return False
+        except Exception as err:
+            self.logger.warning("pulsectl mute error for %s: %s", pa_sink_name, err)
+            return False
+
+    def _apply_software_volume(self, pcm_data: bytes) -> bytes:
+        """Apply software volume scaling to PCM data."""
+        if self.volume_control_mode != VOLUME_CONTROL_SOFTWARE:
+            return pcm_data
+        if self._attr_volume_muted:
+            return b"\x00" * len(pcm_data)
+        volume = self._attr_volume_level
+        if volume is None or volume >= 100:
+            return pcm_data
+        scale = volume / 100.0
+        if self.bit_depth == 32:
+            samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
+            scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
+            return scaled.astype(np.int32).tobytes()
+        if self.bit_depth == 24:
+            samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
+            scaled = np.clip(
+                samples.astype(np.float64) * scale, -2147483648, 2147483647
+            ).astype(np.int32)
+            return scaled.view(np.uint8).reshape(-1, 4)[:, 1:].tobytes()
+        samples_16 = np.frombuffer(pcm_data, dtype=np.int16).copy()
+        scaled = np.clip(samples_16.astype(np.float64) * scale, -32768, 32767)
+        return scaled.astype(np.int16).tobytes()
+
+    # --- State persistence ---
+
+    async def restore_state(self) -> None:
+        """Restore cached volume/mute state from a previous session."""
+        if last_state := await self.mass.cache.get(
+            key=self.player_id,
+            provider=self._provider.instance_id,
+            category=CACHE_CATEGORY_PREV_STATE,
+        ):
+            self._attr_volume_muted = last_state[0]
+            self._attr_volume_level = last_state[1]
+        else:
+            self._attr_volume_muted = False
+            self._attr_volume_level = DEFAULT_PLAYER_VOLUME
+
+    async def _save_state(self) -> None:
+        """Persist current volume/mute state to cache."""
+        await self.mass.cache.set(
+            key=self.player_id,
+            data=[self._attr_volume_muted, self._attr_volume_level],
+            provider=self._provider.instance_id,
+            category=CACHE_CATEGORY_PREV_STATE,
+        )
