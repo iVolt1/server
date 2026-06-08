@@ -324,6 +324,12 @@ class MultiChannelPlayer(Player):
                         "First PCM chunk: len=%d channels=%d content_type=%s",
                         len(chunk), source_channels, output_format.content_type,
                     )
+                    # DEBUG: dump first 4096 bytes for offline inspection
+                    try:
+                        with open("/tmp/first_chunk.bin", "wb") as _f:
+                            _f.write(chunk[:4096])
+                    except Exception:
+                        pass
                     first_chunk = False
 
                 if self._paused:
