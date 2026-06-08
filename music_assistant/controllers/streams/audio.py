@@ -1210,6 +1210,7 @@ class StreamsAudio:
         content_sample_rate: int,
         content_bit_depth: int,
         media_type: MediaType = MediaType.UNKNOWN,
+        content_channels: int = 2,
     ) -> AudioFormat:
         """Parse (player specific) output format details for given format string."""
         content_type: ContentType = ContentType.try_parse(output_format_str)
@@ -1238,9 +1239,16 @@ class StreamsAudio:
         output_channels_str = self.mass.config.get_raw_player_config_value(
             player.player_id, CONF_OUTPUT_CHANNELS, "stereo"
         )
-        # For multichannel players, use actual channel count rather than stereo/mono
-        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
-            output_channels = player.channels
+        # For multichannel players with multichannel content, use the source
+        # channel count capped at player capability. For stereo/mono content,
+        # use normal stereo/mono output even on multichannel players.
+        if (
+            hasattr(player, "channels")
+            and isinstance(player.channels, int)
+            and player.channels > 2
+            and content_channels > 2
+        ):
+            output_channels = min(content_channels, player.channels)
         else:
             output_channels = 1 if output_channels_str != "stereo" else 2
         fmt = AudioFormat(
@@ -1355,16 +1363,12 @@ class StreamsAudio:
         )
         # For multichannel players, use the source channel count rather than
         # hardcoding stereo. Cap at the player's declared channel capability.
+        # Only use start_streamdetails — active queue lookup can return stale
+        # data from a previously queued multichannel track.
         flow_channels = 2
         if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
             try:
-                src_ch = 0
-                if start_streamdetails:
-                    src_ch = start_streamdetails.audio_format.channels
-                if src_ch <= 2:
-                    queue = self.mass.player_queues.get_active_queue(player.player_id)
-                    if queue and queue.current_item and queue.current_item.streamdetails:
-                        src_ch = queue.current_item.streamdetails.audio_format.channels
+                src_ch = start_streamdetails.audio_format.channels if start_streamdetails else 0
                 if src_ch > 2:
                     flow_channels = min(src_ch, player.channels)
             except Exception:
