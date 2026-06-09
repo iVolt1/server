@@ -1239,16 +1239,14 @@ class StreamsAudio:
         output_channels_str = self.mass.config.get_raw_player_config_value(
             player.player_id, CONF_OUTPUT_CHANNELS, "stereo"
         )
-        # For multichannel players with multichannel content, use the source
-        # channel count capped at player capability. For stereo/mono content,
-        # use normal stereo/mono output even on multichannel players.
-        if (
-            hasattr(player, "channels")
-            and isinstance(player.channels, int)
-            and player.channels > 2
-            and content_channels > 2
-        ):
-            output_channels = min(content_channels, player.channels)
+        # For multichannel players, always use player.channels as the output
+        # channel count. The controller does not pass content_channels here so
+        # we cannot gate on source channel count — select_flow_pcm_format has
+        # already set the flow format to the correct channel count, and the
+        # final ffmpeg in the controller converts flow→output format, so
+        # output_format must also be multichannel to avoid a stereo downmix.
+        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
+            output_channels = player.channels
         else:
             output_channels = 1 if output_channels_str != "stereo" else 2
         fmt = AudioFormat(
