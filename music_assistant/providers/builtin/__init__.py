@@ -256,7 +256,7 @@ class BuiltinProvider(MusicProvider):
                 item_id=prov_playlist_id,
                 provider=self.instance_id,
                 name=BUILTIN_PLAYLISTS[prov_playlist_id],
-                translation_key=f"builtin_playlist.{prov_playlist_id}",
+                translation_key=prov_playlist_id,
                 provider_mappings={
                     ProviderMapping(
                         item_id=prov_playlist_id,
@@ -543,7 +543,7 @@ class BuiltinProvider(MusicProvider):
                     continue
                 try:
                     entry = await self._build_m3u_entry_from_uri(uri)
-                except (MediaNotFoundError, InvalidDataError, ProviderUnavailableError):
+                except MediaNotFoundError, InvalidDataError, ProviderUnavailableError:
                     self.logger.warning("Can't add %s to playlist - item not found", uri)
                     continue
                 # check dedup against the newly built entry's providers too
@@ -1105,16 +1105,19 @@ class BuiltinProvider(MusicProvider):
 
     @use_cache(expiration=3600, category=CACHE_CATEGORY_PLAYLISTS)
     async def _get_builtin_playlist_random_artist(self) -> list[Track]:
-        for in_library_only in (True, False):
+        for source in ("library", "top"):
             for min_tracks_required in (25, 10, 5, 1):
                 for random_artist in await self.mass.music.artists.library_items(
                     limit=25, order_by="random"
                 ):
-                    tracks = await self.mass.music.artists.tracks(
-                        random_artist.item_id,
-                        random_artist.provider,
-                        in_library_only=in_library_only,
-                    )
+                    if source == "library":
+                        tracks = await self.mass.music.artists.tracks(
+                            random_artist.item_id, "library"
+                        )
+                    else:
+                        tracks = await self.mass.music.artists.top_tracks(
+                            random_artist.item_id, random_artist.provider
+                        )
                     if len(tracks) < min_tracks_required:
                         continue
                     for idx, track in enumerate(tracks, 1):
@@ -1252,7 +1255,7 @@ class BuiltinProvider(MusicProvider):
                 )
                 if library_item is not None:
                     return library_item
-            except (InvalidDataError, KeyError, NotImplementedError):
+            except InvalidDataError, KeyError, NotImplementedError:
                 continue
         # return unresolved media item so the entry still shows in the playlist
         return media_item
@@ -1380,7 +1383,7 @@ class BuiltinProvider(MusicProvider):
             for uri in uris:
                 try:
                     entries.append(await self._build_m3u_entry_from_uri(uri))
-                except (MediaNotFoundError, InvalidDataError, ProviderUnavailableError):
+                except MediaNotFoundError, InvalidDataError, ProviderUnavailableError:
                     # parse URI for minimal provider info so the entry is resolvable later
                     entry = PlaylistItem(path=uri)
                     if "://" in uri:
