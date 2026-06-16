@@ -275,7 +275,7 @@ class MultiChannelPlayer(Player):
         chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
         chunk_size = max((chunk_size // (source_channels * 4)) * (source_channels * 4),
                          source_channels * 4)
-        buffer_msec = 300
+        buffer_msec = 800
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
