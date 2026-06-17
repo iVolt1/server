@@ -212,20 +212,31 @@ class MultiChannelPlayer(Player):
         """
         Return player-level config entries.
 
-        Forces raw s32le PCM as the output codec instead of the default FLAC.
-        Our provider writes raw PCM samples directly to PulseAudio remap
-        sinks via pa_simple — it has no FLAC decoder. Without this override,
-        MA's stream controller defaults CONF_OUTPUT_CODEC to "flac" for
-        non-protocol players, which silently broke playback (chipmunk-style
-        sped-up audio / pulsing) because our demux code was reading
-        FLAC-compressed bytes as if they were raw interleaved PCM samples.
-        Hidden since this must never be changed by the user.
+        Forces raw s32le PCM as the output codec instead of the default FLAC,
+        with explicit rate/bitrate/channels matching this player's actual
+        hardware format. Our provider writes raw PCM samples directly to
+        PulseAudio remap sinks via pa_simple — it has no FLAC decoder.
+        Without this override, MA's stream controller defaults
+        CONF_OUTPUT_CODEC to "flac" for non-protocol players, which silently
+        broke playback (chipmunk-style sped-up audio / pulsing) because our
+        demux code was reading FLAC-compressed bytes as if they were raw
+        interleaved PCM samples. The explicit ";rate=...;bitrate=...;
+        channels=..." suffix is required — if omitted, the stream controller
+        appends its own generic ";rate=44100;bitrate=16;channels=2" fallback
+        whenever ";" is absent from the codec string, which silently served
+        the wrong format (44.1kHz/16bit/stereo) regardless of our actual
+        96kHz/32bit/8ch (or 6ch) hardware. Hidden since this must never be
+        changed by the user.
         """
+        codec_str = (
+            f"{ContentType.PCM_S32LE.value};codec=pcm;"
+            f"rate={self.sample_rate};bitrate={self.bit_depth};channels={self.channels}"
+        )
         return [
             ConfigEntry(
                 key=CONF_OUTPUT_CODEC,
                 type=ConfigEntryType.STRING,
-                default_value=ContentType.PCM_S32LE.value,
+                default_value=codec_str,
                 hidden=True,
             ),
         ]
