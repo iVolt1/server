@@ -1190,10 +1190,13 @@ class StreamsAudio:
         conf_channels = self.mass.config.get_raw_player_config_value(
             player_id, CONF_OUTPUT_CHANNELS, "stereo"
         )
-        if conf_channels == "left":
-            filter_params.append("pan=mono|c0=FL")
-        elif conf_channels == "right":
-            filter_params.append("pan=mono|c0=FR")
+        # Only apply pan filters for stereo players — multichannel players
+        # handle their own channel routing.
+        if output_format.channels <= 2:
+            if conf_channels == "left":
+                filter_params.append("pan=mono|c0=FL")
+            elif conf_channels == "right":
+                filter_params.append("pan=mono|c0=FR")
 
         if limiter_enabled:
             filter_params.append("alimiter=limit=-2dB:level=false:asc=true")
@@ -1210,6 +1213,7 @@ class StreamsAudio:
         content_sample_rate: int,
         content_bit_depth: int,
         media_type: MediaType = MediaType.UNKNOWN,
+        content_channels: int = 2,
     ) -> AudioFormat:
         """Parse (player specific) output format details for given format string."""
         content_type: ContentType = ContentType.try_parse(output_format_str)
@@ -1238,11 +1242,21 @@ class StreamsAudio:
         output_channels_str = self.mass.config.get_raw_player_config_value(
             player.player_id, CONF_OUTPUT_CHANNELS, "stereo"
         )
+        # For multichannel players, always use player.channels as the output
+        # channel count. The controller does not pass content_channels here so
+        # we cannot gate on source channel count — select_flow_pcm_format has
+        # already set the flow format to the correct channel count, and the
+        # final ffmpeg in the controller converts flow→output format, so
+        # output_format must also be multichannel to avoid a stereo downmix.
+        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
+            output_channels = player.channels
+        else:
+            output_channels = 1 if output_channels_str != "stereo" else 2
         fmt = AudioFormat(
             content_type=content_type,
             sample_rate=output_sample_rate,
             bit_depth=output_bit_depth,
-            channels=1 if output_channels_str != "stereo" else 2,
+            channels=output_channels,
         )
         fmt.bit_rate = get_bit_rate(fmt)
         return fmt
@@ -1348,11 +1362,23 @@ class StreamsAudio:
         content_type, bit_depth = self._pick_pcm_bit_depth(
             player, start_streamdetails, smartfades_enabled
         )
+        # For multichannel players, use the source channel count rather than
+        # hardcoding stereo. Cap at the player's declared channel capability.
+        # Only use start_streamdetails — active queue lookup can return stale
+        # data from a previously queued multichannel track.
+        flow_channels = 2
+        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
+            try:
+                src_ch = start_streamdetails.audio_format.channels if start_streamdetails else 0
+                if src_ch > 2:
+                    flow_channels = min(src_ch, player.channels)
+            except Exception:
+                pass
         return AudioFormat(
             content_type=content_type,
             sample_rate=output_sample_rate,
             bit_depth=bit_depth,
-            channels=2,
+            channels=flow_channels,
         )
 
     async def get_audio_source_stream(
@@ -1754,6 +1780,12 @@ class StreamsAudio:
         crossfade_buffer_size = (crossfade_buffer_size // frame_size) * frame_size
         fade_out_data: bytes | None = None
         uncredited_tail_bytes = 0
+
+        # pin the body to DYNAMIC when the intro was baked DYNAMIC,
+        # else a late measurement flips it and causes a volume jump
+        norm_override: VolumeNormalizationMode | None = None
+        if crossfade_data and crossfade_data.normalization_mode == VolumeNormalizationMode.DYNAMIC:
+            norm_override = VolumeNormalizationMode.DYNAMIC
 
         # pin the body to DYNAMIC when the intro was baked DYNAMIC,
         # else a late measurement flips it and causes a volume jump
@@ -2438,8 +2470,11 @@ class StreamsAudio:
             return False
         if not (self.mass.player_queues.get(queue_item.queue_id)):
             return False  # just a guard
-        if not (self.mass.players.get_player(player_id)):
+        if not (player := self.mass.players.get_player(player_id)):
             return False  # just a guard
+        # Crossfade requires stereo PCM pipeline — disable for multichannel players
+        if hasattr(player, "channels") and isinstance(player.channels, int) and player.channels > 2:
+            return False
         if queue_item.media_type != MediaType.TRACK:
             self.logger.debug("Skipping crossfade: current item is not a track")
             return False
