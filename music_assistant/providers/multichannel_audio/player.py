@@ -232,6 +232,10 @@ class MultiChannelPlayer(Player):
             f"{ContentType.PCM_S32LE.value};codec=pcm;"
             f"rate={self.sample_rate};bitrate={self.bit_depth};channels={self.channels}"
         )
+        self.logger.warning(
+            "*** get_config_entries CALLED for %s -> codec_str=%s",
+            self.player_id, codec_str,
+        )
         return [
             ConfigEntry(
                 key=CONF_OUTPUT_CODEC,
