@@ -421,6 +421,12 @@ class MultiChannelPlayer(Player):
         finally:
             self.logger.warning("*** DEBUG: _playback_loop finally block entered")
             if ffmpeg_proc is not None:
+                self.logger.warning(
+                    "*** DEBUG: ffmpeg returncode=%s closed=%s log_history=%s",
+                    ffmpeg_proc.returncode,
+                    ffmpeg_proc.closed,
+                    list(ffmpeg_proc.log_history),
+                )
                 with suppress(Exception):
                     await ffmpeg_proc.close()
             for sink_name, stream in streams.items():
