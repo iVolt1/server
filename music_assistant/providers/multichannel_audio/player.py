@@ -184,6 +184,21 @@ class MultiChannelPlayer(Player):
         """Return the volume control mode. Always software (numpy PCM scaling)."""
         return VOLUME_CONTROL_SOFTWARE
 
+    @property
+    def supported_sample_rates(self) -> list[tuple[int, int]]:
+        """
+        Declare the only sample rate this player actually supports.
+
+        The PA remap sinks are fixed at self.sample_rate/self.bit_depth — they
+        do not resample. Declaring this (rather than falling back to the
+        generic CONF_SAMPLE_RATES list, which usually includes 44100/48000)
+        forces select_flow_pcm_format's 'smart'/'bit_perfect' anchoring to
+        always snap up to self.sample_rate instead of passing a lower source
+        rate straight through, which previously caused sped-up ("chipmunk")
+        playback for 48kHz sources.
+        """
+        return [(self.sample_rate, self.bit_depth)]
+
     # --- MA mandatory player interface ---
 
     async def play_media(self, media: PlayerMedia) -> None:
@@ -275,7 +290,7 @@ class MultiChannelPlayer(Player):
         chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
         chunk_size = max((chunk_size // (source_channels * 4)) * (source_channels * 4),
                          source_channels * 4)
-        buffer_msec = 300
+        buffer_msec = 800
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
