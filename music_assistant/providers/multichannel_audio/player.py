@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import numpy as np
-from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
-    ConfigEntryType,
     ContentType,
     IdentifierType,
     PlayerFeature,
@@ -21,7 +20,6 @@ from music_assistant_models.enums import (
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 
-from music_assistant.constants import CONF_OUTPUT_CODEC
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.player import Player, PlayerMedia
 
@@ -37,8 +35,6 @@ from .constants import (
 )
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType
-
     from .provider import MultiChannelAudioProvider
 
 
@@ -204,47 +200,6 @@ class MultiChannelPlayer(Player):
         """
         return [(self.sample_rate, self.bit_depth)]
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict[str, ConfigValueType] | None = None,
-    ) -> list[ConfigEntry]:
-        """
-        Return player-level config entries.
-
-        Forces raw s32le PCM as the output codec instead of the default FLAC,
-        with explicit rate/bitrate/channels matching this player's actual
-        hardware format. Our provider writes raw PCM samples directly to
-        PulseAudio remap sinks via pa_simple — it has no FLAC decoder.
-        Without this override, MA's stream controller defaults
-        CONF_OUTPUT_CODEC to "flac" for non-protocol players, which silently
-        broke playback (chipmunk-style sped-up audio / pulsing) because our
-        demux code was reading FLAC-compressed bytes as if they were raw
-        interleaved PCM samples. The explicit ";rate=...;bitrate=...;
-        channels=..." suffix is required — if omitted, the stream controller
-        appends its own generic ";rate=44100;bitrate=16;channels=2" fallback
-        whenever ";" is absent from the codec string, which silently served
-        the wrong format (44.1kHz/16bit/stereo) regardless of our actual
-        96kHz/32bit/8ch (or 6ch) hardware. Hidden since this must never be
-        changed by the user.
-        """
-        codec_str = (
-            f"{ContentType.PCM_S32LE.value};codec=pcm;"
-            f"rate={self.sample_rate};bitrate={self.bit_depth};channels={self.channels}"
-        )
-        self.logger.warning(
-            "*** get_config_entries CALLED for %s -> codec_str=%s",
-            self.player_id, codec_str,
-        )
-        return [
-            ConfigEntry(
-                key=CONF_OUTPUT_CODEC,
-                type=ConfigEntryType.STRING,
-                default_value=codec_str,
-                hidden=True,
-            ),
-        ]
-
     # --- MA mandatory player interface ---
 
     async def play_media(self, media: PlayerMedia) -> None:
@@ -336,7 +291,7 @@ class MultiChannelPlayer(Player):
         chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
         chunk_size = max((chunk_size // (source_channels * 4)) * (source_channels * 4),
                          source_channels * 4)
-        buffer_msec = 800
+        buffer_msec = 300
 
         streams: dict[str, PASimpleStream] = {}
         ffmpeg_proc: FFMpeg | None = None
@@ -393,8 +348,8 @@ class MultiChannelPlayer(Player):
                 collect_log_history=True,
             )
             await ffmpeg_proc.start()
-            self.logger.warning(
-                "*** DEBUG: ffmpeg_proc.start() returned, pid=%s, chunk_size=%d",
+            self.logger.debug(
+                "ffmpeg started: pid=%s chunk_size=%d",
                 ffmpeg_proc.proc.pid if ffmpeg_proc.proc else None, chunk_size,
             )
 
@@ -402,9 +357,7 @@ class MultiChannelPlayer(Player):
             ct_val: str = ""
             is_float = False
             first_demux_logged = False
-            self.logger.warning("*** DEBUG: entering iter_chunked loop")
             async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
-                self.logger.warning("*** DEBUG: got chunk len=%d", len(chunk))
                 if first_chunk:
                     ct_val = str(output_format.content_type.value).lower()
                     is_float = "f32" in ct_val or "float" in ct_val
@@ -432,19 +385,18 @@ class MultiChannelPlayer(Player):
                 )
 
         except asyncio.CancelledError:
-            self.logger.warning("*** DEBUG: _playback_loop CancelledError caught")
             pass
         except Exception as err:
             self.logger.error("Playback error: %s", err, exc_info=True)
         finally:
-            self.logger.warning("*** DEBUG: _playback_loop finally block entered")
             if ffmpeg_proc is not None:
-                self.logger.warning(
-                    "*** DEBUG: ffmpeg returncode=%s closed=%s log_history=%s",
-                    ffmpeg_proc.returncode,
-                    ffmpeg_proc.closed,
-                    list(ffmpeg_proc.log_history),
-                )
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(
+                        "ffmpeg exit: returncode=%s closed=%s log_history=%s",
+                        ffmpeg_proc.returncode,
+                        ffmpeg_proc.closed,
+                        list(ffmpeg_proc.log_history),
+                    )
                 with suppress(Exception):
                     await ffmpeg_proc.close()
             for sink_name, stream in streams.items():
