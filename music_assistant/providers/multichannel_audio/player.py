@@ -9,7 +9,9 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import numpy as np
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
+    ConfigEntryType,
     ContentType,
     IdentifierType,
     PlayerFeature,
@@ -19,6 +21,7 @@ from music_assistant_models.enums import (
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 
+from music_assistant.constants import CONF_OUTPUT_CODEC
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.player import Player, PlayerMedia
 
@@ -34,6 +37,8 @@ from .constants import (
 )
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigValueType
+
     from .provider import MultiChannelAudioProvider
 
 
@@ -198,6 +203,32 @@ class MultiChannelPlayer(Player):
         playback for 48kHz sources.
         """
         return [(self.sample_rate, self.bit_depth)]
+
+    async def get_config_entries(
+        self,
+        action: str | None = None,
+        values: dict[str, ConfigValueType] | None = None,
+    ) -> list[ConfigEntry]:
+        """
+        Return player-level config entries.
+
+        Forces raw s32le PCM as the output codec instead of the default FLAC.
+        Our provider writes raw PCM samples directly to PulseAudio remap
+        sinks via pa_simple — it has no FLAC decoder. Without this override,
+        MA's stream controller defaults CONF_OUTPUT_CODEC to "flac" for
+        non-protocol players, which silently broke playback (chipmunk-style
+        sped-up audio / pulsing) because our demux code was reading
+        FLAC-compressed bytes as if they were raw interleaved PCM samples.
+        Hidden since this must never be changed by the user.
+        """
+        return [
+            ConfigEntry(
+                key=CONF_OUTPUT_CODEC,
+                type=ConfigEntryType.STRING,
+                default_value=ContentType.PCM_S32LE.value,
+                hidden=True,
+            ),
+        ]
 
     # --- MA mandatory player interface ---
 
