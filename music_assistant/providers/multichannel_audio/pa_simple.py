@@ -229,6 +229,9 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
       - max_output_channels: number of channels
       - sample_rate: sink native sample rate in Hz
       - bit_depth: sink native bit depth (16, 24, or 32)
+      - is_remap: True for module-remap-sink.c sinks (detected via the
+        literal driver string on real PulseAudio, or via the node.group
+        property on PipeWire's pulse-compat layer — see inline comment)
     """
     import json  # noqa: PLC0415
     import shutil  # noqa: PLC0415
@@ -275,6 +278,21 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
         desc: str = sink.get("description", name)
         spec_str: str = sink.get("sample_specification", "")
         driver: str = sink.get("driver", "")
+        properties: dict[str, str] = sink.get("properties", {})
+        # Real PulseAudio reports the literal module name in "driver"
+        # ("module-remap-sink.c"), but PipeWire's PulseAudio-compatibility
+        # layer reports a generic "PipeWire" driver string for every sink
+        # it manages — so "driver == module-remap-sink.c" alone misses
+        # every remap sink on a PipeWire-only system (confirmed via real
+        # `pactl --format=json list sinks` output: a module-remap-sink.c
+        # child under PipeWire shows driver="PipeWire" and no
+        # device.master_device property). PipeWire instead labels the
+        # relationship explicitly via node.group ("remap-sink-<module_id>"),
+        # which is present in pactl's JSON properties for every
+        # PipeWire-managed remap sink — check that too so detection works
+        # under PipeWire as well as real PulseAudio.
+        node_group: str = properties.get("node.group", "")
+        is_remap = driver == "module-remap-sink.c" or node_group.startswith("remap-sink-")
         try:
             parts = spec_str.split()
             fmt = parts[0]  # e.g. 's32le'
@@ -292,7 +310,7 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
                 "max_output_channels": channels,
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
-                "is_remap": driver == "module-remap-sink.c",
+                "is_remap": is_remap,
             }
         )
     return sinks
