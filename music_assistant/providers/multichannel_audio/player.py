@@ -322,23 +322,40 @@ class MultiChannelPlayer(Player):
                 self.bit_depth,
             )
 
-            # IMPORTANT: do not rely on ContentType.UNKNOWN auto-probing or on the
-            # URL's declared format string here. resolve_stream_url's CONF_OUTPUT_CODEC
-            # resolution is unreliable (frequently still resolves to the generic
-            # 44100/16/stereo fallback in the URL path itself), while the actual
-            # bytes served by get_output_format/select_flow_pcm_format are correctly
-            # multichannel at self.sample_rate/self.bit_depth/source_channels (verified
-            # via MA's own ffmpeg stream-info logs: codec=s32le, matching bit_rate).
-            # Feeding ffmpeg an UNKNOWN/auto-probed input format against a raw multichannel
-            # PCM stream makes its prober reject the data outright ("Invalid data found
-            # when processing input", returncode=183) because the actual frame layout
-            # doesn't match what a 2ch/16bit guess (or no guess) would expect.
-            # We already know the true format deterministically — declare it explicitly.
-            actual_input_format = AudioFormat(
-                content_type=ContentType.from_bit_depth(self.bit_depth),
-                sample_rate=self.sample_rate,
-                bit_depth=self.bit_depth,
-                channels=source_channels,
+            # resolve_stream_url's CONF_OUTPUT_CODEC resolution is non-deterministic
+            # across player (re)registration/restart cycles — sometimes it resolves
+            # to our intended explicit PCM string (sometimes even with the wrong
+            # rate/channels params), and sometimes it falls all the way back to
+            # plain "flac". We can't assume either outcome; we have to look at what
+            # the URL actually says was served. Forcing ContentType.UNKNOWN here
+            # makes ffmpeg auto-probe undeclared multichannel PCM and reject it
+            # outright ("Invalid data found", returncode=183); forcing PCM
+            # unconditionally (as before) makes ffmpeg silently misread genuine
+            # FLAC-compressed bytes as raw PCM samples, producing hissy static
+            # instead of music. So: parse the real extension/codec MA put in the
+            # URL and only force explicit PCM params when MA is actually serving
+            # PCM; otherwise let ffmpeg auto-probe (it correctly identifies FLAC,
+            # AAC, MP3, etc. from the byte stream on its own).
+            url_fmt_str = url.rsplit(".", 1)[-1] if "." in url.rsplit("/", 1)[-1] else ""
+            url_content_type = ContentType.try_parse(url_fmt_str)
+            if url_content_type.is_pcm():
+                # MA is serving raw PCM — declare the real format explicitly so
+                # ffmpeg doesn't have to (and can't reliably) probe it from
+                # undeclared multichannel bytes.
+                actual_input_format = AudioFormat(
+                    content_type=ContentType.from_bit_depth(self.bit_depth),
+                    sample_rate=self.sample_rate,
+                    bit_depth=self.bit_depth,
+                    channels=source_channels,
+                )
+            else:
+                # MA is serving a compressed/encoded format (flac, aac, mp3, ...) —
+                # let ffmpeg auto-probe and decode it normally, same as MA's own
+                # internal pipeline does for the source file itself.
+                actual_input_format = AudioFormat(content_type=ContentType.UNKNOWN)
+            self.logger.debug(
+                "Resolved stream format from URL: url_content_type=%s -> input_format=%s",
+                url_content_type, actual_input_format.content_type,
             )
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
