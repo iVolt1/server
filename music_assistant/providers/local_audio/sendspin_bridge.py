@@ -776,7 +776,17 @@ class LocalAudioBridgeManager:
         loaded_any = False
 
         for device in devices:
-            if device.get("driver") != "module-alsa-card.c":
+            # Master sinks are anything that isn't itself a remap-sink
+            # child (is_remap=False) — this is more robust than matching
+            # the "driver" field, since PipeWire's PulseAudio-compatibility
+            # layer reports a generic "PipeWire" driver string for every
+            # sink it manages (ALSA-backed or not), unlike real PulseAudio
+            # which reports the literal module name (e.g.
+            # "module-alsa-card.c"). alsa_card_name and channel_map being
+            # present (checked below) is what actually confirms this is a
+            # real ALSA-backed multi-channel sink worth computing a remap
+            # topology for, rather than e.g. a virtual/monitor/null sink.
+            if device.get("is_remap"):
                 continue
             channels: int = device.get("max_output_channels", 0)
             if channels <= 2:
