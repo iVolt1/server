@@ -28,7 +28,11 @@ from music_assistant.controllers.translations import (
     _format,
     _locale_candidates,
 )
-from scripts.build_translations import _flatten_into, build_translations_source
+from scripts.build_translations import (
+    _flatten_into,
+    _resolve_references,
+    build_translations_source,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -65,6 +69,30 @@ def test_flatten_into() -> None:
         "provider.ytmusic.config_entries.cookie.description": "From a session.",
         "provider.ytmusic.media.mixes": "Your Mixes",
     }
+
+
+def test_resolve_references_validated_and_omitted() -> None:
+    """A reference reuses an existing string: its target is validated and the key is omitted."""
+    resolved = _resolve_references(
+        {
+            "common.media.recommendations.recommended_tracks.name": "Recommended tracks",
+            "provider.deezer.media.recommendations.recommended_tracks.name": (
+                "[%key:common::media::recommendations::recommended_tracks::name%]"
+            ),
+        }
+    )
+    # the shared (target) string stays; the referencing key is dropped (resolved via the fallback)
+    assert resolved == {
+        "common.media.recommendations.recommended_tracks.name": "Recommended tracks",
+    }
+
+
+def test_resolve_references_missing_target_raises() -> None:
+    """A reference whose target does not exist fails the build with a clear error."""
+    with pytest.raises(ValueError, match="Unresolved translation reference"):
+        _resolve_references(
+            {"provider.deezer.media.x.name": "[%key:common::media::does::not::exist%]"}
+        )
 
 
 def test_candidate_keys_common_rewrite() -> None:
@@ -501,7 +529,7 @@ def test_media_names_are_keyed_by_media_type() -> None:
     assert source["common.media.genre.jazz.name"] == "Jazz"
     assert source["common.media.playlist.random_album.name"]  # built-in playlists -> playlist.*
     assert source["common.media.folder.albums.name"] == "Albums"  # browse-folder titles
-    assert source["common.media.recommendations.made_for_you.name"] == "Made for you"
+    assert source["common.media.recommendations.recommended_tracks.name"] == "Recommended tracks"
     # the old flat keys are gone (would silently break localization if left behind)
     for stale in (
         "common.media.jazz.name",  # genre was flat
