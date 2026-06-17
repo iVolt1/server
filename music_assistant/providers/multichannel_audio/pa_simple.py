@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import os
 import threading
-from pathlib import Path
 from typing import Any, ClassVar, Final
+
+from .constants import volume_pct_to_amplitude
 
 PA_STREAM_PLAYBACK: Final = 1
 
@@ -103,15 +103,338 @@ def _get_lib() -> ctypes.CDLL:
     return _lib
 
 
-class _PABufferAttr(ctypes.Structure):
-    """PA buffer attributes for controlling stream buffering."""
+# --- Hardware sink volume control (full libpulse, async) ----------------------
+
+PA_VOLUME_NORM: Final = 65536
+PA_CHANNELS_MAX: Final = 32
+
+
+# set_sink_volume() is called frequently (on every volume/mute change, and
+# at bridge start for every player). A short timeout limits how long a
+# stuck/unresponsive PA call can occupy an executor thread — under normal
+# conditions PA responds in single-digit milliseconds, so 0.5s is generous
+# while bounding the worst case. load_module()/unload_module() (rare,
+# one-time during topology setup/teardown) keep a longer 2.0s timeout since
+# we'd rather wait than have sink creation/cleanup spuriously fail.
+_SET_VOLUME_TIMEOUT: Final = 0.5
+
+PA_CONTEXT_READY: Final = 4
+PA_CONTEXT_FAILED: Final = 5
+PA_CONTEXT_TERMINATED: Final = 6
+PA_CONTEXT_NOAUTOSPAWN: Final = 1
+
+_CONTEXT_NOTIFY_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+_CONTEXT_SUCCESS_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+_CONTEXT_INDEX_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+
+PA_INVALID_INDEX: Final = 0xFFFFFFFF
+
+
+class _PACVolume(ctypes.Structure):
     _fields_: ClassVar = [
-        ("maxlength", ctypes.c_uint32),
-        ("tlength",   ctypes.c_uint32),
-        ("prebuf",    ctypes.c_uint32),
-        ("minreq",    ctypes.c_uint32),
-        ("fragsize",  ctypes.c_uint32),
+        ("channels", ctypes.c_uint8),
+        ("values", ctypes.c_uint32 * PA_CHANNELS_MAX),
     ]
+
+
+def _load_full_lib() -> ctypes.CDLL:
+    """Load full libpulse (not -simple) for the async context API.
+
+    Required for pa_context_set_sink_volume_by_name(), which has no
+    equivalent in libpulse-simple. libpulse.so.0 is a transitive dependency
+    of libpulse-simple.so.0, so it is present anywhere PASimpleStream works.
+    """
+    lib = ctypes.CDLL("libpulse.so.0")
+
+    lib.pa_threaded_mainloop_new.restype = ctypes.c_void_p
+    lib.pa_threaded_mainloop_get_api.restype = ctypes.c_void_p
+    lib.pa_threaded_mainloop_get_api.argtypes = [ctypes.c_void_p]
+    lib.pa_threaded_mainloop_start.restype = ctypes.c_int
+    lib.pa_threaded_mainloop_start.argtypes = [ctypes.c_void_p]
+    lib.pa_threaded_mainloop_stop.argtypes = [ctypes.c_void_p]
+    lib.pa_threaded_mainloop_free.argtypes = [ctypes.c_void_p]
+    lib.pa_threaded_mainloop_lock.argtypes = [ctypes.c_void_p]
+    lib.pa_threaded_mainloop_unlock.argtypes = [ctypes.c_void_p]
+
+    lib.pa_context_new.restype = ctypes.c_void_p
+    lib.pa_context_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.pa_context_set_state_callback.argtypes = [
+        ctypes.c_void_p,
+        _CONTEXT_NOTIFY_CB,
+        ctypes.c_void_p,
+    ]
+    lib.pa_context_connect.restype = ctypes.c_int
+    lib.pa_context_connect.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    lib.pa_context_get_state.restype = ctypes.c_int
+    lib.pa_context_get_state.argtypes = [ctypes.c_void_p]
+    lib.pa_context_disconnect.argtypes = [ctypes.c_void_p]
+    lib.pa_context_unref.argtypes = [ctypes.c_void_p]
+
+    lib.pa_cvolume_set.restype = ctypes.c_void_p
+    lib.pa_cvolume_set.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint32]
+
+    lib.pa_context_set_sink_volume_by_name.restype = ctypes.c_void_p
+    lib.pa_context_set_sink_volume_by_name.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        _CONTEXT_SUCCESS_CB,
+        ctypes.c_void_p,
+    ]
+    lib.pa_operation_unref.argtypes = [ctypes.c_void_p]
+
+    lib.pa_context_load_module.restype = ctypes.c_void_p
+    lib.pa_context_load_module.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        _CONTEXT_INDEX_CB,
+        ctypes.c_void_p,
+    ]
+    lib.pa_context_unload_module.restype = ctypes.c_void_p
+    lib.pa_context_unload_module.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        _CONTEXT_SUCCESS_CB,
+        ctypes.c_void_p,
+    ]
+    return lib
+
+
+_full_lib: ctypes.CDLL | None = None
+
+
+def _get_full_lib() -> ctypes.CDLL:
+    global _full_lib  # noqa: PLW0603
+    if _full_lib is None:
+        _full_lib = _load_full_lib()
+    return _full_lib
+
+
+class PAVolumeController:
+    """Shared async libpulse connection for hardware PA sink volume control.
+
+    One instance is shared across all PA sink bridges. Connects once via a
+    threaded mainloop; set_sink_volume() calls are then direct function calls
+    into the existing connection — no subprocess, no fork/exec per change.
+
+    A pa_cvolume with channels=1 is used for all sinks regardless of their
+    actual channel count: PA remaps a single-channel volume uniformly across
+    the sink's full channel map (same behavior as `pactl set-sink-volume
+    <sink> N%`), so no per-sink channel-count detection is needed. This also
+    works correctly for module-remap-sink.c sinks — each remap sink has an
+    independent volume that does not affect its master sink or siblings.
+
+    All calls are blocking (bounded by short timeouts) and must be invoked
+    via run_in_executor from async code.
+    """
+
+    def __init__(self) -> None:
+        """Connect to PulseAudio and start the threaded mainloop."""
+        self._lib = _get_full_lib()
+        self._lock = threading.Lock()
+        self._mainloop = self._lib.pa_threaded_mainloop_new()
+        if not self._mainloop:
+            raise OSError("pa_threaded_mainloop_new returned NULL")
+
+        api = self._lib.pa_threaded_mainloop_get_api(self._mainloop)
+        self._context = self._lib.pa_context_new(api, b"music-assistant-volume")
+        if not self._context:
+            self._lib.pa_threaded_mainloop_free(self._mainloop)
+            self._mainloop = None
+            raise OSError("pa_context_new returned NULL")
+
+        self._ready = threading.Event()
+        self._failed = threading.Event()
+
+        def _state_cb_impl(_ctx: int, _userdata: int) -> None:
+            state = self._lib.pa_context_get_state(self._context)
+            if state == PA_CONTEXT_READY:
+                self._ready.set()
+            elif state in (PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
+                self._failed.set()
+
+        self._state_cb = _CONTEXT_NOTIFY_CB(_state_cb_impl)  # keep reference alive — GC
+        self._lib.pa_context_set_state_callback(self._context, self._state_cb, None)
+
+        pulse_server = _get_pulse_server()
+        ret = self._lib.pa_context_connect(
+            self._context,
+            pulse_server.encode() if pulse_server else None,
+            PA_CONTEXT_NOAUTOSPAWN,
+            None,
+        )
+        if ret < 0:
+            self.close()
+            raise OSError(f"pa_context_connect failed (ret={ret})")
+
+        self._lib.pa_threaded_mainloop_start(self._mainloop)
+
+        if not self._ready.wait(timeout=5.0):
+            self.close()
+            raise OSError("Timed out connecting to PulseAudio for volume control")
+
+    def set_sink_volume(self, sink_name: str, volume_pct: int, channels: int = 2) -> bool:
+        """Set hardware volume on a PA sink by name.
+
+        :param volume_pct: MA player volume, 0-100. Mapped to an amplitude
+            scale factor via a dr-lex 60dB exponential audio taper
+            (_volume_pct_to_amplitude) — constant dB change per slider step,
+            with true silence at volume_pct=0. See
+            https://www.dr-lex.be/info-stuff/volumecontrols.html
+
+            PulseAudio's own volume percentage represents amplitude**3 (a
+            perceptual/cubic curve — pactl reports 10% as -60dB, since
+            20*log10(0.10**3) == -60). Passing the target amplitude straight
+            through as a PA percentage would apply PA's cubic curve on top
+            of the taper already applied here, over-attenuating the signal.
+            A cube root converts the target amplitude to the PA volume
+            percentage that produces it once PA's own cubic curve is
+            applied.
+
+        :param channels: Number of channels to set in the pa_cvolume, all to
+            the same value. Defaults to 2 (BRIDGE_CHANNELS — all local_audio
+            sinks are stereo). Matching the sink's actual channel count
+            avoids PA's channel-count-mismatch remap path, which updates the
+            displayed reference_volume but may not reliably update the
+            soft_volume actually used for sample mixing.
+
+        Blocks (up to ~0.5s) for PA's success/failure response.
+        :returns: True if PA reported success.
+        """
+        with self._lock:
+            if self._failed.is_set():
+                return False
+            amplitude = volume_pct_to_amplitude(volume_pct)
+            pa_vol = round(PA_VOLUME_NORM * amplitude ** (1.0 / 3.0))
+            cvol = _PACVolume()
+            self._lib.pa_cvolume_set(ctypes.byref(cvol), channels, pa_vol)
+
+            done = threading.Event()
+            result: dict[str, int] = {}
+
+            def _success_cb_impl(_ctx: int, success: int, _userdata: int) -> None:
+                result["success"] = success
+                done.set()
+
+            success_cb = _CONTEXT_SUCCESS_CB(_success_cb_impl)
+
+            self._lib.pa_threaded_mainloop_lock(self._mainloop)
+            try:
+                op = self._lib.pa_context_set_sink_volume_by_name(
+                    self._context,
+                    sink_name.encode(),
+                    ctypes.byref(cvol),
+                    success_cb,
+                    None,
+                )
+                if not op:
+                    return False
+            finally:
+                self._lib.pa_threaded_mainloop_unlock(self._mainloop)
+
+            if not done.wait(timeout=_SET_VOLUME_TIMEOUT):
+                self._lib.pa_operation_unref(op)
+                return False
+            self._lib.pa_operation_unref(op)
+            return bool(result.get("success", 0))
+
+    def load_module(self, module_name: str, argument: str) -> int | None:
+        """Load a PulseAudio module (e.g. module-remap-sink) via libpulse.
+
+        :param module_name: PA module name, e.g. "module-remap-sink".
+        :param argument: Module argument string, e.g.
+            "sink_name=Foo master=bar channels=2 master_channel_map=...
+            channel_map=front-left,front-right remix=no".
+
+        Blocks (up to ~2s) for PA's response.
+        :returns: The loaded module's index, or None on failure/timeout.
+        """
+        with self._lock:
+            if self._failed.is_set():
+                return None
+
+            done = threading.Event()
+            result: dict[str, int] = {}
+
+            def _index_cb_impl(_ctx: int, idx: int, _userdata: int) -> None:
+                result["index"] = idx
+                done.set()
+
+            index_cb = _CONTEXT_INDEX_CB(_index_cb_impl)
+
+            self._lib.pa_threaded_mainloop_lock(self._mainloop)
+            try:
+                op = self._lib.pa_context_load_module(
+                    self._context,
+                    module_name.encode(),
+                    argument.encode(),
+                    index_cb,
+                    None,
+                )
+                if not op:
+                    return None
+            finally:
+                self._lib.pa_threaded_mainloop_unlock(self._mainloop)
+
+            if not done.wait(timeout=2.0):
+                self._lib.pa_operation_unref(op)
+                return None
+            self._lib.pa_operation_unref(op)
+            idx = result.get("index", PA_INVALID_INDEX)
+            return None if idx == PA_INVALID_INDEX else idx
+
+    def unload_module(self, module_index: int) -> bool:
+        """Unload a previously-loaded PulseAudio module by index.
+
+        Blocks (up to ~2s) for PA's response.
+        :returns: True if PA reported success.
+        """
+        with self._lock:
+            if self._failed.is_set():
+                return False
+
+            done = threading.Event()
+            result: dict[str, int] = {}
+
+            def _success_cb_impl(_ctx: int, success: int, _userdata: int) -> None:
+                result["success"] = success
+                done.set()
+
+            success_cb = _CONTEXT_SUCCESS_CB(_success_cb_impl)
+
+            self._lib.pa_threaded_mainloop_lock(self._mainloop)
+            try:
+                op = self._lib.pa_context_unload_module(
+                    self._context, module_index, success_cb, None
+                )
+                if not op:
+                    return False
+            finally:
+                self._lib.pa_threaded_mainloop_unlock(self._mainloop)
+
+            if not done.wait(timeout=2.0):
+                self._lib.pa_operation_unref(op)
+                return False
+            self._lib.pa_operation_unref(op)
+            return bool(result.get("success", 0))
+
+    def close(self) -> None:
+        """Disconnect and tear down the mainloop."""
+        with self._lock:
+            if self._context:
+                self._lib.pa_context_disconnect(self._context)
+                self._lib.pa_context_unref(self._context)
+                self._context = None
+            if self._mainloop:
+                self._lib.pa_threaded_mainloop_stop(self._mainloop)
+                self._lib.pa_threaded_mainloop_free(self._mainloop)
+                self._mainloop = None
 
 
 class PASimpleStream:
@@ -129,32 +452,14 @@ class PASimpleStream:
         rate: int,
         channels: int,
         bit_depth: int = 16,
-        buffer_msec: int = 200,
     ) -> None:
-        """Open a synchronous PCM playback stream to the named PulseAudio sink.
-
-        :param buffer_msec: Target buffer size in milliseconds. Larger values
-            reduce underruns at the cost of increased latency. Default 200ms.
-        """
+        """Open a synchronous PCM playback stream to the named PulseAudio sink."""
         lib = _get_lib()
         spec = _PASampleSpec(
             format=_pa_sample_format(bit_depth),
             rate=rate,
             channels=channels,
         )
-
-        # Calculate target buffer length in bytes
-        bytes_per_sec = rate * channels * (4 if bit_depth >= 24 else 2)
-        tlength = int(bytes_per_sec * buffer_msec / 1000)
-
-        buf_attr = _PABufferAttr(
-            maxlength=0xFFFFFFFF,   # PA chooses max
-            tlength=tlength,        # target buffer size
-            prebuf=0xFFFFFFFF,      # PA chooses prebuf
-            minreq=0xFFFFFFFF,      # PA chooses minreq
-            fragsize=0xFFFFFFFF,    # recording only
-        )
-
         error = ctypes.c_int(0)
         self._lib = lib
         self._lock = threading.Lock()
@@ -167,7 +472,7 @@ class PASimpleStream:
             b"playback",
             ctypes.byref(spec),
             None,
-            ctypes.byref(buf_attr),
+            None,
             ctypes.byref(error),
         )
         if not self._conn:
@@ -215,6 +520,82 @@ class PASimpleStream:
         self.close()
 
 
+def enumerate_alsa_devices() -> list[dict[str, Any]]:
+    """Enumerate stereo-capable ALSA output devices via sounddevice/PortAudio.
+
+    Returns list of dicts compatible with the PA sink dict shape so that
+    LocalAudioBridgeManager can use the same registration path for both
+    backends.  Keys returned:
+      - name: stable device name (used for UUID / player-id generation)
+      - description: human-readable label (MA player display name)
+      - pa_sink_name: None (not a PA device)
+      - max_output_channels: number of channels
+      - sample_rate: device default sample rate
+      - bit_depth: fixed 16 (PortAudio ALSA path; bridge uses int16 dtype)
+      - is_remap: False
+      - index: sounddevice device index
+      - hostapi: host API index
+    """
+    import sounddevice as _sd  # noqa: PLC0415
+
+    # Find the ALSA host API index
+    alsa_hostapi_index: int | None = None
+    for i, api in enumerate(_sd.query_hostapis()):
+        if "alsa" in api.get("name", "").lower():
+            alsa_hostapi_index = i
+            break
+
+    devices: list[dict[str, Any]] = []
+    for idx, dev in enumerate(_sd.query_devices()):
+        if dev.get("max_output_channels", 0) < 2:
+            continue
+        if alsa_hostapi_index is not None and dev.get("hostapi") != alsa_hostapi_index:
+            continue
+        try:
+            test = _sd.RawOutputStream(
+                device=idx,
+                samplerate=int(dev.get("default_samplerate", 48000)),
+                channels=2,
+                dtype="int16",
+            )
+            test.close()
+        except _sd.PortAudioError:
+            continue
+        name: str = dev.get("name", f"alsa-device-{idx}")
+
+        # Skip virtual ALSA PCM plugins — only keep real hardware nodes.
+        # PortAudio enumerates both hw: entries and virtual plugins
+        # (sysdefault, front, surround*, dmix, lavrate, upmix, …).
+        # Hardware entries always contain "(hw:" in their name.
+        if "(hw:" not in name:
+            continue
+
+        sample_rate = int(dev.get("default_samplerate", 48000))
+
+        # Build a clean display name: strip the " (hw:C,D)" suffix so the
+        # MA player name reads e.g. "Intel Audio: ALC889A Analog" not
+        # "Intel Audio: ALC889A Analog (hw:1,0)".
+        import re as _re  # noqa: PLC0415
+
+        description = _re.sub(r"\s*\(hw:\d+,\d+\)$", "", name).strip()
+
+        devices.append(
+            {
+                "name": name,  # stable key — includes (hw:C,D) for uniqueness
+                "description": description,  # human-readable MA player label
+                "pa_sink_name": None,
+                "max_output_channels": dev.get("max_output_channels", 2),
+                "sample_rate": sample_rate,
+                "bit_depth": 16,
+                "is_remap": False,
+                "master_device": None,
+                "index": idx,
+                "hostapi": dev.get("hostapi", 0),
+            }
+        )
+    return devices
+
+
 def enumerate_pa_sinks() -> list[dict[str, Any]]:
     """Enumerate stereo-capable PulseAudio sinks via pactl JSON output.
 
@@ -229,31 +610,31 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
       - max_output_channels: number of channels
       - sample_rate: sink native sample rate in Hz
       - bit_depth: sink native bit depth (16, 24, or 32)
+      - is_remap: True for module-remap-sink.c sinks
+      - master_device: for remap sinks, the underlying master sink's PA name.
+        On real PulseAudio this comes from the device.master_device
+        property; on PipeWire's pulse-compat layer (which doesn't set that
+        property) it's recovered by cross-referencing the owning module's
+        id against `pactl list modules`. None if not a remap sink or if
+        the master couldn't be determined.
+      - driver: PA driver string, e.g. "module-alsa-card.c" or
+        "module-remap-sink.c"
+      - channel_map: list of PA channel position names, e.g.
+        ["front-left", "front-right", "rear-left", "rear-right",
+        "front-center", "lfe", "side-left", "side-right"]
+      - alsa_card_name: the alsa.card_name property (e.g. "Creative X-Fi"),
+        or None if not an ALSA-backed sink
     """
     import json  # noqa: PLC0415
     import shutil  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
 
-    # Locate pactl — prefer bundled binary, fall back to system
-    bundled = os.path.join(os.path.dirname(__file__), "bin", "pactl")
-    if os.path.isfile(bundled):
-        if not os.access(bundled, os.X_OK):
-            with contextlib.suppress(OSError):
-                Path(bundled).chmod(0o755)
-    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
-        pactl_bin = bundled
-    elif path := shutil.which("pactl"):
-        pactl_bin = path
-    else:
-        raise FileNotFoundError(
-            "pactl not found — bundled binary missing and pulseaudio-utils not installed"
-        )
+    # Locate pactl — requires pulseaudio-utils to be installed
+    if not (path := shutil.which("pactl")):
+        raise FileNotFoundError("pactl not found — please install pulseaudio-utils")
+    pactl_bin = path
 
-    # Build environment with bundled lib dir and PULSE_SERVER
-    lib_dir = os.path.join(os.path.dirname(__file__), "bin", "lib")
-    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    ld_path = f"{lib_dir}:{existing_ld}" if existing_ld else lib_dir
-    env = {**os.environ, "LD_LIBRARY_PATH": ld_path}
+    env = {**os.environ}
     pulse_server = _get_pulse_server()
     if pulse_server:
         env["PULSE_SERVER"] = pulse_server
@@ -269,30 +650,119 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
     if result.returncode != 0:
         raise RuntimeError(f"pactl exited {result.returncode}: {result.stderr.strip()}")
 
+    # PipeWire's pulse-compat layer never sets device.master_device on
+    # remap-sink children (unlike real PulseAudio's module-remap-sink.c,
+    # which sets it directly on the sink). It does expose the owning
+    # module's id via pulse.module.id/node.group, so the master sink name
+    # can still be recovered by cross-referencing pactl's module list — each
+    # module-remap-sink.c module's "argument" string contains
+    # "master=<sink_name>". Build that id->master lookup once, up front,
+    # rather than re-querying per-sink.
+    module_master_by_id: dict[str, str] = {}
+    try:
+        mod_result = subprocess.run(  # noqa: S603
+            [pactl_bin, "--format=json", "list", "modules"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+            check=False,
+        )
+        if mod_result.returncode == 0:
+            for mod in json.loads(mod_result.stdout):
+                arg: str = mod.get("argument", "") or ""
+                mod_id = str(mod.get("index", ""))
+                for part in arg.split():
+                    if part.startswith("master="):
+                        module_master_by_id[mod_id] = part.split("=", 1)[1]
+                        break
+    except Exception:
+        pass  # nosec - best-effort; falls back to no master_device below
+
     sinks = []
     for sink in json.loads(result.stdout):
         name: str = sink.get("name", "")
         desc: str = sink.get("description", name)
         spec_str: str = sink.get("sample_specification", "")
         driver: str = sink.get("driver", "")
+        properties: dict[str, str] = sink.get("properties", {})
+        # device.master_device is set by module-remap-sink itself on every
+        # sink it creates, and only on those sinks — so it's a reliable way
+        # to detect a remap-sink child regardless of what the host reports
+        # in the top-level "driver" field. Real PulseAudio reports the
+        # literal module name there ("module-remap-sink.c" /
+        # "module-alsa-card.c"), but PipeWire's PulseAudio-compatibility
+        # layer instead reports a generic "PipeWire" driver string for
+        # every sink it manages, so "driver == module-remap-sink.c" alone
+        # would silently misdetect every remap sink (and every ALSA-card
+        # master sink) as something else on a PipeWire-only system.
+        #
+        # PipeWire's pulse-compat layer also never sets device.master_device
+        # on remap-sink children — confirmed against real `pactl --format=json
+        # list sinks` output on a PipeWire system, where module-remap-sink.c
+        # children show no device.master_device property at all. Instead
+        # PipeWire labels the relationship explicitly via node.group
+        # ("remap-sink-<module_id>"), which is present in pactl's JSON
+        # properties for every PipeWire-managed remap sink. Check that too
+        # so detection works under PipeWire as well as real PulseAudio.
+        master_device: str | None = properties.get("device.master_device")
+        node_group: str = properties.get("node.group", "")
+        is_remap = (
+            master_device is not None
+            or driver == "module-remap-sink.c"
+            or node_group.startswith("remap-sink-")
+        )
+        if master_device is None and node_group.startswith("remap-sink-"):
+            # PipeWire path: recover the master sink name via the module-id
+            # lookup built above, using pulse.module.id (falls back to the
+            # node.group suffix, which encodes the same id).
+            mod_id = properties.get(
+                "pulse.module.id", node_group.removeprefix("remap-sink-")
+            )
+            master_device = module_master_by_id.get(mod_id)
+        alsa_card_name: str | None = properties.get("alsa.card_name")
+        # pactl --format=json represents channel_map as a comma-separated
+        # string (e.g. "front-left,front-right,rear-left,rear-right,...").
+        channel_map_str: str = sink.get("channel_map", "")
+        channel_map: list[str] = [c for c in channel_map_str.split(",") if c]
         try:
             parts = spec_str.split()
             fmt = parts[0]  # e.g. 's32le'
             channels = int(parts[1].replace("ch", ""))
             sample_rate = int(parts[2].replace("Hz", ""))
-            bit_depth = int("".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0])))
+            # Parse bit depth from PA format string using explicit lookup.
+            # Avoids s24-32le parsing as 2432 with the digit-filter approach.
+            _fmt_to_depth = {
+                "u8": 8,
+                "s16le": 16,
+                "s16be": 16,
+                "s24le": 24,
+                "s24be": 24,
+                "s24-32le": 32,
+                "s24-32be": 32,
+                "s32le": 32,
+                "s32be": 32,
+                "float32le": 32,
+                "float32be": 32,
+            }
+            bit_depth = _fmt_to_depth.get(fmt.lower(), 16)
         except (IndexError, ValueError):
             continue
         if channels < 2:
             continue
         sinks.append(
             {
-                "name": desc,
+                "name": name,  # stable PA sink name — used for UUID/player-id generation
+                "description": desc,  # human-readable label — used as MA player display name
                 "pa_sink_name": name,
                 "max_output_channels": channels,
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
-                "is_remap": driver == "module-remap-sink.c",
+                "is_remap": is_remap,
+                "master_device": master_device,
+                "driver": driver,
+                "channel_map": channel_map,
+                "alsa_card_name": alsa_card_name,
             }
         )
     return sinks
