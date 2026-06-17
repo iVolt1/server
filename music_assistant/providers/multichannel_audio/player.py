@@ -367,9 +367,27 @@ class MultiChannelPlayer(Player):
                 self.bit_depth,
             )
 
+            # IMPORTANT: do not rely on ContentType.UNKNOWN auto-probing or on the
+            # URL's declared format string here. resolve_stream_url's CONF_OUTPUT_CODEC
+            # resolution is unreliable (frequently still resolves to the generic
+            # 44100/16/stereo fallback in the URL path itself), while the actual
+            # bytes served by get_output_format/select_flow_pcm_format are correctly
+            # multichannel at self.sample_rate/self.bit_depth/source_channels (verified
+            # via MA's own ffmpeg stream-info logs: codec=s32le, matching bit_rate).
+            # Feeding ffmpeg an UNKNOWN/auto-probed input format against a raw multichannel
+            # PCM stream makes its prober reject the data outright ("Invalid data found
+            # when processing input", returncode=183) because the actual frame layout
+            # doesn't match what a 2ch/16bit guess (or no guess) would expect.
+            # We already know the true format deterministically — declare it explicitly.
+            actual_input_format = AudioFormat(
+                content_type=ContentType.from_bit_depth(self.bit_depth),
+                sample_rate=self.sample_rate,
+                bit_depth=self.bit_depth,
+                channels=source_channels,
+            )
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
-                input_format=AudioFormat(content_type=ContentType.UNKNOWN),
+                input_format=actual_input_format,
                 output_format=output_format,
                 extra_output_args=["-flush_packets", "1"],
                 collect_log_history=True,
