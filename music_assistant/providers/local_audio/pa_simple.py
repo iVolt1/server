@@ -611,8 +611,12 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
       - sample_rate: sink native sample rate in Hz
       - bit_depth: sink native bit depth (16, 24, or 32)
       - is_remap: True for module-remap-sink.c sinks
-      - master_device: for remap sinks, the underlying master sink's PA name
-        (from the device.master_device property), else None
+      - master_device: for remap sinks, the underlying master sink's PA name.
+        On real PulseAudio this comes from the device.master_device
+        property; on PipeWire's pulse-compat layer (which doesn't set that
+        property) it's recovered by cross-referencing the owning module's
+        id against `pactl list modules`. None if not a remap sink or if
+        the master couldn't be determined.
       - driver: PA driver string, e.g. "module-alsa-card.c" or
         "module-remap-sink.c"
       - channel_map: list of PA channel position names, e.g.
@@ -646,6 +650,35 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
     if result.returncode != 0:
         raise RuntimeError(f"pactl exited {result.returncode}: {result.stderr.strip()}")
 
+    # PipeWire's pulse-compat layer never sets device.master_device on
+    # remap-sink children (unlike real PulseAudio's module-remap-sink.c,
+    # which sets it directly on the sink). It does expose the owning
+    # module's id via pulse.module.id/node.group, so the master sink name
+    # can still be recovered by cross-referencing pactl's module list — each
+    # module-remap-sink.c module's "argument" string contains
+    # "master=<sink_name>". Build that id->master lookup once, up front,
+    # rather than re-querying per-sink.
+    module_master_by_id: dict[str, str] = {}
+    try:
+        mod_result = subprocess.run(  # noqa: S603
+            [pactl_bin, "--format=json", "list", "modules"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+            check=False,
+        )
+        if mod_result.returncode == 0:
+            for mod in json.loads(mod_result.stdout):
+                arg: str = mod.get("argument", "") or ""
+                mod_id = str(mod.get("index", ""))
+                for part in arg.split():
+                    if part.startswith("master="):
+                        module_master_by_id[mod_id] = part.split("=", 1)[1]
+                        break
+    except Exception:
+        pass  # nosec - best-effort; falls back to no master_device below
+
     sinks = []
     for sink in json.loads(result.stdout):
         name: str = sink.get("name", "")
@@ -663,8 +696,30 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
         # every sink it manages, so "driver == module-remap-sink.c" alone
         # would silently misdetect every remap sink (and every ALSA-card
         # master sink) as something else on a PipeWire-only system.
+        #
+        # PipeWire's pulse-compat layer also never sets device.master_device
+        # on remap-sink children — confirmed against real `pactl --format=json
+        # list sinks` output on a PipeWire system, where module-remap-sink.c
+        # children show no device.master_device property at all. Instead
+        # PipeWire labels the relationship explicitly via node.group
+        # ("remap-sink-<module_id>"), which is present in pactl's JSON
+        # properties for every PipeWire-managed remap sink. Check that too
+        # so detection works under PipeWire as well as real PulseAudio.
         master_device: str | None = properties.get("device.master_device")
-        is_remap = master_device is not None or driver == "module-remap-sink.c"
+        node_group: str = properties.get("node.group", "")
+        is_remap = (
+            master_device is not None
+            or driver == "module-remap-sink.c"
+            or node_group.startswith("remap-sink-")
+        )
+        if master_device is None and node_group.startswith("remap-sink-"):
+            # PipeWire path: recover the master sink name via the module-id
+            # lookup built above, using pulse.module.id (falls back to the
+            # node.group suffix, which encodes the same id).
+            mod_id = properties.get(
+                "pulse.module.id", node_group.removeprefix("remap-sink-")
+            )
+            master_device = module_master_by_id.get(mod_id)
         alsa_card_name: str | None = properties.get("alsa.card_name")
         # pactl --format=json represents channel_map as a comma-separated
         # string (e.g. "front-left,front-right,rear-left,rear-right,...").
