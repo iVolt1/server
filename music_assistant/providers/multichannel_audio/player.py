@@ -375,12 +375,18 @@ class MultiChannelPlayer(Player):
                 collect_log_history=True,
             )
             await ffmpeg_proc.start()
+            self.logger.warning(
+                "*** DEBUG: ffmpeg_proc.start() returned, pid=%s, chunk_size=%d",
+                ffmpeg_proc.proc.pid if ffmpeg_proc.proc else None, chunk_size,
+            )
 
             first_chunk = True
             ct_val: str = ""
             is_float = False
             first_demux_logged = False
+            self.logger.warning("*** DEBUG: entering iter_chunked loop")
             async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
+                self.logger.warning("*** DEBUG: got chunk len=%d", len(chunk))
                 if first_chunk:
                     ct_val = str(output_format.content_type.value).lower()
                     is_float = "f32" in ct_val or "float" in ct_val
@@ -408,10 +414,12 @@ class MultiChannelPlayer(Player):
                 )
 
         except asyncio.CancelledError:
+            self.logger.warning("*** DEBUG: _playback_loop CancelledError caught")
             pass
         except Exception as err:
-            self.logger.error("Playback error: %s", err)
+            self.logger.error("Playback error: %s", err, exc_info=True)
         finally:
+            self.logger.warning("*** DEBUG: _playback_loop finally block entered")
             if ffmpeg_proc is not None:
                 with suppress(Exception):
                     await ffmpeg_proc.close()
