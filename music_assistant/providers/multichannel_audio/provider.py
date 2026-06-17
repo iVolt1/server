@@ -6,9 +6,6 @@ import ctypes
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import ContentType
-
-from music_assistant.constants import CONF_OUTPUT_CODEC
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
@@ -171,34 +168,6 @@ class MultiChannelAudioProvider(PlayerProvider):
         await self._player.restore_state()
         await self._player.apply_restored_volume()
         await self.mass.players.register_or_update(self._player)
-
-        # Force-persist a raw PCM output_codec for this player.
-        #
-        # MA's stream controller (resolve_stream_url) reads this value via
-        # protocol_player.config.get_value(CONF_OUTPUT_CODEC, default="flac").
-        # That get_value() only consults the entry's declared default_value
-        # the moment Config.parse() runs (i.e. at player (re)registration);
-        # it does not re-invoke get_config_entries() on every call. Relying
-        # solely on MultiChannelPlayer.get_config_entries()'s default_value
-        # left a stale/empty stored value resolving to "flac" on a player
-        # that had already gone through at least one parse cycle, which
-        # corrupted playback (MA serving FLAC-compressed bytes that our PA
-        # demux misread as raw PCM samples, manifesting as sped-up/garbled
-        # "chipmunk" audio). Explicitly saving a real stored value here
-        # guarantees get_value() finds it in self.values regardless of when
-        # the in-memory Config was last parsed.
-        codec_str = (
-            f"{ContentType.PCM_S32LE.value};codec=pcm;"
-            f"rate={sample_rate};bitrate={bit_depth};channels={channels}"
-        )
-        try:
-            await self.mass.config.save_player_config(
-                player_id, {CONF_OUTPUT_CODEC: codec_str}
-            )
-        except Exception as err:
-            self.logger.warning(
-                "Could not force-persist output_codec for %s: %s", player_id, err
-            )
 
         self.logger.info(
             "Registered multichannel player: %s (%s, %dch, %dHz, %dbit) -> pairs: %s",
