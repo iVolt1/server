@@ -28,7 +28,14 @@ class SpdifAudioProvider(PlayerProvider):
     _player: SpdifAudioPlayer | None
 
     async def handle_async_init(self) -> None:
-        """Verify ffmpeg (AC3 encoder, spdif muxer, pulse output) and pacat are available."""
+        """Verify ffmpeg (AC3 encoder, spdif muxer, pulse output) is available.
+
+        Both the AC3 passthrough path's encode and write stages use ffmpeg —
+        no pacat dependency. pulseaudio-utils on this project's Debian base
+        (16.1+dfsg1-2+b1) installs pactl but not pacat, so the write stage
+        uses a second ffmpeg process with -c:a copy (pure remux, zero
+        processing) instead.
+        """
         import shutil  # noqa: PLC0415
         import subprocess  # noqa: PLC0415
 
@@ -50,11 +57,6 @@ class SpdifAudioProvider(PlayerProvider):
         if " ac3" not in encoders:
             raise RuntimeError("ffmpeg is not built with an AC3 encoder.")
 
-        if not shutil.which("pacat"):
-            raise RuntimeError(
-                "pacat not found in PATH — required for bit-perfect passthrough writes. "
-                "Should be provided by pulseaudio-utils (see PR #3734)."
-            )
         self._player = None
 
     async def loaded_in_mass(self) -> None:
