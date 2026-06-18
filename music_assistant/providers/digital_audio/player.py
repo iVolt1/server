@@ -191,10 +191,15 @@ class DigitalAudioPlayer(Player):
 
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
 
+        # thread_queue_size cushions ffmpeg's input read thread against brief
+        # scheduling/network jitter on the MA stream URL — without it, a stall
+        # in the read thread propagates directly into the PA write, causing
+        # an audible dropout rather than being absorbed by a queue.
         if url_content_type.is_pcm():
             # MA is serving raw PCM — declare the real format explicitly so
             # ffmpeg does not attempt to probe undeclared multichannel bytes.
             input_args = [
+                "-thread_queue_size", "4096",
                 "-f", str(url_content_type.value),
                 "-ar", str(self.sample_rate),
                 "-ac", str(self.channels),
@@ -202,16 +207,24 @@ class DigitalAudioPlayer(Player):
             ]
         else:
             # Compressed format (flac, aac, mp3, ...) — ffmpeg identifies it natively.
-            input_args = ["-i", url]
+            input_args = ["-thread_queue_size", "4096", "-i", url]
 
         cmd = [
             ffmpeg_bin,
             "-hide_banner",
+            "-nostdin",
             *input_args,
             "-acodec", "pcm_s32le",
             "-ar", str(self.sample_rate),
             "-ac", str(self.channels),
             "-f", "pulse",
+            # buffer_duration defaults to 0 (PA auto-calculates), which on a
+            # loaded system is too tight and underruns on the first scheduling
+            # hiccup, producing audible stutter. 500ms gives real headroom at
+            # a barely-noticeable latency cost. prebuf -1 means "use the
+            # server's default", which combined with an explicit buffer is
+            # the stable PA client pattern.
+            "-buffer_duration", "500",
             "-name", f"music-assistant-{self._sink_name}",
             self._sink_name,
         ]
@@ -397,3 +410,4 @@ class DigitalAudioPlayer(Player):
             provider=self._provider.instance_id,
             category=CACHE_CATEGORY_PREV_STATE,
         )
+        
