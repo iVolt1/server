@@ -25,7 +25,13 @@ SUPPORTED_FEATURES = {
 
 
 def _get_pa_sink_options() -> list[ConfigValueOption]:
-    """Return available PA sinks as config options by running pactl."""
+    """Return available PA sinks as config options by running pactl.
+
+    Appends the actual channel count to each label (parsed from
+    sample_specification, e.g. "s32le 8ch 96000Hz") so multichannel-capable
+    sinks are obvious at a glance without filtering out stereo-only sinks —
+    this provider works generically for any channel count, 2ch included.
+    """
     options: list[ConfigValueOption] = []
     try:
         result = subprocess.run(
@@ -39,8 +45,16 @@ def _get_pa_sink_options() -> list[ConfigValueOption]:
             for sink in json.loads(result.stdout):
                 name: str = sink.get("name", "")
                 desc: str = sink.get("description", name)
-                if name:
-                    options.append(ConfigValueOption(title=desc, value=name))
+                if not name:
+                    continue
+                channels_label = ""
+                spec_str: str = sink.get("sample_specification", "")
+                parts = spec_str.split()
+                if len(parts) >= 2 and parts[1].endswith("ch"):
+                    channels_label = f" — {parts[1]}"
+                options.append(
+                    ConfigValueOption(title=f"{desc}{channels_label}", value=name)
+                )
     except Exception:
         pass
     return options or [ConfigValueOption(title="(enter sink name manually)", value="")]
