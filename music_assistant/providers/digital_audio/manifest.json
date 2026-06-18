@@ -1,0 +1,11 @@
+{
+  "type": "music_assistant",
+  "domain": "digital_audio",
+  "name": "Digital Audio",
+  "description": "Direct multichannel output to a PulseAudio sink via ffmpeg -f pulse. Supports analog 5.1/7.1, HDMI audio, and USB multichannel devices. No remap sinks or libpulse-simple required.",
+  "version": "0.0.1",
+  "codeowners": ["@iVolt1"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": true
+}
