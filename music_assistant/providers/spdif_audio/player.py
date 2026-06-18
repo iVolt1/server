@@ -223,7 +223,8 @@ class SpdifAudioPlayer(Player):
         """
         Run playback segments, relaunching with a seek when volume changes mid-track.
 
-        Each iteration is one ffmpeg/pacat "segment". volume_set() kills the
+        Each iteration is one ffmpeg "segment" (two ffmpeg processes for the
+        AC3 path). volume_set() kills the
         active segment's process(es) and sets _restart_requested; this loop
         then computes the elapsed position via _current_position(), advances
         _segment_start_offset to it, and immediately relaunches with the new
@@ -347,24 +348,33 @@ class SpdifAudioPlayer(Player):
         Encode surround content to Dolby Digital and write it as a passthrough
         bitstream disguised as 2-channel 16-bit PCM.
 
-        Two processes connected by a raw OS pipe (zero-copy, kernel-mediated):
-          1. ffmpeg: decode source -> [volume filter, PCM] -> encode AC3 ->
+        Two ffmpeg processes connected by a raw OS pipe (zero-copy, kernel-mediated):
+          1. encode: decode source -> [volume filter, PCM] -> encode AC3 ->
              wrap as IEC 61937 -> stdout
-          2. pacat: read raw bytes from stdin -> write bit-perfect to PA sink
+          2. write: read raw bytes from stdin -> -c:a copy (zero processing,
+             pure remux) -> -f pulse -> bit-perfect to the PA sink
+
+        A second ffmpeg invocation is used for the write stage rather than
+        pacat — pulseaudio-utils on this Debian build (16.1+dfsg1-2+b1)
+        installs pactl but not pacat. ffmpeg's pulse output is already proven
+        to work in this container (same mechanism as digital_audio and the
+        direct-PCM path above), and -c:a copy guarantees zero decode/filter/
+        encode work on the bytes — exactly as bit-perfect as pacat would have
+        been, with no new dependency.
 
         Volume is applied via -af volume BEFORE the AC3 encoder (-c:a ac3) —
-        safe, since it only ever touches raw PCM. pacat never sees anything
-        but the final compressed bitstream bytes and never modifies them.
+        safe, since it only ever touches raw PCM. The write-stage ffmpeg
+        never sees anything but the final compressed bitstream bytes and
+        never modifies them.
 
         offset seeks the input to resume mid-track after a volume-triggered
-        restart. Pause only needs to SIGSTOP the pacat consumer — once it
-        stops draining, the OS pipe buffer fills and ffmpeg blocks naturally
-        on its next write.
+        restart. Pause only needs to SIGSTOP the write-stage consumer — once
+        it stops draining, the OS pipe buffer fills and the encode stage
+        blocks naturally on its next write.
         """
         url_fmt_str = url.rsplit(".", 1)[-1] if "." in url.rsplit("/", 1)[-1] else ""
         url_content_type = ContentType.try_parse(url_fmt_str)
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        pacat_bin = shutil.which("pacat") or "pacat"
         seek_args = ["-ss", f"{offset:.3f}"] if offset > 0 else []
 
         if url_content_type.is_pcm():
@@ -391,18 +401,19 @@ class SpdifAudioPlayer(Player):
             "pipe:1",
         ]
         cmd_play = [
-            pacat_bin,
-            "--playback",
-            f"--device={self._sink_name}",
-            f"--rate={SPDIF_SAMPLE_RATE}",
-            f"--channels={SPDIF_CARRIER_CHANNELS}",
-            "--format=s16le",
-            "--raw",
-            "--latency-msec=500",
-            f"--client-name=music-assistant-{self._sink_name}",
+            ffmpeg_bin, "-hide_banner", "-nostdin",
+            "-f", "s16le",
+            "-ar", str(SPDIF_SAMPLE_RATE),
+            "-ac", str(SPDIF_CARRIER_CHANNELS),
+            "-i", "pipe:0",
+            "-c:a", "copy",
+            "-f", "pulse",
+            "-buffer_duration", "500",
+            "-name", f"music-assistant-{self._sink_name}",
+            self._sink_name,
         ]
         self.logger.debug(
-            "ffmpeg (AC3 encode) cmd: %s  |  pacat cmd: %s",
+            "ffmpeg (AC3 encode) cmd: %s  |  ffmpeg (raw write) cmd: %s",
             " ".join(cmd_encode), " ".join(cmd_play),
         )
 
@@ -430,7 +441,7 @@ class SpdifAudioPlayer(Player):
 
             stderr_tasks = [
                 self.mass.create_task(self._drain_stderr(proc_encode, "encode")),
-                self.mass.create_task(self._drain_stderr(proc_play, "spdif")),
+                self.mass.create_task(self._drain_stderr(proc_play, "write")),
             ]
             try:
                 await self._monitor_passthrough_pair(proc_encode, proc_play)
@@ -456,8 +467,9 @@ class SpdifAudioPlayer(Player):
         proc_encode: asyncio.subprocess.Process,
         proc_play: asyncio.subprocess.Process,
     ) -> None:
-        """Poll both processes, applying pause via SIGSTOP/SIGCONT to pacat only,
-        and tracking paused duration for accurate _current_position()."""
+        """Poll both processes, applying pause via SIGSTOP/SIGCONT to the
+        write-stage process only, and tracking paused duration for accurate
+        _current_position()."""
         _was_paused = False
         if self._paused:
             with suppress(ProcessLookupError, OSError):
@@ -486,7 +498,7 @@ class SpdifAudioPlayer(Player):
                 self._pause_started_monotonic = None
         if proc_play.returncode not in (0, -signal.SIGTERM, -signal.SIGKILL):
             self.logger.warning(
-                "pacat exited unexpectedly: returncode=%s sink=%s",
+                "ffmpeg (raw write stage) exited unexpectedly: returncode=%s sink=%s",
                 proc_play.returncode, self._sink_name,
             )
 
