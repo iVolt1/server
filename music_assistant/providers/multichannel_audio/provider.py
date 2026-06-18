@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from music_assistant.models.player_provider import PlayerProvider
 
@@ -29,18 +29,20 @@ _PAIR_SUFFIXES_51 = {"_front_stereo", "_center_sub", "_rear_stereo"}
 _PAIR_SUFFIXES_71 = _PAIR_SUFFIXES_51 | {"_side_stereo"}
 
 
-def _derive_card_name(sink_name: str, layout: str, logger: Any = None) -> str | None:
+def _derive_card_name(sink_name: str, layout: str) -> str | None:
     """Auto-detect the stereo pair sink prefix by scanning PulseAudio remap sinks.
 
     For each candidate prefix, checks whether the remap sinks' master sink
     matches the configured surround sink name — giving an exact match rather
     than a string similarity heuristic.
 
+    PipeWire note: PipeWire reports driver="PipeWire" for all sinks, not the
+    module name. The ``is_remap`` detection in pa_simple.py uses
+    ``node.group.startswith("remap-sink-")`` as an additional condition to
+    correctly identify remap sinks on PipeWire-backed systems.
+
     :param sink_name: The configured surround sink name.
     :param layout: Layout string '5.1' or '7.1'.
-    :param logger: Optional logger for diagnostics (debug-level detail on
-        why detection failed, since the bare None return is otherwise
-        indistinguishable across very different failure causes).
     :returns: The detected prefix string, or None if no match found.
     """
     import json  # noqa: PLC0415
@@ -49,35 +51,18 @@ def _derive_card_name(sink_name: str, layout: str, logger: Any = None) -> str | 
     required = _PAIR_SUFFIXES_71 if layout == "7.1" else _PAIR_SUFFIXES_51
     try:
         sinks = enumerate_pa_sinks()
-    except Exception as err:
-        if logger:
-            logger.warning(
-                "*** DEBUG: enumerate_pa_sinks() raised: %r", err, exc_info=True
-            )
+    except Exception:
         return None
-
-    if logger:
-        logger.warning(
-            "*** DEBUG: enumerate_pa_sinks() returned %d sinks: %s",
-            len(sinks),
-            [(s.get("pa_sink_name"), s.get("is_remap"), s.get("master_device")) for s in sinks],
-        )
 
     remap_names = {s["pa_sink_name"] for s in sinks if s.get("is_remap")}
 
-    if logger:
-        logger.warning("*** DEBUG: remap_names=%s required=%s", remap_names, required)
-
-    # Build candidate prefixes from remap sink names
+    # Build candidate prefixes from remap sink names.
     candidates: dict[str, set[str]] = {}
     for name in remap_names:
         for suffix in required:
             if name.endswith(suffix):
                 prefix = name[: -len(suffix)]
                 candidates.setdefault(prefix, set()).add(suffix)
-
-    if logger:
-        logger.warning("*** DEBUG: candidates=%s", candidates)
 
     matches = [p for p, found in candidates.items() if required.issubset(found)]
     if not matches:
@@ -106,13 +91,8 @@ def _derive_card_name(sink_name: str, layout: str, logger: Any = None) -> str | 
     except Exception:
         pass
 
-    # Fallback: prefer shorter prefix (less likely to be a generic name)
+    # Fallback: prefer shorter prefix (less likely to be a generic name).
     return min(matches, key=len)
-
-if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.provider import ProviderManifest
-    from music_assistant.mass import MusicAssistant
 
 
 class MultiChannelAudioProvider(PlayerProvider):
@@ -154,14 +134,14 @@ class MultiChannelAudioProvider(PlayerProvider):
         channel_map = str(self.config.get_value(CONF_CHANNEL_MAP) or "flac")
         custom_map = str(self.config.get_value(CONF_CUSTOM_CHANNEL_MAP) or "")
 
-        # Query native format from the surround sink via pactl
+        # Query native format from the surround sink via pactl.
         sample_rate, bit_depth, _ = await self.mass.loop.run_in_executor(
             None, _query_sink_format, sink_name
         )
 
-        # Auto-detect the stereo pair sink prefix from PA remap sinks
+        # Auto-detect the stereo pair sink prefix from PA remap sinks.
         card_name = await self.mass.loop.run_in_executor(
-            None, _derive_card_name, sink_name, layout, self.logger
+            None, _derive_card_name, sink_name, layout
         )
         if not card_name:
             self.logger.error(
