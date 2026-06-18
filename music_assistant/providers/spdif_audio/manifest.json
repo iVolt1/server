@@ -1,0 +1,12 @@
+{
+  "type": "player",
+  "domain": "spdif_audio",
+  "name": "S/PDIF Audio Out",
+  "description": "Output to an optical/coax S/PDIF sink. Stereo content plays as plain PCM; 5.1 surround content is encoded to Dolby Digital (AC3) and wrapped in IEC 61937 framing for passthrough decoding on a connected receiver or soundbar.",
+  "codeowners": ["@iVolt1"],
+  "requirements": [],
+  "documentation": "",
+  "builtin": false,
+  "allow_disable": true,
+  "stage": "experimental"
+}
