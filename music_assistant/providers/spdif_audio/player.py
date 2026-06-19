@@ -440,7 +440,13 @@ class SpdifAudioPlayer(Player):
             "-i", "pipe:0",
             "-c:a", "copy",
             "-f", "pulse",
-            "-buffer_duration", "500",
+            # Deliberately no -buffer_duration here. IEC 61937 passthrough
+            # requires the bitstream to flow at an exact continuous rate to
+            # the hardware DAC — the soundbar's lock detector expects AC3
+            # sync words at a fixed cadence. Forcing a large PA buffer causes
+            # bursty delivery (fill 500ms, drain, fill...) which looks like
+            # fast pulsing static to the receiver. Let PA auto-select a
+            # hardware-appropriate low latency instead.
             "-name", f"music-assistant-{self._sink_name}",
             self._sink_name,
         ]
