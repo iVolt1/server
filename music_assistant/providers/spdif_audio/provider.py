@@ -43,6 +43,13 @@ class SpdifAudioProvider(PlayerProvider):
         if not ffmpeg_bin:
             raise RuntimeError("ffmpeg not found in PATH — is it installed in the MA container?")
 
+        if not shutil.which("ffprobe"):
+            raise RuntimeError(
+                "ffprobe not found in PATH — required to detect real source channel "
+                "count before choosing the direct-PCM vs AC3-passthrough path. "
+                "Normally ships alongside ffmpeg from the same build."
+            )
+
         formats = subprocess.run(
             [ffmpeg_bin, "-formats"], capture_output=True, text=True, timeout=10, check=False,
         ).stdout.lower()
