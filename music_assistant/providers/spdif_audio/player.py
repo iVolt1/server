@@ -53,7 +53,10 @@ class SpdifAudioPlayer(Player):
 
     Standard S/PDIF is a 2-channel digital carrier — it cannot carry discrete
     multichannel PCM. Two distinct paths are used depending on real source
-    channel count, decided per-track from streamdetails:
+    channel count, probed directly from the actual flow URL via ffprobe
+    (see _probe_source_channels — streamdetails is not reliable for this,
+    it reflects the source track's original format, not what MA's flow
+    encoder actually delivers):
 
     - Stereo (<=2ch): sent as plain 16-bit PCM via ffmpeg -f pulse, identical
       in spirit to digital_audio's direct-sink approach.
@@ -175,20 +178,17 @@ class SpdifAudioPlayer(Player):
         url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
         self.logger.info("Starting S/PDIF playback from %s", url)
 
-        # Real per-track channel count decides plain-PCM vs AC3-passthrough path.
-        source_channels = self.channels
-        try:
-            queue = self.mass.player_queues.get_active_queue(self.player_id)
-            if queue and queue.current_item and queue.current_item.streamdetails:
-                sd = queue.current_item.streamdetails
-                self.logger.debug(
-                    "streamdetails: channels=%d sample_rate=%d uri=%s",
-                    sd.audio_format.channels, sd.audio_format.sample_rate, sd.uri,
-                )
-                if sd.audio_format.channels > 0:
-                    source_channels = sd.audio_format.channels
-        except Exception as err:
-            self.logger.debug("Could not read streamdetails: %s", err)
+        # streamdetails.audio_format.channels reflects the SOURCE track's
+        # original format (e.g. Spotify's native 2ch/44.1kHz) — not what MA's
+        # flow encoder actually delivers at this URL once upmixed for this
+        # player's declared 6-channel capability. Observed diverging in
+        # practice: a genuinely 5.1/48kHz FLAC flow served for a track whose
+        # streamdetails claimed 2ch/44.1kHz, which silently downmixed real
+        # surround content to stereo instead of routing it through AC3
+        # passthrough. Probing the actual bytes is the only reliable source
+        # of truth here.
+        source_channels = await self._probe_source_channels(url)
+        self.logger.debug("Probed real source channels: %d", source_channels)
 
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
@@ -217,7 +217,39 @@ class SpdifAudioPlayer(Player):
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
 
-    # --- Playback dispatch with volume-triggered restart support ---
+    async def _probe_source_channels(self, url: str) -> int:
+        """
+        Probe the actual flow stream's real channel count via ffprobe.
+
+        Falls back to self.channels (the player's declared max, 6) if
+        ffprobe fails or times out — deliberately fails toward the AC3
+        passthrough path rather than direct PCM. Wrongly taking the AC3 path
+        on genuinely-stereo content still plays correctly (just an
+        unnecessary encode step); wrongly taking the direct-PCM path on
+        genuinely-surround content silently drops every channel past stereo,
+        which is the failure mode this method exists to prevent.
+        """
+        ffprobe_bin = shutil.which("ffprobe") or "ffprobe"
+        cmd = [
+            ffprobe_bin, "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=channels",
+            "-of", "csv=p=0",
+            url,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            channels = int(stdout.decode().strip())
+            if channels > 0:
+                return channels
+        except Exception as err:
+            self.logger.debug("ffprobe channel detection failed, assuming surround: %s", err)
+        return self.channels
+
+    # --- Playback dispatch ---
 
     async def _playback_loop(self, url: str, source_channels: int) -> None:
         """
