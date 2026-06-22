@@ -280,18 +280,12 @@ class LocalAudioInProvider(MusicProvider):
         """
         Capture audio from the PA source and yield encoded bytes.
 
-        FLAC with compression_level 0 for all sources — lossless, low
-        encode overhead, and reliably parsed by MA's stream pipeline.
-        PA fragment_size is tuned to ~10ms for low capture latency.
+        FLAC with compression_level 0: lossless, minimal encode overhead,
+        and reliably framed for MA's stream pipeline.
         """
         source_name = streamdetails.item_id
         env = self._build_pa_env()
         fmt = streamdetails.audio_format
-
-        # Target ~10ms PA fragment size to minimise capture-side latency.
-        # PA treats this as a hint; actual fragment may be slightly larger.
-        bytes_per_ms = (fmt.sample_rate * (fmt.bit_depth // 8) * fmt.channels) // 1000
-        fragment_size = max(bytes_per_ms * 10, 512)
 
         # FLAC sample format: s16 for 16-bit sources, s32 for 24/32-bit.
         # (FLAC encodes s32 input as 24-bit internally — lossless for audio.)
@@ -302,19 +296,8 @@ class LocalAudioInProvider(MusicProvider):
             "-hide_banner",
             "-loglevel",
             "error",
-            # Suppress input probing — format is fully known
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            # Reduce ffmpeg's internal packet queue
-            "-fflags",
-            "nobuffer",
-            # PulseAudio input with small fragment for low capture latency
             "-f",
             "pulse",
-            "-fragment_size",
-            str(fragment_size),
             "-i",
             source_name,
             "-ac",
