@@ -1,0 +1,10 @@
+{
+    "type": "music",
+    "domain": "local_audio_in",
+    "name": "Local Audio In",
+    "description": "Exposes PulseAudio hardware input sources (line-in, S/PDIF, HDMI-in) as live audio streams in Music Assistant.",
+    "version": "0.0.1",
+    "codeowners": ["@iVolt1"],
+    "requirements": [],
+    "config_entries": []
+}
