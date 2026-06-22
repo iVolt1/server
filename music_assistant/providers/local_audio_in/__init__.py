@@ -434,20 +434,92 @@ async def _enumerate_pa_sources(
     if resolved:
         env["PULSE_SERVER"] = resolved
 
-    # Short output gives hardware-accurate sample rates.
-    short_out = await _pactl_output(["pactl", "list", "sources", "short"], env)
-    if short_out is None:
-        return None
-    sources = _parse_pactl_sources_short(short_out)
-
-    # Full output gives human-readable descriptions; best-effort only.
+    # Full output gives both descriptions and the PA-server sample rate.
+    # Using the PA server rate (rather than the hardware rate from
+    # "pactl list sources short") ensures source and output sink rates
+    # match, avoiding MA-side resampling through the lower-quality swr
+    # fallback when libsoxr is unavailable.
     full_out = await _pactl_output(["pactl", "list", "sources"], env)
-    if full_out is not None:
-        descriptions = _parse_pactl_descriptions(full_out)
-        for source in sources:
-            source.description = descriptions.get(source.name, "")
+    if full_out is None:
+        return None
+    sources = _parse_pactl_sources_full(full_out)
     if not include_monitors:
         sources = [s for s in sources if not s.is_monitor]
+    return sources
+
+
+def _parse_pactl_sources_full(output: str) -> list[_PASource]:
+    """
+    Parse ``pactl list sources`` full output into _PASource objects.
+
+    Uses the PA server sample rate (which may be higher than the hardware
+    rate due to the server clock being driven by the primary output device).
+    This keeps source and output sink rates aligned, avoiding MA-side
+    resampling through the swr fallback when libsoxr is unavailable.
+    Also extracts human-readable descriptions for display names.
+    """
+    sources: list[_PASource] = []
+    current_name = ""
+    current_desc = ""
+    current_rate = _DEFAULT_SAMPLE_RATE
+    current_bit_depth = _DEFAULT_BIT_DEPTH
+    current_ch = _DEFAULT_CHANNELS
+    is_monitor = False
+    in_source_block = False
+
+    def _flush() -> None:
+        if in_source_block and current_name:
+            sources.append(
+                _PASource(
+                    name=current_name,
+                    description=current_desc,
+                    sample_rate=current_rate,
+                    bit_depth=current_bit_depth,
+                    channels=current_ch,
+                    is_monitor=is_monitor,
+                )
+            )
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if raw_line.startswith("Source #"):
+            _flush()
+            current_name = ""
+            current_desc = ""
+            current_rate = _DEFAULT_SAMPLE_RATE
+            current_bit_depth = _DEFAULT_BIT_DEPTH
+            current_ch = _DEFAULT_CHANNELS
+            is_monitor = False
+            in_source_block = True
+            continue
+        if not in_source_block:
+            continue
+        if line.startswith("Name:"):
+            current_name = line.split(":", 1)[1].strip()
+            if current_name.endswith(".monitor"):
+                is_monitor = True
+        elif line.startswith("Description:"):
+            current_desc = line.split(":", 1)[1].strip()
+            if current_desc.startswith("Monitor of"):
+                is_monitor = True
+        elif line.startswith("Sample Specification:"):
+            spec = line.split(":", 1)[1].strip()
+            tokens = spec.split()
+            if tokens:
+                fmt = tokens[0].lower()
+                for bits in (32, 24, 16, 8):
+                    if str(bits) in fmt:
+                        current_bit_depth = bits
+                        break
+            for token in tokens:
+                if token.endswith("Hz"):
+                    with contextlib.suppress(ValueError):
+                        current_rate = int(token[:-2])
+                elif token.endswith("ch"):
+                    with contextlib.suppress(ValueError):
+                        current_ch = int(token[:-2])
+
+    _flush()
     return sources
 
 
@@ -471,79 +543,6 @@ async def _pactl_output(
     if proc.returncode != 0:
         return None
     return stdout.decode(errors="replace")
-
-
-def _parse_pactl_descriptions(output: str) -> dict[str, str]:
-    """Extract a name→description mapping from ``pactl list sources`` output."""
-    descriptions: dict[str, str] = {}
-    current_name = ""
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if raw_line.startswith("Source #"):
-            current_name = ""
-        elif line.startswith("Name:"):
-            current_name = line.split(":", 1)[1].strip()
-        elif line.startswith("Description:") and current_name:
-            descriptions[current_name] = line.split(":", 1)[1].strip()
-    return descriptions
-
-
-def _parse_pactl_sources_short(output: str) -> list[_PASource]:
-    """
-    Parse ``pactl list sources short`` tab-separated output.
-
-    Format per line:
-        <index>\t<name>\t<driver>\t<sample_spec>\t<state>
-
-    Example:
-        1\talsa_input.pci-0000_03_00.0.analog-stereo\tmodule-alsa-card.c\ts32le 2ch 96000Hz\tRUNNING
-
-    Uses hardware-accurate sample rates as negotiated between ALSA and
-    PulseAudio, rather than PA's internal server clock rate which may be
-    higher when the server is driven by a high-rate primary device.
-    """
-    sources: list[_PASource] = []
-    for line in output.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        name = parts[1].strip()
-        if not name:
-            continue
-
-        sample_spec = parts[3].strip()  # e.g. "s32le 2ch 96000Hz"
-        is_monitor = name.endswith(".monitor")
-
-        bit_depth = _DEFAULT_BIT_DEPTH
-        channels = _DEFAULT_CHANNELS
-        sample_rate = _DEFAULT_SAMPLE_RATE
-
-        tokens = sample_spec.split()
-        if tokens:
-            fmt = tokens[0].lower()
-            for bits in (32, 24, 16, 8):
-                if str(bits) in fmt:
-                    bit_depth = bits
-                    break
-        for token in tokens:
-            if token.endswith("Hz"):
-                with contextlib.suppress(ValueError):
-                    sample_rate = int(token[:-2])
-            elif token.endswith("ch"):
-                with contextlib.suppress(ValueError):
-                    channels = int(token[:-2])
-
-        sources.append(
-            _PASource(
-                name=name,
-                description="",
-                sample_rate=sample_rate,
-                bit_depth=bit_depth,
-                channels=channels,
-                is_monitor=is_monitor,
-            )
-        )
-    return sources
 
 
 async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
