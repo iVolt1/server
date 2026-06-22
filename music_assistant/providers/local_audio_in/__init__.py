@@ -248,10 +248,10 @@ class LocalAudioInProvider(MusicProvider):
         bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
         channels = source.channels or _DEFAULT_CHANNELS
 
-        if bit_depth >= 24:
-            content_type = ContentType.PCM_S32LE
-        else:
-            content_type = ContentType.FLAC
+        # Always use FLAC: lossless, well-framed, reliably decoded by MA.
+        # FLAC caps at 24-bit; 32-bit sources are stored as 24-bit FLAC which
+        # is sonically transparent for any real-world line-in signal.
+        content_type = ContentType.FLAC
 
         return StreamDetails(
             provider=self.instance_id,
@@ -276,9 +276,9 @@ class LocalAudioInProvider(MusicProvider):
         """
         Capture audio from the PA source and yield encoded bytes.
 
-        PCM path (24/32-bit): raw s32le with -fflags nobuffer for minimal
-        latency — no encode overhead, exact native format preserved.
-        FLAC path (16-bit): compression_level 0 for fastest encode.
+        FLAC with compression_level 0 for all sources — lossless, low
+        encode overhead, and reliably parsed by MA's stream pipeline.
+        PA fragment_size is tuned to ~10ms for low capture latency.
         """
         source_name = streamdetails.item_id
         env = self._build_pa_env()
@@ -289,19 +289,9 @@ class LocalAudioInProvider(MusicProvider):
         bytes_per_ms = (fmt.sample_rate * (fmt.bit_depth // 8) * fmt.channels) // 1000
         fragment_size = max(bytes_per_ms * 10, 512)
 
-        if fmt.content_type == ContentType.PCM_S32LE:
-            codec_args: list[str] = ["-sample_fmt", "s32", "-f", "s32le"]
-        else:
-            codec_args = [
-                "-sample_fmt",
-                "s16",
-                "-c:a",
-                "flac",
-                "-compression_level",
-                "0",
-                "-f",
-                "flac",
-            ]
+        # FLAC sample format: s16 for 16-bit sources, s32 for 24/32-bit.
+        # (FLAC encodes s32 input as 24-bit internally — lossless for audio.)
+        sample_fmt = "s16" if fmt.bit_depth <= 16 else "s32"
 
         cmd: list[str] = [
             "ffmpeg",
@@ -313,11 +303,9 @@ class LocalAudioInProvider(MusicProvider):
             "32",
             "-analyzeduration",
             "0",
-            # Minimise ffmpeg internal buffering
+            # Reduce ffmpeg's internal packet queue
             "-fflags",
             "nobuffer",
-            "-avioflags",
-            "direct",
             # PulseAudio input with small fragment for low capture latency
             "-f",
             "pulse",
@@ -329,7 +317,14 @@ class LocalAudioInProvider(MusicProvider):
             str(fmt.channels),
             "-ar",
             str(fmt.sample_rate),
-            *codec_args,
+            "-sample_fmt",
+            sample_fmt,
+            "-c:a",
+            "flac",
+            "-compression_level",
+            "0",
+            "-f",
+            "flac",
             "pipe:1",
         ]
 
