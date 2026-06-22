@@ -249,10 +249,12 @@ class LocalAudioInProvider(MusicProvider):
         bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
         channels = source.channels or _DEFAULT_CHANNELS
 
-        # Always use FLAC: lossless, well-framed, reliably decoded by MA.
-        # FLAC caps at 24-bit; 32-bit sources are stored as 24-bit FLAC which
-        # is sonically transparent for any real-world line-in signal.
-        content_type = ContentType.FLAC
+        # Use PCM for 24/32-bit sources: no encode step, exact bit depth
+        # preserved in the signal chain. FLAC for 16-bit (lossless, framed).
+        if bit_depth >= 24:
+            content_type = ContentType.PCM_S32LE
+        else:
+            content_type = ContentType.FLAC
 
         return StreamDetails(
             provider=self.instance_id,
@@ -289,13 +291,25 @@ class LocalAudioInProvider(MusicProvider):
         env = self._build_pa_env()
         fmt = streamdetails.audio_format
 
-        # FLAC sample format: s16 for 16-bit sources, s32 for 24/32-bit.
-        # (FLAC encodes s32 input as 24-bit internally — lossless for audio.)
-        sample_fmt = "s16" if fmt.bit_depth <= 16 else "s32"
-
         # Target ~10ms PA fragment size to reduce capture-side latency.
         bytes_per_ms = (fmt.sample_rate * (fmt.bit_depth // 8) * fmt.channels) // 1000
         fragment_size = max(bytes_per_ms * 10, 512)
+
+        if fmt.content_type == ContentType.PCM_S32LE:
+            # Raw PCM: no encode step, exact native bit depth, lowest latency.
+            codec_args: list[str] = ["-sample_fmt", "s32", "-f", "s32le"]
+        else:
+            # FLAC for 16-bit sources: lossless and self-framing.
+            codec_args = [
+                "-sample_fmt",
+                "s16",
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "0",
+                "-f",
+                "flac",
+            ]
 
         cmd: list[str] = [
             "ffmpeg",
@@ -321,14 +335,7 @@ class LocalAudioInProvider(MusicProvider):
             str(fmt.channels),
             "-ar",
             str(fmt.sample_rate),
-            "-sample_fmt",
-            sample_fmt,
-            "-c:a",
-            "flac",
-            "-compression_level",
-            "0",
-            "-f",
-            "flac",
+            *codec_args,
             "pipe:1",
         ]
 
