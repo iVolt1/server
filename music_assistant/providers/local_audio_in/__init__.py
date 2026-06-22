@@ -1,5 +1,4 @@
-"""
-Local Audio In provider for Music Assistant.
+"""Local Audio In provider for Music Assistant.
 
 Exposes PulseAudio hardware input sources (line-in, S/PDIF, HDMI-in)
 as live audio streams in Music Assistant, modelled as radio stations.
@@ -11,41 +10,41 @@ through MA's custom audio pipeline using StreamType.CUSTOM.
 Requires ffmpeg and pactl (pulseaudio-utils) in the container/system PATH.
 PipeWire with the PulseAudio compatibility layer is fully supported.
 """
-
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
-from music_assistant.common.models.config_entries import (
-    ConfigEntry,
-    ConfigValueOption,
-    ConfigValueType,
-)
-from music_assistant.common.models.enums import (
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
     MediaType,
     ProviderFeature,
     StreamType,
 )
-from music_assistant.common.models.errors import MediaNotFoundError
-from music_assistant.common.models.media_items import (
+from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.media_items import (
     AudioFormat,
     BrowseFolder,
     MediaItemType,
     ProviderMapping,
     Radio,
 )
-from music_assistant.common.models.streamdetails import StreamDetails
+from music_assistant_models.streamdetails import StreamDetails
+
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.provider import ProviderManifest
+
     from music_assistant.mass import MusicAssistant
+    from music_assistant.models import ProviderInstanceType
 
 # ---------------------------------------------------------------------------
 # Config entry keys (must match strings.json config keys)
@@ -68,12 +67,95 @@ DEFAULT_CHANNELS = 2
 # Listed in priority order for the HAOS / addon environment.
 _PA_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/run/audio/pulse.sock",  # HAOS Music Assistant addon
-    "/run/pulse/native",  # Debian/Ubuntu system-wide daemon
+    "/run/pulse/native",      # Debian/Ubuntu system-wide daemon
 )
 
 # ffmpeg chunk size for streaming (bytes). 4 KiB keeps latency low while
 # avoiding excessive syscall overhead.
 _READ_CHUNK_BYTES = 4096
+
+SUPPORTED_FEATURES = {
+    ProviderFeature.BROWSE,
+    ProviderFeature.LIBRARY_RADIOS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Module-level entry points required by MA
+# ---------------------------------------------------------------------------
+
+async def setup(
+    mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+) -> ProviderInstanceType:
+    """Initialise and return a LocalAudioInProvider instance."""
+    return LocalAudioInProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+
+async def get_config_entries(
+    mass: MusicAssistant,  # noqa: ARG001
+    instance_id: str | None = None,  # noqa: ARG001
+    action: str | None = None,  # noqa: ARG001
+    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
+) -> tuple[ConfigEntry, ...]:
+    """Return config entries to set up this provider."""
+    return (
+        ConfigEntry(
+            key=CONF_PA_SERVER,
+            type=ConfigEntryType.STRING,
+            label=CONF_PA_SERVER,
+            required=False,
+            default_value="",
+        ),
+        ConfigEntry(
+            key=CONF_SOURCE_NAME,
+            type=ConfigEntryType.STRING,
+            label=CONF_SOURCE_NAME,
+            required=False,
+            default_value="",
+        ),
+        ConfigEntry(
+            key=CONF_DISPLAY_NAME,
+            type=ConfigEntryType.STRING,
+            label=CONF_DISPLAY_NAME,
+            required=False,
+            default_value="",
+        ),
+        ConfigEntry(
+            key=CONF_SAMPLE_RATE,
+            type=ConfigEntryType.INTEGER,
+            label=CONF_SAMPLE_RATE,
+            required=False,
+            default_value=DEFAULT_SAMPLE_RATE,
+            options=[
+                ConfigValueOption("44100 Hz (CD)", 44100),
+                ConfigValueOption("48000 Hz (HDMI / S/PDIF)", 48000),
+                ConfigValueOption("88200 Hz (High-res)", 88200),
+                ConfigValueOption("96000 Hz (High-res)", 96000),
+            ],
+        ),
+        ConfigEntry(
+            key=CONF_BIT_DEPTH,
+            type=ConfigEntryType.INTEGER,
+            label=CONF_BIT_DEPTH,
+            required=False,
+            default_value=DEFAULT_BIT_DEPTH,
+            options=[
+                ConfigValueOption("16-bit", 16),
+                ConfigValueOption("24-bit", 24),
+            ],
+        ),
+        ConfigEntry(
+            key=CONF_CHANNELS,
+            type=ConfigEntryType.INTEGER,
+            label=CONF_CHANNELS,
+            required=False,
+            default_value=DEFAULT_CHANNELS,
+            options=[
+                ConfigValueOption("1 (Mono)", 1),
+                ConfigValueOption("2 (Stereo)", 2),
+            ],
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -100,100 +182,22 @@ class _PASource:
 class LocalAudioInProvider(MusicProvider):
     """Music provider that streams PulseAudio hardware inputs into MA."""
 
-    # ------------------------------------------------------------------
-    # MusicProvider interface
-    # ------------------------------------------------------------------
-
-    @property
-    def supported_features(self) -> set[ProviderFeature]:
-        """Return the features supported by this provider."""
-        return {
-            ProviderFeature.BROWSE,
-            ProviderFeature.LIBRARY_RADIOS,
-        }
-
-    @classmethod
-    def get_config_entries(
-        cls,
-        mass: MusicAssistant,  # noqa: ARG003
-        instance_id: str | None = None,  # noqa: ARG003
-        action: str | None = None,  # noqa: ARG003
-        values: dict[str, ConfigValueType] | None = None,  # noqa: ARG003
-    ) -> tuple[ConfigEntry, ...]:
-        """Return config entries for this provider instance."""
-        return (
-            ConfigEntry(
-                key=CONF_PA_SERVER,
-                type=ConfigEntryType.STRING,
-                label=CONF_PA_SERVER,
-                required=False,
-                default_value="",
-            ),
-            ConfigEntry(
-                key=CONF_SOURCE_NAME,
-                type=ConfigEntryType.STRING,
-                label=CONF_SOURCE_NAME,
-                required=False,
-                default_value="",
-            ),
-            ConfigEntry(
-                key=CONF_DISPLAY_NAME,
-                type=ConfigEntryType.STRING,
-                label=CONF_DISPLAY_NAME,
-                required=False,
-                default_value="",
-            ),
-            ConfigEntry(
-                key=CONF_SAMPLE_RATE,
-                type=ConfigEntryType.INTEGER,
-                label=CONF_SAMPLE_RATE,
-                required=False,
-                default_value=DEFAULT_SAMPLE_RATE,
-                options=[
-                    ConfigValueOption("44100 Hz (CD)", 44100),
-                    ConfigValueOption("48000 Hz (HDMI / S/PDIF)", 48000),
-                    ConfigValueOption("88200 Hz (High-res)", 88200),
-                    ConfigValueOption("96000 Hz (High-res)", 96000),
-                ],
-            ),
-            ConfigEntry(
-                key=CONF_BIT_DEPTH,
-                type=ConfigEntryType.INTEGER,
-                label=CONF_BIT_DEPTH,
-                required=False,
-                default_value=DEFAULT_BIT_DEPTH,
-                options=[
-                    ConfigValueOption("16-bit", 16),
-                    ConfigValueOption("24-bit", 24),
-                ],
-            ),
-            ConfigEntry(
-                key=CONF_CHANNELS,
-                type=ConfigEntryType.INTEGER,
-                label=CONF_CHANNELS,
-                required=False,
-                default_value=DEFAULT_CHANNELS,
-                options=[
-                    ConfigValueOption("1 (Mono)", 1),
-                    ConfigValueOption("2 (Stereo)", 2),
-                ],
-            ),
-        )
-
     async def handle_async_init(self) -> None:
         """Initialise the provider: resolve PA server address and verify connectivity."""
-        self._pa_server: str = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
-        self._source_filter: str = cast("str", self.config.get_value(CONF_SOURCE_NAME)) or ""
+        self._pa_server: str = cast(str, self.config.get_value(CONF_PA_SERVER)) or ""
+        self._source_filter: str = cast(str, self.config.get_value(CONF_SOURCE_NAME)) or ""
         self._override_display_name: str = (
-            cast("str", self.config.get_value(CONF_DISPLAY_NAME)) or ""
+            cast(str, self.config.get_value(CONF_DISPLAY_NAME)) or ""
         )
         self._sample_rate: int = (
-            cast("int", self.config.get_value(CONF_SAMPLE_RATE)) or DEFAULT_SAMPLE_RATE
+            cast(int, self.config.get_value(CONF_SAMPLE_RATE)) or DEFAULT_SAMPLE_RATE
         )
         self._bit_depth: int = (
-            cast("int", self.config.get_value(CONF_BIT_DEPTH)) or DEFAULT_BIT_DEPTH
+            cast(int, self.config.get_value(CONF_BIT_DEPTH)) or DEFAULT_BIT_DEPTH
         )
-        self._channels: int = cast("int", self.config.get_value(CONF_CHANNELS)) or DEFAULT_CHANNELS
+        self._channels: int = (
+            cast(int, self.config.get_value(CONF_CHANNELS)) or DEFAULT_CHANNELS
+        )
 
         # Active ffmpeg capture subprocesses keyed by PA source name.
         # Populated by get_audio_stream(); cleaned up in unload().
@@ -242,14 +246,14 @@ class LocalAudioInProvider(MusicProvider):
     # Browse / Library
     # ------------------------------------------------------------------
 
-    async def browse(self, path: str) -> list[MediaItemType | BrowseFolder]:
+    async def browse(self, path: str) -> Sequence[MediaItemType | BrowseFolder]:
         """Return available input sources as Radio items."""
         sources = await self._list_pa_sources()
         if not sources:
             return []
         return [self._source_to_radio(s) for s in sources]
 
-    async def get_library_radios(self) -> AsyncGenerator[Radio]:
+    async def get_library_radios(self) -> AsyncGenerator[Radio, None]:
         """Yield all available input sources as Radio items for the MA library."""
         sources = await self._list_pa_sources()
         if not sources:
@@ -294,9 +298,8 @@ class LocalAudioInProvider(MusicProvider):
         self,
         streamdetails: StreamDetails,
         seek_position: int = 0,
-    ) -> AsyncGenerator[bytes]:
-        """
-        Capture audio from the PA source and yield FLAC-encoded bytes.
+    ) -> AsyncGenerator[bytes, None]:
+        """Capture audio from the PA source and yield FLAC-encoded bytes.
 
         Spawns an ``ffmpeg -f pulse`` subprocess per stream request.
         The subprocess is terminated when the caller stops consuming
@@ -314,26 +317,17 @@ class LocalAudioInProvider(MusicProvider):
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel",
-            "error",
+            "-loglevel", "error",
             # PulseAudio input
-            "-f",
-            "pulse",
-            "-i",
-            source_name,
+            "-f", "pulse",
+            "-i", source_name,
             # Output format
-            "-ac",
-            str(self._channels),
-            "-ar",
-            str(self._sample_rate),
-            "-sample_fmt",
-            sample_fmt,
-            "-c:a",
-            "flac",
-            "-compression_level",
-            "0",  # lossless, fastest encode
-            "-f",
-            "flac",
+            "-ac", str(self._channels),
+            "-ar", str(self._sample_rate),
+            "-sample_fmt", sample_fmt,
+            "-c:a", "flac",
+            "-compression_level", "0",  # lossless, fastest encode
+            "-f", "flac",
             "pipe:1",
         ]
 
@@ -348,7 +342,7 @@ class LocalAudioInProvider(MusicProvider):
         self._capture_procs[source_name] = proc
 
         try:
-            assert proc.stdout is not None
+            assert proc.stdout is not None  # noqa: S101
             while True:
                 chunk = await proc.stdout.read(_READ_CHUNK_BYTES)
                 if not chunk:
@@ -356,7 +350,9 @@ class LocalAudioInProvider(MusicProvider):
                     stderr_out = b""
                     if proc.stderr:
                         with contextlib.suppress(TimeoutError):
-                            stderr_out = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                            stderr_out = await asyncio.wait_for(
+                                proc.stderr.read(), timeout=1.0
+                            )
                     if stderr_out:
                         self.logger.warning(
                             "ffmpeg capture ended for '%s': %s",
@@ -366,7 +362,7 @@ class LocalAudioInProvider(MusicProvider):
                     break
                 yield chunk
 
-        except asyncio.CancelledError, GeneratorExit:
+        except (asyncio.CancelledError, GeneratorExit):
             # Normal stop: MA stopped the player or switched tracks
             self.logger.debug("Capture cancelled for '%s'", source_name)
 
@@ -408,8 +404,7 @@ class LocalAudioInProvider(MusicProvider):
         return radio
 
     async def _list_pa_sources(self) -> list[_PASource] | None:
-        """
-        Enumerate non-monitor PulseAudio sources via ``pactl list sources``.
+        """Enumerate non-monitor PulseAudio sources via ``pactl list sources``.
 
         Returns a list of _PASource instances, or None if PA is unreachable.
         When ``source_filter`` is set, only the matching source is returned.
@@ -417,9 +412,7 @@ class LocalAudioInProvider(MusicProvider):
         env = self._build_pa_env()
         try:
             proc = await asyncio.create_subprocess_exec(
-                "pactl",
-                "list",
-                "sources",
+                "pactl", "list", "sources",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -428,7 +421,7 @@ class LocalAudioInProvider(MusicProvider):
         except FileNotFoundError:
             self.logger.debug("'pactl' not found in PATH")
             return None
-        except TimeoutError:
+        except asyncio.TimeoutError:
             self.logger.debug("pactl timed out")
             return None
 
@@ -452,7 +445,6 @@ class LocalAudioInProvider(MusicProvider):
 # Module-level helpers (no provider state needed)
 # ---------------------------------------------------------------------------
 
-
 def _probe_pa_socket() -> str:
     """Return the first resolvable PulseAudio socket path, or empty string."""
     for path in _PA_SOCKET_CANDIDATES:
@@ -462,8 +454,7 @@ def _probe_pa_socket() -> str:
 
 
 def _parse_pactl_sources(output: str) -> list[_PASource]:
-    """
-    Parse ``pactl list sources`` output into a list of _PASource objects.
+    """Parse ``pactl list sources`` output into a list of _PASource objects.
 
     Skips monitor sources (loopbacks of output sinks).  Both PulseAudio and
     PipeWire (with PA compatibility) are supported; monitor sources are
@@ -539,7 +530,7 @@ async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
     try:
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=3.0)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
     except ProcessLookupError:
