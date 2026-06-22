@@ -6,7 +6,7 @@ as live audio streams in Music Assistant, modelled as radio stations.
 
 All qualifying sources are auto-discovered with no per-source configuration.
 Each source is named from its PA description with format details appended,
-e.g. "Built-in Audio Analog Stereo (96kHz / 32-bit / 2ch)".
+e.g. "Built-in Audio Analog Stereo (96000, 32, 2)".
 
 Sample rate, bit depth, and channel count are read from the source's native
 PA format; no manual configuration is required or available.
@@ -152,13 +152,11 @@ class _PASource:
         """
         Human-readable name: PA description with format details appended.
 
-        Example: "Built-in Audio Analog Stereo (96kHz / 32-bit / 2ch)"
+        Example: "Built-in Audio Analog Stereo (96000, 32, 2)"
         Falls back to the raw source name if no description is available.
         """
         base = self.description if self.description else self.name
-        return (
-            f"{base} ({_format_rate(self.sample_rate)} / {self.bit_depth}-bit / {self.channels}ch)"
-        )
+        return f"{base} ({self.sample_rate}, {self.bit_depth}, {self.channels})"
 
 
 # ---------------------------------------------------------------------------
@@ -393,17 +391,6 @@ class LocalAudioInProvider(MusicProvider):
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-
-def _format_rate(hz: int) -> str:
-    """
-    Format a sample rate in Hz as a compact kHz string.
-
-    Examples: 44100 → '44.1kHz', 96000 → '96kHz', 192000 → '192kHz'.
-    """
-    if hz % 1000 == 0:
-        return f"{hz // 1000}kHz"
-    return f"{hz / 1000:.1f}kHz"
 
 
 def _probe_pa_socket() -> str:
