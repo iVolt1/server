@@ -414,23 +414,18 @@ class LocalAudioInProvider(MusicProvider):
     def _source_to_radio(self, source: _PASource) -> Radio:
         """Convert a _PASource to an MA Radio item."""
         display_name = self._override_display_name or source.display_label
-        radio = Radio(
+        return Radio(
             item_id=source.name,
             provider=self.instance_id,
             name=display_name,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=source.name,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
         )
-        radio.provider_mappings = {
-            ProviderMapping(
-                item_id=source.name,
-                provider_domain=self.domain,
-                provider_instance=self.instance_id,
-            )
-        }
-        radio.metadata.description = (
-            f"Live capture from PulseAudio source: {source.name}\n"
-            f"{source.sample_rate} Hz / {source.channels} ch"
-        )
-        return radio
 
     async def _list_pa_sources(self) -> list[_PASource] | None:
         """Return filtered hardware PA sources, or None if PA is unreachable.
