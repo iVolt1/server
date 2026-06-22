@@ -321,9 +321,6 @@ class LocalAudioInProvider(MusicProvider):
             "32",
             "-analyzeduration",
             "0",
-            # Reduce ffmpeg's internal packet queue
-            "-fflags",
-            "nobuffer",
             # PulseAudio input with small fragment for low capture latency
             "-f",
             "pulse",
