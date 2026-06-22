@@ -94,9 +94,43 @@ async def get_config_entries(
     mass: MusicAssistant,  # noqa: ARG001
     instance_id: str | None = None,  # noqa: ARG001
     action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
+    values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """Return config entries to set up this provider."""
+    """Return config entries to set up this provider.
+
+    The pa_server, source_name, and display_name entries are dynamically
+    populated from the live PulseAudio server so the user can pick from
+    detected sources rather than typing raw names.
+    """
+    current_pa_server = str(values.get(CONF_PA_SERVER, "") if values else "") or ""
+
+    # --- pa_server: options from detected socket paths ---
+    pa_server_options: list[ConfigValueOption] = [
+        ConfigValueOption("(auto-detect)", ""),
+    ]
+    for path in _PA_SOCKET_CANDIDATES:
+        if os.path.exists(path):
+            uri = f"unix:{path}"
+            pa_server_options.append(ConfigValueOption(uri, uri))
+
+    # --- Enumerate live PA sources for source_name and display_name ---
+    sources = await _enumerate_pa_sources(current_pa_server)
+
+    source_name_options: list[ConfigValueOption] = [
+        ConfigValueOption("(all hardware inputs)", ""),
+    ]
+    display_name_options: list[ConfigValueOption] = [
+        ConfigValueOption("(use PA source description)", ""),
+    ]
+    for source in sources:
+        source_name_options.append(
+            ConfigValueOption(source.display_label, source.name)
+        )
+        if source.description and source.description != source.name:
+            display_name_options.append(
+                ConfigValueOption(source.description, source.description)
+            )
+
     return (
         ConfigEntry(
             key=CONF_PA_SERVER,
@@ -104,6 +138,7 @@ async def get_config_entries(
             label=CONF_PA_SERVER,
             required=False,
             default_value="",
+            options=pa_server_options,
         ),
         ConfigEntry(
             key=CONF_SOURCE_NAME,
@@ -111,6 +146,7 @@ async def get_config_entries(
             label=CONF_SOURCE_NAME,
             required=False,
             default_value="",
+            options=source_name_options,
         ),
         ConfigEntry(
             key=CONF_DISPLAY_NAME,
@@ -118,6 +154,7 @@ async def get_config_entries(
             label=CONF_DISPLAY_NAME,
             required=False,
             default_value="",
+            options=display_name_options,
         ),
         ConfigEntry(
             key=CONF_SAMPLE_RATE,
@@ -207,7 +244,7 @@ class LocalAudioInProvider(MusicProvider):
         # Populated by get_audio_stream(); cleaned up in unload().
         self._capture_procs: dict[str, asyncio.subprocess.Process] = {}
 
-        # Resolve PA server address: explicit config > PULSE_SERVER env > socket probe
+        # Resolve PA server: explicit config > PULSE_SERVER env > socket probe
         if not self._pa_server:
             self._pa_server = os.environ.get("PULSE_SERVER", "")
         if not self._pa_server:
@@ -218,7 +255,6 @@ class LocalAudioInProvider(MusicProvider):
             self._pa_server if self._pa_server else "(system default)",
         )
 
-        # Verify connectivity and log discovered sources
         sources = await self._list_pa_sources()
         if sources is None:
             self.logger.warning(
@@ -247,7 +283,7 @@ class LocalAudioInProvider(MusicProvider):
         self._capture_procs.clear()
 
     # ------------------------------------------------------------------
-    # Browse / Library
+    # Browse
     # ------------------------------------------------------------------
 
     async def browse(self, path: str) -> Sequence[MediaItemType | BrowseFolder]:
@@ -256,14 +292,6 @@ class LocalAudioInProvider(MusicProvider):
         if not sources:
             return []
         return [self._source_to_radio(s) for s in sources]
-
-    async def get_library_radios(self) -> AsyncGenerator[Radio, None]:
-        """Yield all available input sources as Radio items for the MA library."""
-        sources = await self._list_pa_sources()
-        if not sources:
-            return
-        for source in sources:
-            yield self._source_to_radio(source)
 
     async def get_radio(self, prov_radio_id: str) -> Radio:
         """Return a single Radio item by its provider ID (PA source name)."""
@@ -323,10 +351,8 @@ class LocalAudioInProvider(MusicProvider):
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
-            # PulseAudio input
             "-f", "pulse",
             "-i", source_name,
-            # Output format
             "-ac", str(self._channels),
             "-ar", str(self._sample_rate),
             "-sample_fmt", sample_fmt,
@@ -351,7 +377,6 @@ class LocalAudioInProvider(MusicProvider):
             while True:
                 chunk = await proc.stdout.read(_READ_CHUNK_BYTES)
                 if not chunk:
-                    # ffmpeg exited (source disconnected, etc.)
                     stderr_out = b""
                     if proc.stderr:
                         with contextlib.suppress(TimeoutError):
@@ -368,7 +393,6 @@ class LocalAudioInProvider(MusicProvider):
                 yield chunk
 
         except (asyncio.CancelledError, GeneratorExit):
-            # Normal stop: MA stopped the player or switched tracks
             self.logger.debug("Capture cancelled for '%s'", source_name)
 
         finally:
@@ -409,40 +433,16 @@ class LocalAudioInProvider(MusicProvider):
         return radio
 
     async def _list_pa_sources(self) -> list[_PASource] | None:
-        """Enumerate non-monitor PulseAudio sources via ``pactl list sources``.
+        """Return filtered hardware PA sources, or None if PA is unreachable.
 
-        Returns a list of _PASource instances, or None if PA is unreachable.
-        When ``source_filter`` is set, only the matching source is returned.
+        Delegates enumeration to the module-level ``_enumerate_pa_sources``
+        helper and applies the configured source_filter on top.
         """
-        env = self._build_pa_env()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pactl", "list", "sources",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except FileNotFoundError:
-            self.logger.debug("'pactl' not found in PATH")
+        sources = await _enumerate_pa_sources(self._pa_server)
+        if sources is None:
             return None
-        except asyncio.TimeoutError:
-            self.logger.debug("pactl timed out")
-            return None
-
-        if proc.returncode != 0:
-            self.logger.debug(
-                "pactl list sources returned %d: %s",
-                proc.returncode,
-                stderr.decode(errors="replace").strip(),
-            )
-            return None
-
-        sources = _parse_pactl_sources(stdout.decode(errors="replace"))
-
         if self._source_filter:
             sources = [s for s in sources if s.name == self._source_filter]
-
         return sources
 
 
@@ -456,6 +456,38 @@ def _probe_pa_socket() -> str:
         if os.path.exists(path):
             return f"unix:{path}"
     return ""
+
+
+async def _enumerate_pa_sources(pa_server: str = "") -> list[_PASource] | None:
+    """Enumerate non-monitor PulseAudio sources via ``pactl list sources``.
+
+    Module-level so it can be called from both ``get_config_entries`` and
+    ``LocalAudioInProvider._list_pa_sources`` without duplicating logic.
+
+    Returns a list of _PASource instances, or None if PA is unreachable.
+    """
+    env = dict(os.environ)
+    resolved = pa_server or os.environ.get("PULSE_SERVER", "") or _probe_pa_socket()
+    if resolved:
+        env["PULSE_SERVER"] = resolved
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pactl", "list", "sources",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except FileNotFoundError:
+        return None
+    except asyncio.TimeoutError:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    return _parse_pactl_sources(stdout.decode(errors="replace"))
 
 
 def _parse_pactl_sources(output: str) -> list[_PASource]:
@@ -489,7 +521,6 @@ def _parse_pactl_sources(output: str) -> list[_PASource]:
     for raw_line in output.splitlines():
         line = raw_line.strip()
 
-        # New source block starts at column 0: "Source #N"
         if raw_line.startswith("Source #"):
             _flush()
             current_name = ""
@@ -524,14 +555,14 @@ def _parse_pactl_sources(output: str) -> list[_PASource]:
                     with contextlib.suppress(ValueError):
                         current_ch = int(token[:-2])
 
-    _flush()  # emit the last source block
+    _flush()
     return sources
 
 
 async def _terminate_proc(proc: asyncio.subprocess.Process) -> None:
     """Gracefully terminate a subprocess, escalating to SIGKILL if needed."""
     if proc.returncode is not None:
-        return  # already exited
+        return
     try:
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=3.0)
