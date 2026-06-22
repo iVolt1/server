@@ -291,13 +291,28 @@ class LocalAudioInProvider(MusicProvider):
         # (FLAC encodes s32 input as 24-bit internally — lossless for audio.)
         sample_fmt = "s16" if fmt.bit_depth <= 16 else "s32"
 
+        # Target ~10ms PA fragment size to reduce capture-side latency.
+        bytes_per_ms = (fmt.sample_rate * (fmt.bit_depth // 8) * fmt.channels) // 1000
+        fragment_size = max(bytes_per_ms * 10, 512)
+
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
+            # Suppress input probing — format is fully known
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            # Reduce ffmpeg's internal packet queue
+            "-fflags",
+            "nobuffer",
+            # PulseAudio input with small fragment for low capture latency
             "-f",
             "pulse",
+            "-fragment_size",
+            str(fragment_size),
             "-i",
             source_name,
             "-ac",
