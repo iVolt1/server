@@ -76,7 +76,6 @@ _READ_CHUNK_BYTES = 4096
 
 SUPPORTED_FEATURES = {
     ProviderFeature.BROWSE,
-    ProviderFeature.LIBRARY_RADIOS,
 }
 
 
@@ -129,8 +128,12 @@ async def get_config_entries(
             options=[
                 ConfigValueOption("44100 Hz (CD)", 44100),
                 ConfigValueOption("48000 Hz (HDMI / S/PDIF)", 48000),
-                ConfigValueOption("88200 Hz (High-res)", 88200),
+                ConfigValueOption("88200 Hz", 88200),
                 ConfigValueOption("96000 Hz (High-res)", 96000),
+                ConfigValueOption("176400 Hz", 176400),
+                ConfigValueOption("192000 Hz (High-res)", 192000),
+                ConfigValueOption("352800 Hz", 352800),
+                ConfigValueOption("384000 Hz (Ultra high-res)", 384000),
             ],
         ),
         ConfigEntry(
@@ -142,6 +145,7 @@ async def get_config_entries(
             options=[
                 ConfigValueOption("16-bit", 16),
                 ConfigValueOption("24-bit", 24),
+                ConfigValueOption("32-bit", 32),
             ],
         ),
         ConfigEntry(
@@ -311,7 +315,8 @@ class LocalAudioInProvider(MusicProvider):
         source_name = streamdetails.item_id
         env = self._build_pa_env()
 
-        # Select the correct ffmpeg sample format for the configured bit depth
+        # ffmpeg sample format: 16-bit→s16, 24 or 32-bit→s32
+        # (ffmpeg has no native s24; 24-bit PCM is carried in s32 frames)
         sample_fmt = "s16" if self._bit_depth <= 16 else "s32"
 
         cmd: list[str] = [
