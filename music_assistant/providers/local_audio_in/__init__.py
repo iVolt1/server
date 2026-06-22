@@ -4,12 +4,15 @@ Local Audio In provider for Music Assistant.
 Exposes PulseAudio audio sources (hardware inputs and optionally sink monitors)
 as live audio streams in Music Assistant, modelled as radio stations.
 
-Each qualifying PulseAudio source becomes a browsable Radio item.
-When played, audio is captured via ``ffmpeg -f pulse`` and streamed
-through MA's custom audio pipeline using StreamType.CUSTOM.
+All qualifying sources are auto-discovered with no per-source configuration.
+Each source is named from its PA description with format details appended,
+e.g. "Built-in Audio Analog Stereo (96kHz / 32-bit / 2ch)".
 
-Sample rate, bit depth, and channel count are auto-detected from the PA
-source's native format; the config entries act as overrides only.
+Sample rate, bit depth, and channel count are read from the source's native
+PA format; no manual configuration is required or available.
+
+For 32 and 24-bit sources, audio is streamed as raw PCM (no encode overhead).
+For 16-bit sources, FLAC is used (lossless, minimal CPU cost).
 
 Requires ffmpeg and pactl (pulseaudio-utils) in the container/system PATH.
 PipeWire with the PulseAudio compatibility layer is fully supported.
@@ -55,19 +58,9 @@ if TYPE_CHECKING:
 # Config entry keys (must match strings.json config keys)
 # ---------------------------------------------------------------------------
 CONF_PA_SERVER = "pa_server"
-CONF_SOURCE_NAME = "source_name"
-CONF_DISPLAY_NAME = "display_name"
-CONF_SAMPLE_RATE = "sample_rate"
-CONF_BIT_DEPTH = "bit_depth"
-CONF_CHANNELS = "channels"
 CONF_INCLUDE_MONITORS = "include_monitors"
 
-# ---------------------------------------------------------------------------
-# Sentinel: 0 means "auto-detect from source"
-# ---------------------------------------------------------------------------
-AUTO = 0
-
-# Fallback values used only when pactl is unavailable
+# Fallback format values used only when pactl is unavailable
 _DEFAULT_SAMPLE_RATE = 44100
 _DEFAULT_BIT_DEPTH = 16
 _DEFAULT_CHANNELS = 2
@@ -78,8 +71,9 @@ _PA_SOCKET_CANDIDATES: tuple[str, ...] = (
     "/run/pulse/native",  # Debian/Ubuntu system-wide daemon
 )
 
-# ffmpeg chunk size (bytes). 4 KiB keeps first-audio latency low.
-_READ_CHUNK_BYTES = 4096
+# Read chunk size for the audio stream loop (bytes).
+# Smaller = lower first-audio latency; 2 KiB is a good balance for PCM.
+_READ_CHUNK_BYTES = 2048
 
 SUPPORTED_FEATURES = {
     ProviderFeature.BROWSE,
@@ -107,13 +101,13 @@ async def get_config_entries(
     """
     Return config entries to set up this provider.
 
-    Source name and display name dropdowns are dynamically populated from
-    the live PulseAudio server.  Format options (sample rate, bit depth,
-    channels) include an Auto entry that reads the source's native format.
+    Only two entries are needed: the PA server address (auto-detected by
+    default) and an optional toggle to include sink monitor sources.
+    All audio sources are discovered and presented automatically with no
+    per-source configuration required.
     """
     current_pa_server = str(values.get(CONF_PA_SERVER, "") if values else "") or ""
 
-    # --- pa_server options: detected socket paths ---
     pa_server_options: list[ConfigValueOption] = [
         ConfigValueOption("", "(auto-detect)"),
     ]
@@ -121,20 +115,6 @@ async def get_config_entries(
         if os.path.exists(path):
             uri = f"unix:{path}"
             pa_server_options.append(ConfigValueOption(uri, uri))
-
-    # --- Enumerate all PA sources (hardware + monitors) for dropdowns ---
-    all_sources = await _enumerate_pa_sources(current_pa_server, include_monitors=True) or []
-
-    source_name_options: list[ConfigValueOption] = [
-        ConfigValueOption("", "(all hardware inputs)"),
-    ]
-    display_name_options: list[ConfigValueOption] = [
-        ConfigValueOption("", "(use PA source description)"),
-    ]
-    for source in all_sources:
-        source_name_options.append(ConfigValueOption(source.name, source.display_label))
-        if source.description and source.description != source.name:
-            display_name_options.append(ConfigValueOption(source.description, source.description))
 
     return (
         ConfigEntry(
@@ -144,65 +124,6 @@ async def get_config_entries(
             required=False,
             default_value="",
             options=pa_server_options,
-        ),
-        ConfigEntry(
-            key=CONF_SOURCE_NAME,
-            type=ConfigEntryType.STRING,
-            label=CONF_SOURCE_NAME,
-            required=False,
-            default_value="",
-            options=source_name_options,
-        ),
-        ConfigEntry(
-            key=CONF_DISPLAY_NAME,
-            type=ConfigEntryType.STRING,
-            label=CONF_DISPLAY_NAME,
-            required=False,
-            default_value="",
-            options=display_name_options,
-        ),
-        ConfigEntry(
-            key=CONF_SAMPLE_RATE,
-            type=ConfigEntryType.INTEGER,
-            label=CONF_SAMPLE_RATE,
-            required=False,
-            default_value=AUTO,
-            options=[
-                ConfigValueOption(AUTO, "Auto (detect from source)"),
-                ConfigValueOption(44100, "44100 Hz (CD)"),
-                ConfigValueOption(48000, "48000 Hz (HDMI / S/PDIF)"),
-                ConfigValueOption(88200, "88200 Hz"),
-                ConfigValueOption(96000, "96000 Hz (High-res)"),
-                ConfigValueOption(176400, "176400 Hz"),
-                ConfigValueOption(192000, "192000 Hz (High-res)"),
-                ConfigValueOption(352800, "352800 Hz"),
-                ConfigValueOption(384000, "384000 Hz (Ultra high-res)"),
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_BIT_DEPTH,
-            type=ConfigEntryType.INTEGER,
-            label=CONF_BIT_DEPTH,
-            required=False,
-            default_value=AUTO,
-            options=[
-                ConfigValueOption(AUTO, "Auto (detect from source)"),
-                ConfigValueOption(16, "16-bit"),
-                ConfigValueOption(24, "24-bit"),
-                ConfigValueOption(32, "32-bit"),
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_CHANNELS,
-            type=ConfigEntryType.INTEGER,
-            label=CONF_CHANNELS,
-            required=False,
-            default_value=AUTO,
-            options=[
-                ConfigValueOption(AUTO, "Auto (detect from source)"),
-                ConfigValueOption(1, "1 (Mono)"),
-                ConfigValueOption(2, "2 (Stereo)"),
-            ],
         ),
         ConfigEntry(
             key=CONF_INCLUDE_MONITORS,
@@ -228,31 +149,27 @@ class _PASource:
 
     @property
     def display_label(self) -> str:
-        """Return the description if it differs meaningfully from the raw name."""
-        if self.description and self.description != self.name:
-            return self.description
-        return self.name
+        """
+        Human-readable name: PA description with format details appended.
+
+        Example: "Built-in Audio Analog Stereo (96kHz / 32-bit / 2ch)"
+        Falls back to the raw source name if no description is available.
+        """
+        base = self.description if self.description else self.name
+        return (
+            f"{base} ({_format_rate(self.sample_rate)} / {self.bit_depth}-bit / {self.channels}ch)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
 class LocalAudioInProvider(MusicProvider):
-    """Music provider that streams PulseAudio sources into MA."""
+    """Music provider that auto-discovers and streams PulseAudio sources."""
 
     async def handle_async_init(self) -> None:
-        """Initialise the provider: resolve PA server address and verify connectivity."""
+        """Initialise: resolve PA server address and log discovered sources."""
         self._pa_server: str = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
-        self._source_filter: str = cast("str", self.config.get_value(CONF_SOURCE_NAME)) or ""
-        self._override_display_name: str = (
-            cast("str", self.config.get_value(CONF_DISPLAY_NAME)) or ""
-        )
-        # 0 = Auto: use source's native value
-        self._override_sample_rate: int = (
-            cast("int", self.config.get_value(CONF_SAMPLE_RATE)) or AUTO
-        )
-        self._override_bit_depth: int = cast("int", self.config.get_value(CONF_BIT_DEPTH)) or AUTO
-        self._override_channels: int = cast("int", self.config.get_value(CONF_CHANNELS)) or AUTO
         self._include_monitors: bool = bool(self.config.get_value(CONF_INCLUDE_MONITORS))
 
         # Active ffmpeg capture subprocesses keyed by PA source name.
@@ -277,15 +194,14 @@ class LocalAudioInProvider(MusicProvider):
             )
         elif not sources:
             self.logger.info(
-                "No sources found (filter: %r, monitors: %s).",
-                self._source_filter or "none",
+                "No sources found (monitors included: %s).",
                 self._include_monitors,
             )
         else:
             self.logger.info(
                 "Discovered %d source(s): %s",
                 len(sources),
-                [s.name for s in sources],
+                [s.display_label for s in sources],
             )
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -300,7 +216,7 @@ class LocalAudioInProvider(MusicProvider):
     # ------------------------------------------------------------------
 
     async def browse(self, path: str) -> Sequence[MediaItemType | BrowseFolder]:
-        """Return available input sources as Radio items."""
+        """Return all discovered PA input sources as Radio items."""
         sources = await self._list_pa_sources()
         if not sources:
             return []
@@ -320,26 +236,22 @@ class LocalAudioInProvider(MusicProvider):
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """
-        Return StreamDetails for the given PA source name (item_id).
+        Return StreamDetails using the source's native format.
 
-        Format (sample rate, bit depth, channels) is taken from the source's
-        native values unless an explicit override is configured.
+        32 and 24-bit sources stream as raw PCM to avoid FLAC's 24-bit cap
+        and eliminate the encode step.  16-bit sources use FLAC.
         """
         sources = await self._list_pa_sources()
         source = next((s for s in (sources or []) if s.name == item_id), None)
         if source is None:
             raise MediaNotFoundError(f"PA source not found: {item_id}")
 
-        sample_rate = self._override_sample_rate or source.sample_rate or _DEFAULT_SAMPLE_RATE
-        bit_depth = self._override_bit_depth or source.bit_depth or _DEFAULT_BIT_DEPTH
-        channels = self._override_channels or source.channels or _DEFAULT_CHANNELS
+        sample_rate = source.sample_rate or _DEFAULT_SAMPLE_RATE
+        bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
+        channels = source.channels or _DEFAULT_CHANNELS
 
-        # FLAC is limited to 24-bit; use PCM_S32LE for 32-bit sources so the
-        # signal chain reflects the true source format without truncation.
-        if bit_depth == 32:
+        if bit_depth >= 24:
             content_type = ContentType.PCM_S32LE
-        elif bit_depth == 24:
-            content_type = ContentType.PCM_S24LE
         else:
             content_type = ContentType.FLAC
 
@@ -366,42 +278,44 @@ class LocalAudioInProvider(MusicProvider):
         """
         Capture audio from the PA source and yield encoded bytes.
 
-        For 32-bit sources: raw PCM (s32le) — no encode overhead, exact format.
-        For 24-bit sources: raw PCM (s24le packed as s32le).
-        For 16-bit sources: FLAC with compression_level 0.
+        PCM path (24/32-bit): raw s32le with -fflags nobuffer for minimal
+        latency — no encode overhead, exact native format preserved.
+        FLAC path (16-bit): compression_level 0 for fastest encode.
         """
         source_name = streamdetails.item_id
         env = self._build_pa_env()
         fmt = streamdetails.audio_format
-        bit_depth = fmt.bit_depth
-        sample_rate = fmt.sample_rate
-        channels = fmt.channels
 
-        if fmt.content_type in (ContentType.PCM_S32LE, ContentType.PCM_S24LE):
-            # Raw PCM passthrough — lowest latency, exact bit depth
-            out_fmt = "s32le"
-            sample_fmt = "s32"
-            codec_args: list[str] = ["-f", out_fmt]
+        if fmt.content_type == ContentType.PCM_S32LE:
+            codec_args: list[str] = ["-sample_fmt", "s32", "-f", "s32le"]
+            low_latency_args: list[str] = ["-fflags", "nobuffer"]
         else:
-            # FLAC for 16-bit sources
-            sample_fmt = "s16"
-            codec_args = ["-c:a", "flac", "-compression_level", "0", "-f", "flac"]
+            codec_args = [
+                "-sample_fmt",
+                "s16",
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "0",
+                "-f",
+                "flac",
+            ]
+            low_latency_args = []
 
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
+            *low_latency_args,
             "-f",
             "pulse",
             "-i",
             source_name,
             "-ac",
-            str(channels),
+            str(fmt.channels),
             "-ar",
-            str(sample_rate),
-            "-sample_fmt",
-            sample_fmt,
+            str(fmt.sample_rate),
             *codec_args,
             "pipe:1",
         ]
@@ -455,11 +369,10 @@ class LocalAudioInProvider(MusicProvider):
 
     def _source_to_radio(self, source: _PASource) -> Radio:
         """Convert a _PASource to an MA Radio item."""
-        display_name = self._override_display_name or source.display_label
         return Radio(
             item_id=source.name,
             provider=self.instance_id,
-            name=display_name,
+            name=source.display_label,
             provider_mappings={
                 ProviderMapping(
                     item_id=source.name,
@@ -470,30 +383,27 @@ class LocalAudioInProvider(MusicProvider):
         )
 
     async def _list_pa_sources(self) -> list[_PASource] | None:
-        """
-        Return filtered PA sources, or None if PA is unreachable.
-
-        When source_filter is set, the named source is returned regardless
-        of whether it is a monitor.  When source_filter is empty, only
-        hardware inputs are returned unless include_monitors is True.
-        """
-        all_sources = await _enumerate_pa_sources(self._pa_server, include_monitors=True)
-        if all_sources is None:
-            return None
-
-        if self._source_filter:
-            # Explicit filter: honour it for both hardware and monitor sources
-            return [s for s in all_sources if s.name == self._source_filter]
-
-        # No filter: apply monitor gate
-        if self._include_monitors:
-            return all_sources
-        return [s for s in all_sources if not s.is_monitor]
+        """Return all qualifying PA sources, or None if PA is unreachable."""
+        return await _enumerate_pa_sources(
+            self._pa_server,
+            include_monitors=self._include_monitors,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _format_rate(hz: int) -> str:
+    """
+    Format a sample rate in Hz as a compact kHz string.
+
+    Examples: 44100 → '44.1kHz', 96000 → '96kHz', 192000 → '192kHz'.
+    """
+    if hz % 1000 == 0:
+        return f"{hz // 1000}kHz"
+    return f"{hz / 1000:.1f}kHz"
 
 
 def _probe_pa_socket() -> str:
@@ -511,7 +421,7 @@ async def _enumerate_pa_sources(
     """
     Enumerate PulseAudio sources via ``pactl list sources``.
 
-    Returns all hardware inputs (and optionally monitor sources).
+    Returns hardware inputs and optionally monitor (loopback) sources.
     Returns None if PA is unreachable.
     """
     env = dict(os.environ)
@@ -547,9 +457,8 @@ def _parse_pactl_sources(output: str) -> list[_PASource]:
     """
     Parse ``pactl list sources`` output into a list of _PASource objects.
 
-    Extracts name, description, sample rate, bit depth, and channel count
-    from each Source block.  The is_monitor flag is set for sources whose
-    name ends in ``.monitor`` or whose description starts with "Monitor of".
+    Extracts name, description, sample rate, bit depth, channels, and
+    monitor flag from each Source block.
     """
     sources: list[_PASource] = []
     current_name = ""
@@ -605,7 +514,6 @@ def _parse_pactl_sources(output: str) -> list[_PASource]:
             spec = line.split(":", 1)[1].strip()
             tokens = spec.split()
             if tokens:
-                # Parse bit depth from format token (s32le → 32, s16le → 16)
                 fmt = tokens[0].lower()
                 for bits in (32, 24, 16, 8):
                     if str(bits) in fmt:
