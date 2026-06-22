@@ -106,7 +106,7 @@ async def get_config_entries(
 
     # --- pa_server: options from detected socket paths ---
     pa_server_options: list[ConfigValueOption] = [
-        ConfigValueOption("(auto-detect)", ""),
+        ConfigValueOption("", "(auto-detect)"),
     ]
     for path in _PA_SOCKET_CANDIDATES:
         if os.path.exists(path):
@@ -114,17 +114,17 @@ async def get_config_entries(
             pa_server_options.append(ConfigValueOption(uri, uri))
 
     # --- Enumerate live PA sources for source_name and display_name ---
-    sources = await _enumerate_pa_sources(current_pa_server)
+    sources = await _enumerate_pa_sources(current_pa_server) or []
 
     source_name_options: list[ConfigValueOption] = [
-        ConfigValueOption("(all hardware inputs)", ""),
+        ConfigValueOption("", "(all hardware inputs)"),
     ]
     display_name_options: list[ConfigValueOption] = [
-        ConfigValueOption("(use PA source description)", ""),
+        ConfigValueOption("", "(use PA source description)"),
     ]
     for source in sources:
         source_name_options.append(
-            ConfigValueOption(source.display_label, source.name)
+            ConfigValueOption(source.name, source.display_label)
         )
         if source.description and source.description != source.name:
             display_name_options.append(
@@ -163,14 +163,14 @@ async def get_config_entries(
             required=False,
             default_value=DEFAULT_SAMPLE_RATE,
             options=[
-                ConfigValueOption("44100 Hz (CD)", 44100),
-                ConfigValueOption("48000 Hz (HDMI / S/PDIF)", 48000),
-                ConfigValueOption("88200 Hz", 88200),
-                ConfigValueOption("96000 Hz (High-res)", 96000),
-                ConfigValueOption("176400 Hz", 176400),
-                ConfigValueOption("192000 Hz (High-res)", 192000),
-                ConfigValueOption("352800 Hz", 352800),
-                ConfigValueOption("384000 Hz (Ultra high-res)", 384000),
+                ConfigValueOption(44100, "44100 Hz (CD)"),
+                ConfigValueOption(48000, "48000 Hz (HDMI / S/PDIF)"),
+                ConfigValueOption(88200, "88200 Hz"),
+                ConfigValueOption(96000, "96000 Hz (High-res)"),
+                ConfigValueOption(176400, "176400 Hz"),
+                ConfigValueOption(192000, "192000 Hz (High-res)"),
+                ConfigValueOption(352800, "352800 Hz"),
+                ConfigValueOption(384000, "384000 Hz (Ultra high-res)"),
             ],
         ),
         ConfigEntry(
@@ -180,9 +180,9 @@ async def get_config_entries(
             required=False,
             default_value=DEFAULT_BIT_DEPTH,
             options=[
-                ConfigValueOption("16-bit", 16),
-                ConfigValueOption("24-bit", 24),
-                ConfigValueOption("32-bit", 32),
+                ConfigValueOption(16, "16-bit"),
+                ConfigValueOption(24, "24-bit"),
+                ConfigValueOption(32, "32-bit"),
             ],
         ),
         ConfigEntry(
@@ -192,8 +192,8 @@ async def get_config_entries(
             required=False,
             default_value=DEFAULT_CHANNELS,
             options=[
-                ConfigValueOption("1 (Mono)", 1),
-                ConfigValueOption("2 (Stereo)", 2),
+                ConfigValueOption(1, "1 (Mono)"),
+                ConfigValueOption(2, "2 (Stereo)"),
             ],
         ),
     )
