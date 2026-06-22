@@ -2,30 +2,31 @@
     "config": {
         "pa_server": {
             "label": "PulseAudio server address",
-            "description": "PulseAudio server socket or TCP address (e.g. unix:/run/audio/pulse.sock). Leave empty to use the PULSE_SERVER environment variable or the default socket path."
+            "description": "PulseAudio server socket or TCP address (e.g. unix:/run/audio/pulse.sock). Leave empty to auto-detect."
         },
         "source_name": {
-            "label": "PulseAudio source name",
-            "description": "Name of a specific PulseAudio source to expose (e.g. alsa_input.pci-0000_00_1b.0.analog-stereo). Leave empty to auto-discover all hardware input sources."
+            "label": "PulseAudio source",
+            "description": "Specific PulseAudio source to expose. Leave empty to show all hardware inputs. Monitor sources are also selectable here for loopback capture."
         },
         "display_name": {
             "label": "Display name",
-            "description": "Friendly name shown in the Music Assistant UI. Overrides the PulseAudio source description when set."
+            "description": "Friendly name shown in the Music Assistant UI. Overrides the PA source description when set."
         },
         "sample_rate": {
             "label": "Sample rate (Hz)",
-            "description": "Capture sample rate in Hz. Match the native rate of your audio interface for best quality (e.g. 44100 for CD, 48000 for HDMI/S/PDIF, 96000 for high-res)."
+            "description": "Capture sample rate. Auto reads the source's native rate."
         },
         "bit_depth": {
             "label": "Bit depth",
-            "description": "Capture bit depth. 16-bit is compatible with all players; use 24-bit for high-resolution sources."
+            "description": "Capture bit depth. Auto reads the source's native depth. 32-bit sources stream as PCM; 16-bit as FLAC."
         },
         "channels": {
             "label": "Channels",
-            "description": "Number of audio channels to capture."
+            "description": "Number of audio channels. Auto reads from the source."
+        },
+        "include_monitors": {
+            "label": "Include monitor sources",
+            "description": "When enabled, sink monitor sources (loopbacks of audio outputs) also appear in the browse view, enabling capture of any output stream."
         }
-    },
-    "action_browse": "Browse",
-    "source_not_found": "PulseAudio source not found: {source_name}",
-    "pa_not_available": "PulseAudio is not available or the server is unreachable. Check the PULSE_SERVER address and ensure PulseAudio is running."
+    }
 }
