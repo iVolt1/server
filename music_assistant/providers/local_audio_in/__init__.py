@@ -34,6 +34,7 @@ from music_assistant_models.enums import (
     MediaType,
     ProviderFeature,
     StreamType,
+    VolumeNormalizationMode,
 )
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
@@ -266,10 +267,11 @@ class LocalAudioInProvider(MusicProvider):
             media_type=MediaType.RADIO,
             can_seek=False,
             duration=0,
-            # Suppress loudness normalization gain: live line-in is already
-            # at the correct level; MA's default boost (+21 dB for a quiet
-            # source) causes severe clipping.
-            volume_normalization_gain_correct=0.0,
+            # Disable MA's loudness normalization entirely for live sources.
+            # Dynamic normalization measures the stream loudness and applies
+            # a large boost when the input is quiet (e.g. +21 dB for a mic),
+            # which clips any signal at normal line-in level.
+            volume_normalization_mode=VolumeNormalizationMode.DISABLED,
         )
 
     async def get_audio_stream(
