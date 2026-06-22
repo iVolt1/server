@@ -266,6 +266,9 @@ class LocalAudioInProvider(MusicProvider):
             media_type=MediaType.RADIO,
             can_seek=False,
             duration=0,
+            # Disable loudness normalization: live line-in is already at
+            # the correct level; MA's default boost causes severe clipping.
+            loudness_correction_gain=0.0,
         )
 
     async def get_audio_stream(
