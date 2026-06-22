@@ -284,9 +284,13 @@ class LocalAudioInProvider(MusicProvider):
         env = self._build_pa_env()
         fmt = streamdetails.audio_format
 
+        # Target ~10ms PA fragment size to minimise capture-side latency.
+        # PA treats this as a hint; actual fragment may be slightly larger.
+        bytes_per_ms = (fmt.sample_rate * (fmt.bit_depth // 8) * fmt.channels) // 1000
+        fragment_size = max(bytes_per_ms * 10, 512)
+
         if fmt.content_type == ContentType.PCM_S32LE:
             codec_args: list[str] = ["-sample_fmt", "s32", "-f", "s32le"]
-            low_latency_args: list[str] = ["-fflags", "nobuffer"]
         else:
             codec_args = [
                 "-sample_fmt",
@@ -298,16 +302,27 @@ class LocalAudioInProvider(MusicProvider):
                 "-f",
                 "flac",
             ]
-            low_latency_args = []
 
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
-            *low_latency_args,
+            # Suppress input probing — format is fully known
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            # Minimise ffmpeg internal buffering
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
+            # PulseAudio input with small fragment for low capture latency
             "-f",
             "pulse",
+            "-fragment_size",
+            str(fragment_size),
             "-i",
             source_name,
             "-ac",
