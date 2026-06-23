@@ -2,20 +2,34 @@
 Local Audio In provider for Music Assistant.
 
 Exposes PulseAudio audio sources (hardware inputs and optionally sink monitors)
-as live audio streams in Music Assistant, modelled as radio stations.
+as live AudioSource streams in Music Assistant, listed under the global
+'Live Inputs' browse node.
 
-All qualifying sources are auto-discovered with no per-source configuration.
-Each source is named from its PA description with format details appended,
-e.g. "Built-in Audio Analog Stereo (96000, 32, 2)".
+All qualifying sources are auto-discovered at startup with no per-source
+configuration.  Each source is named from its PA description with format
+details appended, e.g. "Built-in Audio Analog Stereo (96000, 32, 2)".
 
-Sample rate, bit depth, and channel count are read from the source's native
-PA format; no manual configuration is required or available.
+Sample rate, bit depth, and channel count are read from the source's PA
+server rate (not the raw hardware rate); using the server rate keeps source
+and output sink rates aligned, avoiding MA-side resampling through the lower-
+quality swr fallback when libsoxr is unavailable.
 
 For 32 and 24-bit sources, audio is streamed as raw PCM (no encode overhead).
 For 16-bit sources, FLAC is used (lossless, minimal CPU cost).
 
 Requires ffmpeg and pactl (pulseaudio-utils) in the container/system PATH.
 PipeWire with the PulseAudio compatibility layer is fully supported.
+
+NOTE — Favorites / Shortcuts:
+AudioSource items are surfaced under the global 'Live Inputs' browse node but
+are NOT favoritable or library-backed in MA core today.  This is a current
+MA-wide limitation on the AudioSource type, not specific to this provider.
+Until the core adds favorites support for AudioSource, sources are reached
+through Home → Live Inputs rather than a favorites shortcut.  The original
+MusicProvider/Radio approach DID support favorites; this is the only
+user-facing regression of the PluginProvider rebase.  If MA adds AudioSource
+favorites in a future release this provider will gain them automatically with
+no code change.
 """
 
 from __future__ import annotations
@@ -23,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -34,19 +48,16 @@ from music_assistant_models.enums import (
     MediaType,
     ProviderFeature,
     StreamType,
-    VolumeNormalizationMode,
 )
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import (
     AudioFormat,
-    BrowseFolder,
-    MediaItemType,
+    AudioSource,
     ProviderMapping,
-    Radio,
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
@@ -76,8 +87,10 @@ _PA_SOCKET_CANDIDATES: tuple[str, ...] = (
 # Smaller = lower first-audio latency; 2 KiB is a good balance for PCM.
 _READ_CHUNK_BYTES = 2048
 
+# PluginProvider with AUDIO_SOURCE: sources appear under the global
+# 'Live Inputs' browse node.  BROWSE is not needed — the core handles it.
 SUPPORTED_FEATURES = {
-    ProviderFeature.BROWSE,
+    ProviderFeature.AUDIO_SOURCE,
 }
 
 
@@ -107,8 +120,6 @@ async def get_config_entries(
     All audio sources are discovered and presented automatically with no
     per-source configuration required.
     """
-    current_pa_server = str(values.get(CONF_PA_SERVER, "") if values else "") or ""
-
     pa_server_options: list[ConfigValueOption] = [
         ConfigValueOption("", "(auto-detect)"),
     ]
@@ -163,8 +174,8 @@ class _PASource:
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
-class LocalAudioInProvider(MusicProvider):
-    """Music provider that auto-discovers and streams PulseAudio sources."""
+class LocalAudioInProvider(PluginProvider):
+    """Plugin provider that auto-discovers and streams PulseAudio sources."""
 
     async def handle_async_init(self) -> None:
         """Initialise: resolve PA server address and log discovered sources."""
@@ -211,39 +222,49 @@ class LocalAudioInProvider(MusicProvider):
         self._capture_procs.clear()
 
     # ------------------------------------------------------------------
-    # Browse
+    # AudioSource exposure
     # ------------------------------------------------------------------
 
-    async def browse(self, path: str) -> Sequence[MediaItemType | BrowseFolder]:
-        """Return all discovered PA input sources as Radio items."""
+    async def get_audio_sources(self) -> list[AudioSource]:
+        """
+        Return all discovered PA input sources as AudioSource items.
+
+        Sources appear under the global 'Live Inputs' browse node in MA.
+
+        NOTE — Favorites gap: AudioSource items are NOT favoritable or
+        library-backed in MA core as of this writing.  This is a known
+        MA-wide limitation (see module docstring for full context).  The
+        previous MusicProvider/Radio implementation DID allow favorites;
+        if this matters for your workflow, track upstream issue progress
+        and this provider will benefit automatically when core support
+        lands.
+        """
         sources = await self._list_pa_sources()
         if not sources:
             return []
-        return [self._source_to_radio(s) for s in sources]
-
-    async def get_radio(self, prov_radio_id: str) -> Radio:
-        """Return a single Radio item by its provider ID (PA source name)."""
-        sources = await self._list_pa_sources()
-        for source in sources or []:
-            if source.name == prov_radio_id:
-                return self._source_to_radio(source)
-        raise MediaNotFoundError(f"PA source not found: {prov_radio_id}")
+        return [self._source_to_audio_source(s) for s in sources]
 
     # ------------------------------------------------------------------
     # Streaming
     # ------------------------------------------------------------------
 
-    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
+    async def get_stream_details(self, source_id: str, queue_id: str) -> StreamDetails:
         """
         Return StreamDetails using the source's native format.
 
         32 and 24-bit sources stream as raw PCM to avoid FLAC's 24-bit cap
         and eliminate the encode step.  16-bit sources use FLAC.
+
+        volume_normalization_mode is intentionally omitted: the MA core
+        auto-disables normalization for MediaType.AUDIO_SOURCE
+        (helpers/audio.py get_normalization_mode() returns DISABLED
+        unconditionally — "live/realtime: upstream producer owns loudness").
+        Setting it explicitly here would be redundant.
         """
         sources = await self._list_pa_sources()
-        source = next((s for s in (sources or []) if s.name == item_id), None)
+        source = next((s for s in (sources or []) if s.name == source_id), None)
         if source is None:
-            raise MediaNotFoundError(f"PA source not found: {item_id}")
+            raise MediaNotFoundError(f"PA source not found: {source_id}")
 
         sample_rate = source.sample_rate or _DEFAULT_SAMPLE_RATE
         bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
@@ -251,14 +272,11 @@ class LocalAudioInProvider(MusicProvider):
 
         # Use PCM for 24/32-bit sources: no encode step, exact bit depth
         # preserved in the signal chain. FLAC for 16-bit (lossless, framed).
-        if bit_depth >= 24:
-            content_type = ContentType.PCM_S32LE
-        else:
-            content_type = ContentType.FLAC
+        content_type = ContentType.PCM_S32LE if bit_depth >= 24 else ContentType.FLAC
 
         return StreamDetails(
             provider=self.instance_id,
-            item_id=item_id,
+            item_id=source_id,
             audio_format=AudioFormat(
                 content_type=content_type,
                 sample_rate=sample_rate,
@@ -266,14 +284,7 @@ class LocalAudioInProvider(MusicProvider):
                 channels=channels,
             ),
             stream_type=StreamType.CUSTOM,
-            media_type=MediaType.RADIO,
-            can_seek=False,
-            duration=0,
-            # Disable MA's loudness normalization entirely for live sources.
-            # Dynamic normalization measures the stream loudness and applies
-            # a large boost when the input is quiet (e.g. +21 dB for a mic),
-            # which clips any signal at normal line-in level.
-            volume_normalization_mode=VolumeNormalizationMode.DISABLED,
+            media_type=MediaType.AUDIO_SOURCE,
         )
 
     async def get_audio_stream(
@@ -284,8 +295,14 @@ class LocalAudioInProvider(MusicProvider):
         """
         Capture audio from the PA source and yield encoded bytes.
 
-        FLAC with compression_level 0: lossless, minimal encode overhead,
-        and reliably framed for MA's stream pipeline.
+        For PCM_S32LE: raw 32-bit little-endian PCM, no encode overhead.
+        For FLAC: compression_level 0, lossless, minimal CPU cost.
+
+        The MA core wraps this generator (StreamType.CUSTOM +
+        MediaType.AUDIO_SOURCE) with a silence-keepalive: if the generator
+        stops yielding (e.g. ffmpeg exits or the source goes silent), the
+        core inserts silence frames at the declared PCM format and keeps
+        the downstream player connected.
         """
         source_name = streamdetails.item_id
         env = self._build_pa_env()
@@ -364,7 +381,7 @@ class LocalAudioInProvider(MusicProvider):
                     break
                 yield chunk
 
-        except asyncio.CancelledError, GeneratorExit:
+        except (asyncio.CancelledError, GeneratorExit):  # fmt: skip
             self.logger.debug("Capture cancelled for '%s'", source_name)
 
         finally:
@@ -383,9 +400,12 @@ class LocalAudioInProvider(MusicProvider):
             env["PULSE_SERVER"] = self._pa_server
         return env
 
-    def _source_to_radio(self, source: _PASource) -> Radio:
-        """Convert a _PASource to an MA Radio item."""
-        return Radio(
+    def _source_to_audio_source(self, source: _PASource) -> AudioSource:
+        """Convert a _PASource to an MA AudioSource item."""
+        bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
+        content_type = ContentType.PCM_S32LE if bit_depth >= 24 else ContentType.FLAC
+
+        return AudioSource(
             item_id=source.name,
             provider=self.instance_id,
             name=source.display_label,
@@ -394,8 +414,21 @@ class LocalAudioInProvider(MusicProvider):
                     item_id=source.name,
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
+                    audio_format=AudioFormat(
+                        content_type=content_type,
+                        sample_rate=source.sample_rate or _DEFAULT_SAMPLE_RATE,
+                        bit_depth=bit_depth,
+                        channels=source.channels or _DEFAULT_CHANNELS,
+                    ),
                 )
             },
+            can_play_pause=False,
+            can_seek=False,
+            can_next_previous=False,
+            # PA sources support multiple concurrent readers (ffmpeg can open
+            # the same source from several consumers simultaneously).
+            exclusive=False,
+            allow_external_trigger=False,
         )
 
     async def _list_pa_sources(self) -> list[_PASource] | None:
@@ -424,21 +457,22 @@ async def _enumerate_pa_sources(
     include_monitors: bool = False,
 ) -> list[_PASource] | None:
     """
-    Enumerate PulseAudio sources via ``pactl list sources short``.
+    Enumerate PulseAudio sources via ``pactl list sources``.
 
     Returns hardware inputs and optionally monitor (loopback) sources.
     Returns None if PA is unreachable.
+
+    Full output (not ``pactl list sources short``) is used to obtain both
+    human-readable descriptions and the PA server sample rate.  Using the
+    server rate rather than the raw hardware rate ensures source and output
+    sink rates match, avoiding MA-side resampling through the swr fallback
+    when libsoxr is unavailable.
     """
     env = dict(os.environ)
     resolved = pa_server or os.environ.get("PULSE_SERVER", "") or _probe_pa_socket()
     if resolved:
         env["PULSE_SERVER"] = resolved
 
-    # Full output gives both descriptions and the PA-server sample rate.
-    # Using the PA server rate (rather than the hardware rate from
-    # "pactl list sources short") ensures source and output sink rates
-    # match, avoiding MA-side resampling through the lower-quality swr
-    # fallback when libsoxr is unavailable.
     full_out = await _pactl_output(["pactl", "list", "sources"], env)
     if full_out is None:
         return None
