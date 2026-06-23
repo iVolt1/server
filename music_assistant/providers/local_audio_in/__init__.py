@@ -425,6 +425,11 @@ class LocalAudioInProvider(PluginProvider):
             can_play_pause=False,
             can_seek=False,
             can_next_previous=False,
+            # MA can always initiate capture on demand: ffmpeg reads from the PA
+            # source whenever the user selects it from Live Inputs.  This is
+            # distinct from passive receivers (AirPlay, Spotify Connect) where
+            # an external device must initiate the session first.
+            can_initiate=True,
             # PA sources support multiple concurrent readers (ffmpeg can open
             # the same source from several consumers simultaneously).
             exclusive=False,
