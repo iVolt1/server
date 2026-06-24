@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 CONF_PA_SERVER = "pa_server"
 CONF_INCLUDE_MONITORS = "include_monitors"
+CONF_INPUT_GAIN_DB = "input_gain_db"
 
 # Fallback format values used only when pactl is unavailable
 _DEFAULT_SAMPLE_RATE = 44100
@@ -144,6 +145,14 @@ async def get_config_entries(
             required=False,
             default_value=False,
         ),
+        ConfigEntry(
+            key=CONF_INPUT_GAIN_DB,
+            type=ConfigEntryType.FLOAT,
+            label=CONF_INPUT_GAIN_DB,
+            required=False,
+            default_value=0.0,
+            range=((-20.0), 20.0),
+        ),
     )
 
 
@@ -181,6 +190,7 @@ class LocalAudioInProvider(PluginProvider):
         """Initialise: resolve PA server address and log discovered sources."""
         self._pa_server: str = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
         self._include_monitors: bool = bool(self.config.get_value(CONF_INCLUDE_MONITORS))
+        self._input_gain_db: float = float(self.config.get_value(CONF_INPUT_GAIN_DB) or 0.0)
 
         # Active ffmpeg capture subprocesses keyed by PA source name.
         self._capture_procs: dict[str, asyncio.subprocess.Process] = {}
@@ -328,6 +338,14 @@ class LocalAudioInProvider(PluginProvider):
                 "flac",
             ]
 
+        # Inject a software gain stage when configured.  Applied before the
+        # encoder so the gain is baked into the PCM/FLAC bytes yielded to MA.
+        # Keeps the ADC at 0 dB (clean) and compensates for low line-level
+        # sources entirely in software.  Range: -20 to +20 dB.
+        gain_args: list[str] = []
+        if self._input_gain_db != 0.0:
+            gain_args = ["-af", f"volume={self._input_gain_db:.2f}dB"]
+
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
@@ -349,6 +367,7 @@ class LocalAudioInProvider(PluginProvider):
             str(fmt.channels),
             "-ar",
             str(fmt.sample_rate),
+            *gain_args,
             *codec_args,
             "pipe:1",
         ]
