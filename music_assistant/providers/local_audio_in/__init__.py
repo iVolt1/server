@@ -215,6 +215,16 @@ class LocalAudioInProvider(PluginProvider):
         self._source_name: str = cast("str", self.config.get_value(CONF_SOURCE_NAME)) or ""
         self._input_gain_db: float = float(self.config.get_value(CONF_INPUT_GAIN_DB) or 0.0)
 
+        # In single-source mode, seed default_name from the PA source description
+        # so the instance shows something readable in Settings before the user
+        # sets a custom name.  self.config.name (user-set) takes precedence via
+        # self.name; default_name is only the fallback.
+        if self._source_name and not self.config.default_name:
+            sources = await self._list_pa_sources()
+            match = next((s for s in (sources or []) if s.name == self._source_name), None)
+            if match:
+                self.config.default_name = match.description or match.name
+
         # Active ffmpeg capture subprocesses keyed by PA source name.
         self._capture_procs: dict[str, asyncio.subprocess.Process] = {}
 
@@ -454,10 +464,16 @@ class LocalAudioInProvider(PluginProvider):
         bit_depth = source.bit_depth or _DEFAULT_BIT_DEPTH
         content_type = ContentType.PCM_S32LE if bit_depth >= 24 else ContentType.FLAC
 
+        # Use the user-set instance name (config.name) as the display name when
+        # one has been set — so Browse reflects whatever the user called this
+        # instance in Settings.  Fall back to the PA technical name so format
+        # details are visible in the default / all-sources case.
+        display_name = self.config.name or source.display_label
+
         return AudioSource(
             item_id=source.name,
             provider=self.instance_id,
-            name=source.display_label,
+            name=display_name,
             provider_mappings={
                 ProviderMapping(
                     item_id=source.name,
