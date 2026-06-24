@@ -1,5 +1,5 @@
 {
-    "config": {
+    "config_entries": {
         "pa_server": {
             "label": "PulseAudio server address",
             "description": "PulseAudio server socket or TCP address. Leave empty to auto-detect from the PULSE_SERVER environment variable or the default socket path (e.g. /run/audio/pulse.sock on HAOS)."
@@ -7,6 +7,10 @@
         "include_monitors": {
             "label": "Include monitor sources",
             "description": "When enabled, sink monitor sources (loopbacks of audio outputs) also appear alongside hardware inputs, enabling capture of any output stream."
+        },
+        "input_gain_db": {
+            "label": "Input gain (dB)",
+            "description": "Software gain applied after the ADC, before streaming to Music Assistant. Use this to compensate for low line-level sources without increasing ALSA capture gain. Range: -20 to +20 dB. 0 = unity gain (no adjustment)."
         }
     }
 }
