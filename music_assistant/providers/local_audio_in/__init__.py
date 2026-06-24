@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 CONF_PA_SERVER = "pa_server"
 CONF_INCLUDE_MONITORS = "include_monitors"
+CONF_SOURCE_NAME = "source_name"
 CONF_INPUT_GAIN_DB = "input_gain_db"
 
 # Fallback format values used only when pactl is unavailable
@@ -129,6 +130,19 @@ async def get_config_entries(
             uri = f"unix:{path}"
             pa_server_options.append(ConfigValueOption(uri, uri))
 
+    # Populate the source dropdown from pactl using whatever PA server
+    # is currently configured (or auto-detected).  Gracefully returns an
+    # empty list if PA is unreachable at config time.
+    pa_server = str(values.get(CONF_PA_SERVER, "") if values else "")
+    include_monitors = bool(values.get(CONF_INCLUDE_MONITORS, False) if values else False)
+    discovered = await _enumerate_pa_sources(pa_server, include_monitors=include_monitors) or []
+
+    source_options: list[ConfigValueOption] = [
+        ConfigValueOption("", "(all sources)"),
+    ]
+    for src in discovered:
+        source_options.append(ConfigValueOption(src.name, src.display_label))
+
     return (
         ConfigEntry(
             key=CONF_PA_SERVER,
@@ -144,6 +158,14 @@ async def get_config_entries(
             label=CONF_INCLUDE_MONITORS,
             required=False,
             default_value=False,
+        ),
+        ConfigEntry(
+            key=CONF_SOURCE_NAME,
+            type=ConfigEntryType.STRING,
+            label=CONF_SOURCE_NAME,
+            required=False,
+            default_value="",
+            options=source_options,
         ),
         ConfigEntry(
             key=CONF_INPUT_GAIN_DB,
@@ -190,6 +212,7 @@ class LocalAudioInProvider(PluginProvider):
         """Initialise: resolve PA server address and log discovered sources."""
         self._pa_server: str = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
         self._include_monitors: bool = bool(self.config.get_value(CONF_INCLUDE_MONITORS))
+        self._source_name: str = cast("str", self.config.get_value(CONF_SOURCE_NAME)) or ""
         self._input_gain_db: float = float(self.config.get_value(CONF_INPUT_GAIN_DB) or 0.0)
 
         # Active ffmpeg capture subprocesses keyed by PA source name.
@@ -237,7 +260,12 @@ class LocalAudioInProvider(PluginProvider):
 
     async def get_audio_sources(self) -> list[AudioSource]:
         """
-        Return all discovered PA input sources as AudioSource items.
+        Return PA input sources as AudioSource items.
+
+        If a specific source is configured (source_name), only that source
+        is returned — enabling independent per-source gain and naming when
+        the provider is added as multiple instances.  If source_name is
+        empty all discovered sources are returned (default / legacy mode).
 
         Sources appear under the global 'Live Inputs' browse node in MA.
 
@@ -252,6 +280,8 @@ class LocalAudioInProvider(PluginProvider):
         sources = await self._list_pa_sources()
         if not sources:
             return []
+        if self._source_name:
+            sources = [s for s in sources if s.name == self._source_name]
         return [self._source_to_audio_source(s) for s in sources]
 
     # ------------------------------------------------------------------

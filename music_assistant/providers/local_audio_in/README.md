@@ -29,8 +29,26 @@ On HAOS the PulseAudio socket is detected automatically. No configuration is req
 | Setting | Default | Description |
 |---|---|---|
 | PulseAudio server address | *(auto-detect)* | Socket path or TCP address. Auto-detects `/run/audio/pulse.sock` (HAOS) or `/run/pulse/native`. Override only if PA is on a non-standard path. |
-| Include monitor sources | Off | When enabled, sink monitor sources (loopbacks of audio outputs) appear alongside hardware inputs, allowing capture of any playback stream. |
+| Include monitor sources | Off | When enabled, sink monitor sources (loopbacks of audio outputs) appear in the source list alongside hardware inputs. |
+| Source | *(all sources)* | Which PA source to expose. Leave empty to show all discovered sources. Set to a specific source to dedicate this instance to one input — see [Multiple instances](#multiple-instances) below. |
 | Input gain (dB) | 0.0 | Software gain applied after capture, before streaming to MA. Range: −20 to +20 dB. Use this to compensate for low line-level sources while keeping the ALSA capture gain at 0 dB. |
+
+---
+
+## Multiple instances
+
+The provider can be added more than once, following the same pattern as the Spotify Connect provider. Each instance is independent with its own configuration.
+
+The intended use is per-source settings: add one instance per physical input, set the **Source** dropdown to that input's PA source name, and configure the **Input gain** independently for each. This gives per-source gain control without any core MA changes.
+
+Example setup for two inputs:
+
+| Instance | Source | Input gain |
+|---|---|---|
+| Local Audio In (X-Fi) | Creative X-Fi Analog Stereo | +9 dB |
+| Local Audio In (HD Audio) | HD-Audio Generic Analog Stereo | 0 dB |
+
+Each instance appears separately in the MA provider list and contributes its source to **Live Inputs**.
 
 ---
 
@@ -88,7 +106,7 @@ PipeWire with the PulseAudio compatibility layer is fully supported. Source enum
 
 **Latency** — Capture-side latency is approximately 10–50 ms (PA fragment size). MA's internal stream pipeline adds a small additional buffer. The total end-to-end latency is suitable for monitoring but not for real-time performance applications.
 
-**Multiple instances** — To apply different input gain settings to different physical sources, add the provider more than once and configure the PA server or gain per instance. Each instance discovers all available sources independently.
+**Per-player configuration** — The `input_gain_db` setting applies per provider instance. Per-player configuration (different gain depending on which player receives the stream) is not supported by the current MA `PluginProvider` architecture — config scopes to `(instance_id)` only, not `(instance_id, player_id)`. The `queue_id` is available in `get_stream_details()` at runtime, but there is no config entry mechanism to expose per-player settings in the UI without a core MA change.
 
 ---
 

@@ -6,7 +6,11 @@
         },
         "include_monitors": {
             "label": "Include monitor sources",
-            "description": "When enabled, sink monitor sources (loopbacks of audio outputs) also appear alongside hardware inputs, enabling capture of any output stream."
+            "description": "When enabled, sink monitor sources (loopbacks of audio outputs) also appear in the source selection list and browse view."
+        },
+        "source_name": {
+            "label": "Source",
+            "description": "The PulseAudio source to expose. Leave empty to expose all discovered sources. Set to a specific source to use this instance for one source only — add the provider again for each additional source that needs independent settings."
         },
         "input_gain_db": {
             "label": "Input gain (dB)",
