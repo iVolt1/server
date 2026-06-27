@@ -1,31 +1,20 @@
 {
-    "config": {
+    "config_entries": {
         "pa_server": {
             "label": "PulseAudio server address",
-            "description": "PulseAudio server socket or TCP address (e.g. unix:/run/audio/pulse.sock). Leave empty to use the PULSE_SERVER environment variable or the default socket path."
+            "description": "PulseAudio server socket or TCP address. Leave empty to auto-detect from the PULSE_SERVER environment variable or the default socket path (e.g. /run/audio/pulse.sock on HAOS)."
+        },
+        "include_monitors": {
+            "label": "Include monitor sources",
+            "description": "When enabled, sink monitor sources (loopbacks of audio outputs) also appear in the source selection list and browse view."
         },
         "source_name": {
-            "label": "PulseAudio source name",
-            "description": "Name of a specific PulseAudio source to expose (e.g. alsa_input.pci-0000_00_1b.0.analog-stereo). Leave empty to auto-discover all hardware input sources."
+            "label": "Source",
+            "description": "The PulseAudio source to expose. Leave empty to expose all discovered sources. Set to a specific source to use this instance for one source only — add the provider again for each additional source that needs independent settings."
         },
-        "display_name": {
-            "label": "Display name",
-            "description": "Friendly name shown in the Music Assistant UI. Overrides the PulseAudio source description when set."
-        },
-        "sample_rate": {
-            "label": "Sample rate (Hz)",
-            "description": "Capture sample rate in Hz. Match the native rate of your audio interface for best quality (e.g. 44100 for CD, 48000 for HDMI/S/PDIF, 96000 for high-res)."
-        },
-        "bit_depth": {
-            "label": "Bit depth",
-            "description": "Capture bit depth. 16-bit is compatible with all players; use 24-bit for high-resolution sources."
-        },
-        "channels": {
-            "label": "Channels",
-            "description": "Number of audio channels to capture."
+        "input_gain_db": {
+            "label": "Input gain (dB)",
+            "description": "Software gain applied after the ADC, before streaming to Music Assistant. Use this to compensate for low line-level sources without increasing ALSA capture gain. Range: -20 to +20 dB. 0 = unity gain (no adjustment)."
         }
-    },
-    "action_browse": "Browse",
-    "source_not_found": "PulseAudio source not found: {source_name}",
-    "pa_not_available": "PulseAudio is not available or the server is unreachable. Check the PULSE_SERVER address and ensure PulseAudio is running."
+    }
 }
