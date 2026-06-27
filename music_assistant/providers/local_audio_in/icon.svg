@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 680" role="img">
+<title>Local Audio In</title>
+<desc>TRS jack socket with microphone and line-in symbol</desc>
+<rect width="680" height="680" rx="120" fill="#1a6ebd"/>
+<circle cx="400" cy="340" r="145" fill="none" stroke="#c8e4ff" stroke-width="6"/>
+<circle cx="400" cy="340" r="138" fill="#1a8fd8"/>
+<circle cx="400" cy="340" r="92"  fill="#07152a"/>
+<circle cx="400" cy="340" r="60"  fill="none" stroke="#c8e4ff" stroke-width="6"/>
+<circle cx="400" cy="340" r="26"  fill="#e8f4ff"/>
+<g transform="translate(175,430)" stroke="#ffffff" stroke-linecap="round" fill="none" stroke-width="9">
+  <line x1="-85" y1="0" x2="-30" y2="0"/>
+  <polygon points="-20,0 -42,-14 -42,14" fill="#ffffff" stroke="none"/>
+  <path d="M 0,-30 C 35,-30 35,30 0,30"/>
+  <path d="M 0,-55 C 72,-55 72,55 0,55"/>
+  <path d="M 0,-80 C 108,-80 108,80 0,80"/>
+</g>
+<g transform="translate(165,195)" stroke="#ffffff" stroke-linecap="round" stroke-width="9" fill="none">
+  <rect x="-16" y="-38" width="32" height="50" rx="16" fill="#ffffff" stroke="none"/>
+  <path d="M -26,16 Q -26,46 0,46 Q 26,46 26,16"/>
+  <line x1="0"   y1="46" x2="0"  y2="68"/>
+  <line x1="-22" y1="68" x2="22" y2="68"/>
+</g>
+</svg>
