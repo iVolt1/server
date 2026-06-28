@@ -72,7 +72,6 @@ if TYPE_CHECKING:
 CONF_PA_SERVER = "pa_server"
 CONF_INCLUDE_MONITORS = "include_monitors"
 CONF_SOURCE_NAME = "source_name"
-CONF_INPUT_GAIN_DB = "input_gain_db"
 
 # Fallback format values used only when pactl is unavailable
 _DEFAULT_SAMPLE_RATE = 44100
@@ -167,14 +166,6 @@ async def get_config_entries(
             default_value="",
             options=source_options,
         ),
-        ConfigEntry(
-            key=CONF_INPUT_GAIN_DB,
-            type=ConfigEntryType.FLOAT,
-            label=CONF_INPUT_GAIN_DB,
-            required=False,
-            default_value=0.0,
-            range=((-20.0), 20.0),
-        ),
     )
 
 
@@ -213,7 +204,6 @@ class LocalAudioInProvider(PluginProvider):
         self._pa_server: str = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
         self._include_monitors: bool = bool(self.config.get_value(CONF_INCLUDE_MONITORS))
         self._source_name: str = cast("str", self.config.get_value(CONF_SOURCE_NAME)) or ""
-        self._input_gain_db: float = float(self.config.get_value(CONF_INPUT_GAIN_DB) or 0.0)
 
         # In single-source mode, seed default_name from the PA source description
         # so the instance shows something readable in Settings before the user
@@ -273,9 +263,9 @@ class LocalAudioInProvider(PluginProvider):
         Return PA input sources as AudioSource items.
 
         If a specific source is configured (source_name), only that source
-        is returned — enabling independent per-source gain and naming when
-        the provider is added as multiple instances.  If source_name is
-        empty all discovered sources are returned (default / legacy mode).
+        is returned — enabling independent naming when the provider is added
+        as multiple instances.  If source_name is empty all discovered sources
+        are returned (default / legacy mode).
 
         Sources appear under the global 'Live Inputs' browse node in MA.
 
@@ -378,14 +368,6 @@ class LocalAudioInProvider(PluginProvider):
                 "flac",
             ]
 
-        # Inject a software gain stage when configured.  Applied before the
-        # encoder so the gain is baked into the PCM/FLAC bytes yielded to MA.
-        # Keeps the ADC at 0 dB (clean) and compensates for low line-level
-        # sources entirely in software.  Range: -20 to +20 dB.
-        gain_args: list[str] = []
-        if self._input_gain_db != 0.0:
-            gain_args = ["-af", f"volume={self._input_gain_db:.2f}dB"]
-
         cmd: list[str] = [
             "ffmpeg",
             "-hide_banner",
@@ -407,7 +389,6 @@ class LocalAudioInProvider(PluginProvider):
             str(fmt.channels),
             "-ar",
             str(fmt.sample_rate),
-            *gain_args,
             *codec_args,
             "pipe:1",
         ]
