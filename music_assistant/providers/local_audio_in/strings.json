@@ -11,10 +11,6 @@
         "source_name": {
             "label": "Source",
             "description": "The PulseAudio source to expose. Leave empty to expose all discovered sources. Set to a specific source to use this instance for one source only — add the provider again for each additional source that needs independent settings."
-        },
-        "input_gain_db": {
-            "label": "Input gain (dB)",
-            "description": "Software gain applied after the ADC, before streaming to Music Assistant. Use this to compensate for low line-level sources without increasing ALSA capture gain. Range: -20 to +20 dB. 0 = unity gain (no adjustment)."
         }
     }
 }
