@@ -31,7 +31,6 @@ On HAOS the PulseAudio socket is detected automatically. No configuration is req
 | PulseAudio server address | *(auto-detect)* | Socket path or TCP address. Auto-detects `/run/audio/pulse.sock` (HAOS) or `/run/pulse/native`. Override only if PA is on a non-standard path. |
 | Include monitor sources | Off | When enabled, sink monitor sources (loopbacks of audio outputs) appear in the source list alongside hardware inputs. |
 | Source | *(all sources)* | Which PA source to expose. Leave empty to show all discovered sources. Set to a specific source to dedicate this instance to one input — see [Multiple instances](#multiple-instances) below. |
-| Input gain (dB) | 0.0 | Software gain applied after capture, before streaming to MA. Range: −20 to +20 dB. Use this to compensate for low line-level sources while keeping the ALSA capture gain at 0 dB. |
 
 ---
 
@@ -43,10 +42,10 @@ The intended use is per-source settings: add one instance per physical input, se
 
 Example setup for two inputs:
 
-| Instance | Source | Input gain |
-|---|---|---|
-| Local Audio In (X-Fi) | Creative X-Fi Analog Stereo | +9 dB |
-| Local Audio In (HD Audio) | HD-Audio Generic Analog Stereo | 0 dB |
+| Instance | Source |
+|---|---|
+| Local Audio In (X-Fi) | Creative X-Fi Analog Stereo |
+| Local Audio In (HD Audio) | HD-Audio Generic Analog Stereo |
 
 Each instance appears separately in the MA provider list and contributes its source to **Live Inputs**.
 
@@ -76,7 +75,7 @@ Volume normalization is automatically disabled by the MA core for `MediaType.AUD
 
 ## Gain staging
 
-For best results, keep the ALSA capture gain at 0 dB and use the **Input gain** config entry to add software boost if needed. This avoids ADC clipping regardless of the source level.
+ADC clipping happens before any software processing and cannot be corrected after the fact. If a source sounds distorted, reduce the analog output level on the source device first. The only controls that prevent clipping are the source device volume and the ALSA capture gain.
 
 Check and set ALSA capture gain:
 
@@ -84,7 +83,7 @@ Check and set ALSA capture gain:
 alsamixer   # F4 to switch to Capture view
 ```
 
-The Capture slider at 0 dB gives a clean signal from a nominal line-level source (+4 dBu / −10 dBV). If the source is too quiet at 0 dB ALSA gain, raise the Input gain config entry in MA rather than the ALSA slider. Typical values: +6 to +12 dB for consumer line-level sources.
+Keep the ALSA Capture slider at 0 dB for line-level sources. If the captured signal is too quiet, increase the source device's output volume rather than the ALSA capture gain. Raising ALSA gain above 0 dB amplifies noise and risks clipping at the ADC.
 
 Save ALSA state so it persists across reboots:
 
@@ -105,8 +104,6 @@ PipeWire with the PulseAudio compatibility layer is fully supported. Source enum
 **Favorites and shortcuts** — `AudioSource` items are not favoritable or library-backed in MA core as of this writing. This is a current MA-wide limitation on the `AudioSource` type. Sources are reached through **Home → Live Inputs**. When the MA core adds favorites support for `AudioSource`, this provider will gain it automatically with no code change.
 
 **Latency** — Capture-side latency is approximately 10–50 ms (PA fragment size). MA's internal stream pipeline adds a small additional buffer. The total end-to-end latency is suitable for monitoring but not for real-time performance applications.
-
-**Per-player configuration** — The `input_gain_db` setting applies per provider instance. Per-player configuration (different gain depending on which player receives the stream) is not supported by the current MA `PluginProvider` architecture — config scopes to `(instance_id)` only, not `(instance_id, player_id)`. The `queue_id` is available in `get_stream_details()` at runtime, but there is no config entry mechanism to expose per-player settings in the UI without a core MA change.
 
 ---
 
