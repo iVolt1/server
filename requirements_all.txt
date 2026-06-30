@@ -48,8 +48,8 @@ librosa==0.11.0
 lyricsgenius==3.12.2
 mashumaro==3.20
 modern_colorthief==0.2.1
-music-assistant-frontend==2.17.203
-music-assistant-models==1.1.145
+music-assistant-frontend==2.17.204
+music-assistant-models==1.1.146
 mutagen==1.47.0
 niconico.py-ma==2.1.0.post2
 nnAudio==0.3.3
@@ -85,11 +85,11 @@ snapcast==2.3.8
 soco==0.31.1
 soundcloudpy==0.1.4
 sounddevice==0.5.5
-srptools>=1.0.0
+srptools>=1.0.1
 sxm==0.2.8
 threadpoolctl==3.6.0
-torch==2.11.0+cpu; sys_platform == 'linux' and platform_machine == 'x86_64'
-torch==2.11.0; sys_platform != 'linux' or platform_machine != 'x86_64'
+torch==2.12.1+cpu; sys_platform == 'linux' and platform_machine == 'x86_64'
+torch==2.12.1; sys_platform != 'linux' or platform_machine != 'x86_64'
 torchaudio==2.11.0+cpu; sys_platform == 'linux' and platform_machine == 'x86_64'
 torchaudio==2.11.0; sys_platform != 'linux' or platform_machine != 'x86_64'
 torchlibrosa==0.1.0
