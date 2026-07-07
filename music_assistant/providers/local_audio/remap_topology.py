@@ -51,15 +51,23 @@ class RemapSinkSpec:
     channels: int
 
 
-def normalize_card_name(alsa_card_name: str) -> str:
+def normalize_card_name(alsa_card_name: str, card_index: str | None = None) -> str:
     """
     Normalize an alsa.card_name property into a sink-name prefix.
 
     Mirrors `tr ' -' '_' | tr -cd '[:alnum:]_'`, e.g. "Creative X-Fi" ->
     "Creative_X_Fi", "HD-Audio Generic" -> "HD_Audio_Generic".
+
+    :param card_index: Optional ALSA card index (from alsa.card property).
+        When provided, appended as ``_card{N}`` suffix to disambiguate
+        identical cards (e.g. two X-Fi cards become ``Creative_X_Fi_card0``
+        and ``Creative_X_Fi_card3``).
     """
     name = re.sub(r"[ -]", "_", alsa_card_name)
-    return re.sub(r"[^A-Za-z0-9_]", "", name)
+    name = re.sub(r"[^A-Za-z0-9_]", "", name)
+    if card_index is not None:
+        name = f"{name}_card{card_index}"
+    return name
 
 
 def compute_remap_topology(
