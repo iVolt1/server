@@ -724,3 +724,60 @@ def suspend_resume_sink(sink_name: str) -> None:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):  # fmt: skip
         pass
+
+
+def unmute_playback_switches(alsa_card_index: str) -> None:
+    """
+    Force all "* Playback Switch" ALSA mixer controls to 'on' for a card.
+
+    On some multi-instance sound cards, certain playback-enable mixer
+    controls (e.g. for surround/center/side channels) don't default to
+    unmuted on every card instance, even though volume and PCM routing
+    are otherwise correct — hardware is confirmed consuming audio via
+    /proc/asound/cardN/pcm0p/sub0/status, but no sound is produced because
+    the relevant channel switch is muted. This is a driver/hardware
+    init-order quirk independent of physical PCI slot, observed on setups
+    with two identical cards installed.
+
+    Called on ALSA-card master sinks after remap-sink topology creation,
+    alongside suspend_resume_sink(). No-op if amixer is not available or
+    the card exposes no matching controls.
+
+    :param alsa_card_index: ALSA card index (the "alsa.card" PA property),
+        e.g. "0" or "4".
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if not (amixer_bin := shutil.which("amixer")):
+        return
+
+    try:
+        result = subprocess.run(  # noqa: S603
+            [amixer_bin, "-c", alsa_card_index, "controls"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return
+
+    for line in result.stdout.splitlines():
+        if "Playback Switch" not in line:
+            continue
+        # line looks like: numid=1047,iface=MIXER,name='Surround Playback Switch'
+        try:
+            numid = line.split(",")[0].split("=")[1]
+        except IndexError:
+            continue
+        try:
+            subprocess.run(  # noqa: S603
+                [amixer_bin, "-c", alsa_card_index, "cset", f"numid={numid}", "on"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=3,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
