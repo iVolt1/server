@@ -618,6 +618,7 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
         master_device: str | None = properties.get("device.master_device")
         is_remap = master_device is not None or driver == "module-remap-sink.c"
         alsa_card_name: str | None = properties.get("alsa.card_name")
+        alsa_card_index: str | None = properties.get("alsa.card")
         # pactl --format=json represents channel_map as a comma-separated
         # string (e.g. "front-left,front-right,rear-left,rear-right,...").
         channel_map_str: str = sink.get("channel_map", "")
@@ -660,8 +661,22 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
                 "driver": driver,
                 "channel_map": channel_map,
                 "alsa_card_name": alsa_card_name,
+                "alsa_card_index": alsa_card_index,
             }
         )
+
+    # Disambiguate duplicate display names — two identical cards produce the
+    # same PA description string (e.g. two X-Fi cards both appear as "Creative
+    # X-Fi Analog Surround 7.1"). Append the ALSA card index so the MA player
+    # display names are distinct ("Creative X-Fi Analog Surround 7.1 (card 0)"
+    # vs "Creative X-Fi Analog Surround 7.1 (card 1)").
+    descriptions = [s["description"] for s in sinks]
+    for sink in sinks:
+        if descriptions.count(sink["description"]) > 1:
+            card_idx = sink.get("alsa_card_index")
+            if card_idx is not None:
+                sink["description"] = f"{sink['description']} (card {card_idx})"
+
     return sinks
 
 
