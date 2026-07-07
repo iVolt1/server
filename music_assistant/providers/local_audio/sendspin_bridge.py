@@ -991,7 +991,20 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             if not alsa_card_name or not channel_map:
                 continue
 
-            card_name = normalize_card_name(alsa_card_name)
+            # When two identical cards share the same alsa.card_name (e.g.
+            # two Creative X-Fi cards both report "Creative X-Fi"), their
+            # normalized names would collide, causing the second card's remap
+            # sinks to be silently skipped as "already exists". Append the
+            # ALSA card index to disambiguate: "Creative_X_Fi_card0" vs
+            # "Creative_X_Fi_card3".
+            all_card_names = [
+                d.get("alsa_card_name") for d in devices if not d.get("is_remap")
+            ]
+            is_duplicate_card_name = all_card_names.count(alsa_card_name) > 1
+            alsa_card_index: str | None = (
+                device.get("alsa_card_index") if is_duplicate_card_name else None
+            )
+            card_name = normalize_card_name(alsa_card_name, alsa_card_index)
             master_sink_name: str = device["name"]
             for spec in compute_remap_topology(card_name, channel_map, channels):
                 if spec.sink_name in existing_names:
