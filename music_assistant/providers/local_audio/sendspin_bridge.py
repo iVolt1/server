@@ -648,6 +648,18 @@ class SendspinLocalAudioBridge:
             self.logger.debug("PA stream ready for %s", self.pa_sink_name)
             assert stream is not None
 
+            # For remap sinks, run a suspend/resume on the master sink just
+            # before the first write. PA's suspend-on-idle can re-suspend the
+            # master during idle periods between plays, re-triggering the
+            # snd_ctxfi mmap stall. The topology-creation suspend/resume only
+            # runs once at startup — this per-play cycle ensures the master is
+            # in a clean DMA state when the stream first becomes active.
+            master_sink = self.device_info.get("master_device")
+            if master_sink and self.backend == "pulse":
+                await self.mass.loop.run_in_executor(
+                    None, suspend_resume_sink, master_sink
+                )
+
             first_chunk_written = False
 
             while True:
