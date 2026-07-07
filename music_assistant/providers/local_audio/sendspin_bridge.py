@@ -49,6 +49,7 @@ if sys.platform == "linux":
         enumerate_alsa_devices,
         enumerate_pa_sinks,
         suspend_resume_sink,
+        unmute_playback_switches,
     )
     from .remap_topology import (
         build_remap_sink_argument,
@@ -1046,6 +1047,20 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             # is safe — it only takes ~0.5s and has no effect on cards that
             # don't have the bug.
             await self.mass.loop.run_in_executor(None, suspend_resume_sink, master_sink_name)
+
+            # Force-unmute any "* Playback Switch" ALSA mixer controls on
+            # this card. On some multi-instance card setups, one or more
+            # channel-enable switches (e.g. surround/center/side) default to
+            # muted on the second-enumerated card even though DMA is
+            # confirmed running and volume/routing are correct — the card
+            # is silently producing no output on those channels. Safe to run
+            # unconditionally: a no-op on cards that don't expose these
+            # controls or that are already unmuted.
+            device_alsa_card_index = device.get("alsa_card_index")
+            if device_alsa_card_index:
+                await self.mass.loop.run_in_executor(
+                    None, unmute_playback_switches, str(device_alsa_card_index)
+                )
 
             # Pin the master sink to 100% so it never attenuates remap sinks
             # feeding through it. The master has no bridge of its own (it's
