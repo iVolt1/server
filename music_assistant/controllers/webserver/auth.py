@@ -16,6 +16,7 @@ import jwt as pyjwt
 from music_assistant_models.auth import (
     AuthProviderType,
     AuthToken,
+    Scope,
     User,
     UserAuthProvider,
     UserRole,
@@ -28,8 +29,10 @@ from music_assistant_models.errors import (
 
 from music_assistant.constants import DB_TABLE_PLAYLOG, HOMEASSISTANT_SYSTEM_USER, MASS_LOGGER_NAME
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
+    ROLE_SCOPES,
     get_current_token,
     get_current_user,
+    has_scope,
 )
 from music_assistant.controllers.webserver.helpers.auth_providers import (
     AuthResult,
@@ -60,6 +63,11 @@ TOKEN_LONG_LIVED_EXPIRATION = 365  # Long-lived tokens (1 year, no auto-renewal)
 # Max days a sliding short-lived session may live from creation before re-auth.
 TOKEN_ABSOLUTE_MAX_EXPIRATION = 90
 TOKEN_GUEST_EXPIRATION = 1  # Guest sessions: short fixed lifetime, no renewal
+# Days before the absolute cap at which the HA integration token is rotated
+HA_TOKEN_ROTATION_MARGIN = 7
+
+HA_TOKEN_SETTING_KEY = "ha_integration_token"
+HA_TOKEN_NAME = "Home Assistant Integration"
 
 # Join code constants (short codes for QR/link-based login)
 JOIN_CODE_LENGTH = 12
@@ -107,6 +115,9 @@ class AuthenticationManager:
         await self._setup_login_providers()
 
         self._has_users = await self._has_non_system_users()
+
+        # migrate the Home Assistant system user of pre-existing installs to the service role
+        await self._migrate_system_user_role()
 
         self._schedule_join_code_cleanup()
 
@@ -247,7 +258,7 @@ class AuthenticationManager:
             return None
         return str(token_row["token_id"])
 
-    @api_command("auth/user", required_role="admin")
+    @api_command("auth/user", required_scope=Scope.USERS_MANAGE)
     async def get_user(self, user_id: str) -> User | None:
         """
         Get user by ID (admin only).
@@ -262,7 +273,7 @@ class AuthenticationManager:
         return User(
             user_id=user_row["user_id"],
             username=user_row["username"],
-            role=UserRole(user_row["role"]),
+            role=user_row["role"],
             enabled=bool(user_row["enabled"]),
             created_at=datetime.fromisoformat(user_row["created_at"]),
             display_name=user_row["display_name"],
@@ -389,7 +400,7 @@ class AuthenticationManager:
         """
         username = HOMEASSISTANT_SYSTEM_USER
         display_name = "Home Assistant Integration"
-        role = UserRole.USER
+        role = UserRole.SERVICE
 
         normalized_username = normalize_username(username)
 
@@ -412,34 +423,42 @@ class AuthenticationManager:
 
     async def get_homeassistant_system_user_token(self) -> str:
         """
-        Get or create an auth token for the Home Assistant system user.
+        Get the auth token to announce to the Home Assistant integration.
 
-        This method ensures only one active token exists for the HA integration.
-        If an old token exists, it is deleted and a new one is created.
-        The token auto-renews on use (expires after 30 days of inactivity).
+        Returns the same (still valid) token on repeated calls so re-announcing it via
+        Supervisor discovery is idempotent for the HA integration. A replacement is only
+        minted when the current token is missing, expired or revoked, or shortly before
+        it reaches its absolute lifetime cap - allowing seamless rotation as HA reloads
+        with the newly announced token while the old one is still accepted.
 
         :return: Authentication token for the Home Assistant system user.
         """
-        token_name = "Home Assistant Integration"
-
-        # Get the system user
         system_user = await self.get_homeassistant_system_user()
 
-        # Delete any existing tokens with this name to avoid accumulation
-        # We can't retrieve the plain token from the hash, so we always create a new one
-        existing_tokens = await self.database.get_rows(
-            "auth_tokens",
-            {"user_id": system_user.user_id, "name": token_name},
-        )
-        for token_row in existing_tokens:
-            await self.database.delete("auth_tokens", {"token_id": token_row["token_id"]})
+        # Keep the plain token in settings for re-announcing; the jwt_secret next to it can mint any token anyway
+        if token_row := await self.database.get_row("settings", {"key": HA_TOKEN_SETTING_KEY}):
+            token = str(token_row["value"])
+            if await self._can_reuse_ha_integration_token(token, system_user):
+                return token
 
-        # Create a new token for the system user
-        return await self.create_token(
+        # A superseded token stays valid until expiry, so HA keeps working until it reloads
+        token = await self.create_token(
             user=system_user,
-            name=token_name,
+            name=HA_TOKEN_NAME,
             is_long_lived=False,
         )
+        await self.database.insert_or_replace(
+            "settings",
+            {"key": HA_TOKEN_SETTING_KEY, "value": token, "type": "string"},
+        )
+        now = utc()
+        for old_row in await self.database.get_rows(
+            "auth_tokens", {"user_id": system_user.user_id, "name": HA_TOKEN_NAME}
+        ):
+            if old_row["expires_at"] and datetime.fromisoformat(old_row["expires_at"]) <= now:
+                await self.database.delete("auth_tokens", {"token_id": old_row["token_id"]})
+        await self.database.commit()
+        return token
 
     async def link_user_to_provider(
         self,
@@ -659,8 +678,9 @@ class AuthenticationManager:
         if not token_row:
             raise InvalidDataError("Token not found")
 
-        # Check permissions - users can only revoke their own tokens unless admin
-        if token_row["user_id"] != user.user_id and user.role != UserRole.ADMIN:
+        # Check permissions - users can only revoke their own tokens
+        # unless they hold the users.manage scope
+        if token_row["user_id"] != user.user_id and not has_scope(user, Scope.USERS_MANAGE):
             raise InsufficientPermissions("You can only revoke your own tokens")
 
         await self.database.delete("auth_tokens", {"token_id": token_id})
@@ -714,9 +734,10 @@ class AuthenticationManager:
         if not current_user:
             return []
 
-        # If user_id is provided and different from current user, require admin
+        # If user_id is provided and different from current user,
+        # require the users.manage scope
         if user_id and user_id != current_user.user_id:
-            if current_user.role != UserRole.ADMIN:
+            if not has_scope(current_user, Scope.USERS_MANAGE):
                 return []
             target_user = await self.get_user(user_id)
             if not target_user:
@@ -729,7 +750,7 @@ class AuthenticationManager:
         )
         return [AuthToken.from_dict(dict(row)) for row in token_rows]
 
-    @api_command("auth/users", required_role="admin")
+    @api_command("auth/users", required_scope=Scope.USERS_MANAGE)
     async def list_users(self) -> list[User]:
         """
         Get all users (admin only).
@@ -748,7 +769,7 @@ class AuthenticationManager:
                 User(
                     user_id=row["user_id"],
                     username=row["username"],
-                    role=UserRole(row["role"]),
+                    role=row["role"],
                     enabled=bool(row["enabled"]),
                     created_at=datetime.fromisoformat(row["created_at"]),
                     display_name=row["display_name"],
@@ -762,13 +783,13 @@ class AuthenticationManager:
 
     async def update_user_role(self, user_id: str, new_role: UserRole, admin_user: User) -> bool:
         """
-        Update a user's role (admin only).
+        Update a user's role (requires the users.manage scope).
 
         :param user_id: The user ID to update.
         :param new_role: The new role to assign.
-        :param admin_user: The admin user performing the action.
+        :param admin_user: The user performing the action.
         """
-        if admin_user.role != UserRole.ADMIN:
+        if not has_scope(admin_user, Scope.USERS_MANAGE):
             return False
 
         user_row = await self.database.get_row("users", {"user_id": user_id})
@@ -790,7 +811,7 @@ class AuthenticationManager:
         )
         return True
 
-    @api_command("auth/user/enable", required_role="admin")
+    @api_command("auth/user/enable", required_scope=Scope.USERS_MANAGE)
     async def enable_user(self, user_id: str) -> None:
         """
         Enable user account (admin only).
@@ -804,7 +825,7 @@ class AuthenticationManager:
         )
         self.logger.info("User account enabled (user_id=%s)", user_id)
 
-    @api_command("auth/user/disable", required_role="admin")
+    @api_command("auth/user/disable", required_scope=Scope.USERS_MANAGE)
     async def disable_user(self, user_id: str) -> None:
         """
         Disable user account (admin only).
@@ -916,7 +937,7 @@ class AuthenticationManager:
                 "user_id": auth_result.user.user_id,
                 "username": auth_result.user.username,
                 "display_name": auth_result.user.display_name,
-                "role": auth_result.user.role.value,
+                "role": auth_result.user.role,
             },
         }
 
@@ -1010,11 +1031,12 @@ class AuthenticationManager:
         if not current_user:
             raise AuthenticationRequired("Not authenticated")
 
-        # If user_id is provided and different from current user, require admin
+        # If user_id is provided and different from current user,
+        # require the users.manage scope
         if user_id and user_id != current_user.user_id:
-            if current_user.role != UserRole.ADMIN:
+            if not has_scope(current_user, Scope.USERS_MANAGE):
                 raise InsufficientPermissions(
-                    "Admin access required to create tokens for other users"
+                    "The users.manage scope is required to create tokens for other users"
                 )
             target_user = await self.get_user(user_id)
             if not target_user:
@@ -1027,7 +1049,7 @@ class AuthenticationManager:
         self.logger.info("Created long-lived token '%s' for user '%s'", name, target_user.username)
         return token
 
-    @api_command("auth/user/create", required_role="admin")
+    @api_command("auth/user/create", required_scope=Scope.USERS_MANAGE)
     async def create_user_with_api(
         self,
         username: str,
@@ -1088,7 +1110,7 @@ class AuthenticationManager:
         self.logger.info("User created by admin: %s (role: %s)", username, role)
         return user
 
-    @api_command("auth/user/delete", required_role="admin")
+    @api_command("auth/user/delete", required_scope=Scope.USERS_MANAGE)
     async def delete_user(self, user_id: str) -> None:
         """
         Delete user account (admin only).
@@ -1128,6 +1150,14 @@ class AuthenticationManager:
         if not current_user_obj:
             raise AuthenticationRequired("Not authenticated")
         return current_user_obj
+
+    @api_command("auth/scopes")
+    async def get_role_scopes(self) -> dict[str, list[str]]:
+        """Get the scopes granted to each of the builtin user roles."""
+        return {
+            str(role): sorted(str(scope) for scope in scopes)
+            for role, scopes in ROLE_SCOPES.items()
+        }
 
     async def update_user_filters(
         self,
@@ -1185,11 +1215,13 @@ class AuthenticationManager:
             raise AuthenticationRequired("Not authenticated")
 
         # Determine target user
-        is_admin = current_user_obj.role == UserRole.ADMIN
+        may_manage_users = has_scope(current_user_obj, Scope.USERS_MANAGE)
         if user_id and user_id != current_user_obj.user_id:
-            # Updating another user - requires admin
-            if not is_admin:
-                raise InsufficientPermissions("Admin access required")
+            # Updating another user - requires the users.manage scope
+            if not may_manage_users:
+                raise InsufficientPermissions(
+                    "The users.manage scope is required to update other users"
+                )
             target_user = await self.get_user(user_id)
             if not target_user:
                 raise InvalidDataError("User not found")
@@ -1197,10 +1229,12 @@ class AuthenticationManager:
             # Updating own profile
             target_user = current_user_obj
 
-        # Update role (admin only)
+        # Update role (requires the users.manage scope)
         if role:
-            if not is_admin:
-                raise InsufficientPermissions("Only admins can update user roles")
+            if not may_manage_users:
+                raise InsufficientPermissions(
+                    "The users.manage scope is required to update user roles"
+                )
 
             try:
                 new_role = UserRole(role)
@@ -1233,17 +1267,21 @@ class AuthenticationManager:
         if preferences is not None:
             target_user = await self.update_user_preferences(target_user, preferences)
 
-        # Update player_filter and provider_filter (admin only)
+        # Update player_filter and provider_filter (requires the users.manage scope)
         if player_filter is not None or provider_filter is not None:
-            if not is_admin:
-                raise InsufficientPermissions("Only admins can update player/provider filters")
+            if not may_manage_users:
+                raise InsufficientPermissions(
+                    "The users.manage scope is required to update player/provider filters"
+                )
             target_user = await self.update_user_filters(
                 target_user, player_filter, provider_filter
             )
 
         # Update password if provided
         if password:
-            await self._update_profile_password(target_user, password, is_admin, current_user_obj)
+            await self._update_profile_password(
+                target_user, password, may_manage_users, current_user_obj
+            )
 
         return target_user
 
@@ -1286,7 +1324,7 @@ class AuthenticationManager:
         providers = [UserAuthProvider.from_dict(dict(row)) for row in rows]
         return [p.to_dict() for p in providers]
 
-    @api_command("auth/user/unlink_provider", required_role="admin")
+    @api_command("auth/user/unlink_provider", required_scope=Scope.USERS_MANAGE)
     async def unlink_provider(self, user_id: str, provider_type: str) -> bool:
         """
         Unlink authentication provider from user (admin only).
@@ -1462,7 +1500,7 @@ class AuthenticationManager:
                 "error": "Failed to create access token",
             }
 
-    @api_command("auth/join_codes", required_role="admin")
+    @api_command("auth/join_codes", required_scope=Scope.USERS_MANAGE)
     async def list_join_codes(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """
         List join codes, optionally filtered by user (admin only).
@@ -1474,7 +1512,7 @@ class AuthenticationManager:
         rows = await self.database.get_rows("join_codes", filter_args, limit=100)
         return [dict(row) for row in rows]
 
-    @api_command("auth/join_code/revoke", required_role="admin")
+    @api_command("auth/join_code/revoke", required_scope=Scope.USERS_MANAGE)
     async def revoke_join_code(self, code_id: str) -> None:
         """
         Revoke a specific join code (admin only).
@@ -1764,6 +1802,19 @@ class AuthenticationManager:
         user_rows = await self.database.get_rows("users", limit=10)
         return any(row["username"] != HOMEASSISTANT_SYSTEM_USER for row in user_rows)
 
+    async def _migrate_system_user_role(self) -> None:
+        """Migrate the Home Assistant system user of pre-existing installs to the service role."""
+        user_row = await self.database.get_row(
+            "users", {"username": normalize_username(HOMEASSISTANT_SYSTEM_USER)}
+        )
+        if user_row and user_row["role"] != UserRole.SERVICE.value:
+            await self.database.update(
+                "users", {"user_id": user_row["user_id"]}, {"role": UserRole.SERVICE.value}
+            )
+            self.logger.info(
+                "Updated Home Assistant system user role to %s", UserRole.SERVICE.value
+            )
+
     async def _migrate_playlog_to_first_user(self, user_id: str) -> None:
         """
         Migrate all existing playlog entries to the first user.
@@ -1909,3 +1960,20 @@ class AuthenticationManager:
                 updates["expires_at"] = new_expires_at.isoformat()
 
         return updates
+
+    async def _can_reuse_ha_integration_token(self, token: str, system_user: User) -> bool:
+        """Check whether the stored HA integration token is valid and not yet due for rotation."""
+        token_id = self.jwt_helper.get_token_id(token)
+        if not token_id:
+            return False
+        token_row = await self.database.get_row("auth_tokens", {"token_id": token_id})
+        if not token_row or token_row["user_id"] != system_user.user_id:
+            return False
+        now = utc()
+        if token_row["expires_at"] and datetime.fromisoformat(token_row["expires_at"]) <= now:
+            return False
+        created_at = datetime.fromisoformat(token_row["created_at"])
+        rotate_after = created_at + timedelta(
+            days=TOKEN_ABSOLUTE_MAX_EXPIRATION - HA_TOKEN_ROTATION_MARGIN
+        )
+        return now < rotate_after

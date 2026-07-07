@@ -39,7 +39,7 @@ PLAYLIST_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
 
 # API_SCHEMA_VERSION: bump this when adding new features to the API commands (and models)
 # or small non-breaking changes to existing commands
-API_SCHEMA_VERSION: Final[int] = 34
+API_SCHEMA_VERSION: Final[int] = 35
 
 # MIN_SCHEMA_VERSION is the minimum API schema version that the current server
 # version can work with. Only bump when there are breaking changes to existing
@@ -87,6 +87,8 @@ MASS_LOGO: Final[str] = str(RESOURCES_DIR.joinpath("logo.png"))
 # config keys
 CONF_ONBOARD_DONE: Final[str] = "onboard_done"
 CONF_SERVER_ID: Final[str] = "server_id"
+CONF_ENCRYPTION_KEY: Final[str] = "encryption_key"
+CONF_ENCRYPTION_KEY_MIGRATED: Final[str] = "encryption_key_migrated"
 CONF_IP_ADDRESS: Final[str] = "ip_address"
 CONF_PORT: Final[str] = "port"
 CONF_PROVIDERS: Final[str] = "providers"
