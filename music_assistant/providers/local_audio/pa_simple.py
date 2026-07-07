@@ -728,10 +728,10 @@ def suspend_resume_sink(sink_name: str) -> None:
 
 def unmute_playback_switches(alsa_card_index: str) -> None:
     """
-    Force all "* Playback Switch" ALSA mixer controls to 'on' for a card.
+    Force every playback-switch-capable ALSA mixer element to 'on' for a card.
 
     On some multi-instance sound cards, certain playback-enable mixer
-    controls (e.g. for surround/center/side channels) don't default to
+    elements (e.g. for surround/center/side channels) don't default to
     unmuted on every card instance, even though volume and PCM routing
     are otherwise correct — hardware is confirmed consuming audio via
     /proc/asound/cardN/pcm0p/sub0/status, but no sound is produced because
@@ -739,45 +739,65 @@ def unmute_playback_switches(alsa_card_index: str) -> None:
     init-order quirk independent of physical PCI slot, observed on setups
     with two identical cards installed.
 
+    Talks directly to libasound's simple-mixer API rather than shelling
+    out to the `amixer` binary, since alsa-utils is not guaranteed to be
+    present in every deployment (e.g. this addon's container).
+
     Called on ALSA-card master sinks after remap-sink topology creation,
-    alongside suspend_resume_sink(). No-op if amixer is not available or
-    the card exposes no matching controls.
+    alongside suspend_resume_sink(). No-op if libasound is unavailable,
+    the card can't be attached, or it has no matching elements.
 
     :param alsa_card_index: ALSA card index (the "alsa.card" PA property),
         e.g. "0" or "4".
     """
-    import shutil  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
+    try:
+        lib = ctypes.CDLL("libasound.so.2")
+    except OSError:
+        return
 
-    if not (amixer_bin := shutil.which("amixer")):
+    lib.snd_mixer_open.restype = ctypes.c_int
+    lib.snd_mixer_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+    lib.snd_mixer_attach.restype = ctypes.c_int
+    lib.snd_mixer_attach.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.snd_mixer_selem_register.restype = ctypes.c_int
+    lib.snd_mixer_selem_register.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.snd_mixer_load.restype = ctypes.c_int
+    lib.snd_mixer_load.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_first_elem.restype = ctypes.c_void_p
+    lib.snd_mixer_first_elem.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_elem_next.restype = ctypes.c_void_p
+    lib.snd_mixer_elem_next.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_selem_has_playback_switch.restype = ctypes.c_int
+    lib.snd_mixer_selem_has_playback_switch.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_selem_set_playback_switch_all.restype = ctypes.c_int
+    lib.snd_mixer_selem_set_playback_switch_all.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    lib.snd_mixer_close.restype = None
+    lib.snd_mixer_close.argtypes = [ctypes.c_void_p]
+
+    mixer = ctypes.c_void_p()
+    if lib.snd_mixer_open(ctypes.byref(mixer), 0) < 0:
         return
 
     try:
-        result = subprocess.run(  # noqa: S603
-            [amixer_bin, "-c", alsa_card_index, "controls"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return
+        card_name = f"hw:{alsa_card_index}".encode()
+        if lib.snd_mixer_attach(mixer, card_name) < 0:
+            return
+        if lib.snd_mixer_selem_register(mixer, None, None) < 0:
+            return
+        if lib.snd_mixer_load(mixer) < 0:
+            return
 
-    for line in result.stdout.splitlines():
-        if "Playback Switch" not in line:
-            continue
-        # line looks like: numid=1047,iface=MIXER,name='Surround Playback Switch'
-        try:
-            numid = line.split(",")[0].split("=")[1]
-        except IndexError:
-            continue
-        try:
-            subprocess.run(  # noqa: S603
-                [amixer_bin, "-c", alsa_card_index, "cset", f"numid={numid}", "on"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=3,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            continue
+        elem = lib.snd_mixer_first_elem(mixer)
+        while elem:
+            if lib.snd_mixer_selem_has_playback_switch(elem):
+                lib.snd_mixer_selem_set_playback_switch_all(elem, 1)
+            elem = lib.snd_mixer_elem_next(elem)
+    finally:
+        lib.snd_mixer_close(mixer)
