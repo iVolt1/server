@@ -726,7 +726,7 @@ def suspend_resume_sink(sink_name: str) -> None:
         pass
 
 
-def unmute_playback_switches(alsa_card_index: str) -> None:
+def unmute_playback_switches(alsa_card_index: str) -> str:
     """
     Force every playback-switch-capable ALSA mixer element to 'on' for a card.
 
@@ -741,19 +741,28 @@ def unmute_playback_switches(alsa_card_index: str) -> None:
 
     Talks directly to libasound's simple-mixer API rather than shelling
     out to the `amixer` binary, since alsa-utils is not guaranteed to be
-    present in every deployment (e.g. this addon's container).
+    present in every deployment. Note this requires the calling process
+    to have direct access to /dev/snd — going through PulseAudio's socket
+    (as suspend_resume_sink() does) is not sufficient, since PA does not
+    generically expose arbitrary ALSA mixer element control over its
+    protocol. In containerized deployments where only a PA socket is
+    passed through (no /dev/snd bind-mount), this will return
+    "attach_failed" and have no effect.
 
     Called on ALSA-card master sinks after remap-sink topology creation,
-    alongside suspend_resume_sink(). No-op if libasound is unavailable,
-    the card can't be attached, or it has no matching elements.
+    alongside suspend_resume_sink().
 
     :param alsa_card_index: ALSA card index (the "alsa.card" PA property),
         e.g. "0" or "4".
+    :return: short status string for logging/diagnostics — "ok:<n>" on
+        success (n = number of elements unmuted), or one of
+        "no_libasound", "open_failed", "attach_failed", "register_failed",
+        "load_failed" describing where it stopped.
     """
     try:
         lib = ctypes.CDLL("libasound.so.2")
     except OSError:
-        return
+        return "no_libasound"
 
     lib.snd_mixer_open.restype = ctypes.c_int
     lib.snd_mixer_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
@@ -783,21 +792,24 @@ def unmute_playback_switches(alsa_card_index: str) -> None:
 
     mixer = ctypes.c_void_p()
     if lib.snd_mixer_open(ctypes.byref(mixer), 0) < 0:
-        return
+        return "open_failed"
 
     try:
         card_name = f"hw:{alsa_card_index}".encode()
         if lib.snd_mixer_attach(mixer, card_name) < 0:
-            return
+            return "attach_failed"
         if lib.snd_mixer_selem_register(mixer, None, None) < 0:
-            return
+            return "register_failed"
         if lib.snd_mixer_load(mixer) < 0:
-            return
+            return "load_failed"
 
+        unmuted_count = 0
         elem = lib.snd_mixer_first_elem(mixer)
         while elem:
             if lib.snd_mixer_selem_has_playback_switch(elem):
                 lib.snd_mixer_selem_set_playback_switch_all(elem, 1)
+                unmuted_count += 1
             elem = lib.snd_mixer_elem_next(elem)
+        return f"ok:{unmuted_count}"
     finally:
         lib.snd_mixer_close(mixer)
