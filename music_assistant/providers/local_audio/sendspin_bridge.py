@@ -1058,9 +1058,24 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             # controls or that are already unmuted.
             device_alsa_card_index = device.get("alsa_card_index")
             if device_alsa_card_index:
-                await self.mass.loop.run_in_executor(
+                unmute_status = await self.mass.loop.run_in_executor(
                     None, unmute_playback_switches, str(device_alsa_card_index)
                 )
+                if unmute_status.startswith("ok"):
+                    self.logger.debug(
+                        "unmute_playback_switches on ALSA card %s: %s",
+                        device_alsa_card_index,
+                        unmute_status,
+                    )
+                else:
+                    self.logger.debug(
+                        "unmute_playback_switches on ALSA card %s did not "
+                        "complete (%s) — likely no direct /dev/snd access "
+                        "from this process; suspend_resume_sink via PA is "
+                        "unaffected",
+                        device_alsa_card_index,
+                        unmute_status,
+                    )
 
             # Pin the master sink to 100% so it never attenuates remap sinks
             # feeding through it. The master has no bridge of its own (it's
