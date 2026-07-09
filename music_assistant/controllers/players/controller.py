@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     from music_assistant_models.player_queue import PlayerQueue
 
     from music_assistant import MusicAssistant
+    from music_assistant.helpers.json import SerializableType
 
 CACHE_CATEGORY_PLAYER_POWER = 1
 
@@ -251,7 +252,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
 
     async def setup(self, config: CoreConfig) -> None:
         """Async initialize of module."""
-        self._cleanup_stale_protocol_parent_ids()
+        self._repair_protocol_parent_links()
         self._poll_task = self.mass.create_task(self._poll_players())
         self.mass.tasks.register_scheduled_task(
             task_id="fix_group_member_configs",
@@ -276,6 +277,20 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         for player in self._players.values():
             if player.sleep_timer_expires_at is not None:
                 self.mass.cancel_timer(self._sleep_timer_task_id(player.player_id))
+
+    async def get_diagnostics(self) -> dict[str, SerializableType]:
+        """Return diagnostics info for this controller to include in diagnostics reports."""
+        players = list(self._players.values())
+        return {
+            "players_synced": sum(player.state.synced_to is not None for player in players),
+            "players_with_active_group": sum(
+                player.state.active_group is not None for player in players
+            ),
+            "announcements_in_progress": sum(
+                bool(player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS)) for player in players
+            ),
+            "pending_protocol_evaluations": len(self._pending_protocol_evaluations),
+        }
 
     async def on_provider_loaded(self, provider: PlayerProvider) -> None:
         """Handle logic when a provider is loaded."""
@@ -2909,18 +2924,18 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             # player was playing something before the announcement - try to resume that here
             await self._handle_cmd_resume(player.player_id, prev_source, prev_media)
 
-    def _cleanup_stale_protocol_parent_ids(self) -> None:
+    def _repair_protocol_parent_links(self) -> None:
         """
-        Clean up stale protocol_parent_id values in config on startup.
+        Repair protocol parent links in player configs on startup.
 
-        Scans protocol player configs and clears parent_ids that point to
-        player configs that no longer exist (e.g., deleted universal players).
+        Scans player configs with a protocol_parent_id set and clears parent_ids
+        that point to player configs that no longer exist (e.g., deleted universal
+        players). A valid parent link also proves the player is a protocol child,
+        so a stale player_type (left behind by an aborted registration) is healed.
         """
         all_player_configs = self.mass.config.get(CONF_PLAYERS, {})
         for player_id, player_config in all_player_configs.items():
-            if player_config.get("player_type") != "protocol":
-                continue
-            values = player_config.get("values", {})
+            values = player_config.get("values") or {}
             parent_id = values.get(CONF_PROTOCOL_PARENT_ID)
             if not parent_id:
                 continue
@@ -2934,6 +2949,14 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 )
                 conf_key = f"{CONF_PLAYERS}/{player_id}/values/{CONF_PROTOCOL_PARENT_ID}"
                 self.mass.config.set(conf_key, None)
+                continue
+            if player_config.get("player_type") != PlayerType.PROTOCOL.value:
+                self.logger.info(
+                    "Repairing player type of %s - linked as protocol child of %s",
+                    player_id,
+                    parent_id,
+                )
+                self.mass.config.set_player_type(player_id, PlayerType.PROTOCOL)
 
     async def _fix_group_member_configs(self) -> None:
         """
