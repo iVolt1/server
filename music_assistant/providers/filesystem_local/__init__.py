@@ -325,9 +325,13 @@ class LocalFileSystemProvider(MusicProvider):
         """
         # for audiobooks and podcasts we just return all library items
         if self.media_content_type == "podcasts":
-            return await self.mass.music.podcasts.library_items(provider=self.instance_id)
+            return await self.mass.music.podcasts.library_items(
+                provider=self.instance_id, summary=False
+            )
         if self.media_content_type == "audiobooks":
-            return await self.mass.music.audiobooks.library_items(provider=self.instance_id)
+            return await self.mass.music.audiobooks.library_items(
+                provider=self.instance_id, summary=False
+            )
         items: list[MediaItemType | ItemMapping | BrowseFolder] = []
         item_path = path.split("://", 1)[1]
         if not item_path:
@@ -1115,6 +1119,17 @@ class LocalFileSystemProvider(MusicProvider):
         """
         try:
             self.logger.log(VERBOSE_LOG_LEVEL, "Processing: %s", item.relative_path)
+
+            if prev_checksum is not None:
+                # the file changed on disk: drop cached artwork derived from it
+                # (thumbnails, source bytes, palette) so re-read embedded art is
+                # served fresh, for both reference forms of the image path
+                await self.mass.metadata.invalidate_image_cache(
+                    self.instance_id, item.relative_path
+                )
+                await self.mass.metadata.invalidate_image_cache(
+                    self.instance_id, self._versioned_image_path(item.relative_path, prev_checksum)
+                )
 
             if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
                 tracks = await self._cue.parse_tracks(item)
