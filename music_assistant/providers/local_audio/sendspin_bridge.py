@@ -34,6 +34,7 @@ from .constants import (
     AUDIO_BACKEND_PULSEAUDIO,
     CACHE_CATEGORY_PREV_STATE,
     CONF_AUDIO_BACKEND,
+    CONF_PREWARM_STREAMS,
     DEFAULT_BUFFER_FRAMES,
     DEFAULT_PLAYER_VOLUME,
     DEVICE_UUID_NAMESPACE,
@@ -317,7 +318,18 @@ class SendspinLocalAudioBridge:
         # sync offset that persists for the session. Pre-warming means all
         # streams are already open and idle when the first play starts, so
         # play_at_us scheduling lands all bridges within a much tighter window.
-        if self.backend == "pulse" and self.pa_sink_name:
+        #
+        # Trade-off: a pre-warmed stream is an open (uncorked) sink-input, so
+        # the sink stays RUNNING while the provider is active — even with
+        # module-suspend-on-idle loaded. On PCI cards the idle cost is
+        # negligible; on USB devices (isochronous traffic) or virtualized
+        # setups it can matter, hence the config option to disable it and
+        # accept per-play stream-open latency instead.
+        if (
+            self.backend == "pulse"
+            and self.pa_sink_name
+            and bool(self.provider.config.get_value(CONF_PREWARM_STREAMS))
+        ):
             await self._prewarm_pa_stream()
 
     async def stop(self) -> None:
@@ -648,18 +660,6 @@ class SendspinLocalAudioBridge:
             stream = await self._get_pa_stream()
             self.logger.debug("PA stream ready for %s", self.pa_sink_name)
             assert stream is not None
-
-            # For remap sinks, run a suspend/resume on the master sink just
-            # before the first write. PA's suspend-on-idle can re-suspend the
-            # master during idle periods between plays, re-triggering the
-            # snd_ctxfi mmap stall. The topology-creation suspend/resume only
-            # runs once at startup — this per-play cycle ensures the master is
-            # in a clean DMA state when the stream first becomes active.
-            master_sink = self.device_info.get("master_device")
-            if master_sink and self.backend == "pulse":
-                await self.mass.loop.run_in_executor(
-                    None, suspend_resume_sink, master_sink
-                )
 
             first_chunk_written = False
 
