@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _COMPANION_PAIRING_DISABLED = 0x04
 _COMPANION_PAIRING_WITH_PIN = 0x4000
+# Bound the binary's `--check` probe. It normally answers instantly, but the first
+# execution of a freshly-fetched binary can stall (e.g. macOS Gatekeeper verification
+# of an unsigned download), and a wedged binary would otherwise block provider load or
+# a stream start indefinitely.
+_CLI_BINARY_CHECK_TIMEOUT = 15.0
 
 
 async def resolve_if_ip(mass: MusicAssistant, target_ip: str) -> str:
@@ -167,11 +172,32 @@ def is_apple_device(manufacturer: str, model: str) -> bool:
     )
 
 
+def get_decoded_property(discovery_info: AsyncServiceInfo, key: str) -> str | None:
+    """
+    Return an mDNS TXT property value by case-insensitive key.
+
+    TXT record keys are case-insensitive (RFC 6763) and zeroconf preserves the
+    casing as advertised on the wire, which differs per device (e.g. Companion
+    services advertise ``rpFl``, MRP services ``SystemBuildVersion``).
+
+    :param discovery_info: The mDNS service info to read the property from.
+    :param key: The TXT record key to look up (any casing).
+    """
+    decoded_properties = discovery_info.decoded_properties
+    if (value := decoded_properties.get(key)) is not None:
+        return value
+    folded_key = key.casefold()
+    for prop_key, prop_value in decoded_properties.items():
+        if prop_key.casefold() == folded_key:
+            return prop_value
+    return None
+
+
 def supports_companion_pairing(discovery_info: AsyncServiceInfo | None) -> bool:
     """Return whether a Companion service supports PIN pairing."""
     if discovery_info is None:
         return False
-    raw_flags = discovery_info.decoded_properties.get("rpfl")
+    raw_flags = get_decoded_property(discovery_info, "rpFl")
     if raw_flags is None:
         return False
     try:
@@ -210,11 +236,7 @@ def supports_mrp_service(discovery_info: AsyncServiceInfo | None) -> bool:
     """Return whether a native MRP service is usable."""
     if discovery_info is None or discovery_info.port is None:
         return False
-    build = (
-        discovery_info.decoded_properties.get("SystemBuildVersion")
-        or discovery_info.decoded_properties.get("systembuildversion")
-        or ""
-    )
+    build = get_decoded_property(discovery_info, "SystemBuildVersion") or ""
     match = re.match(r"^(\d+)[A-Z]", build)
     return match is None or int(match.group(1)) < 19
 
@@ -235,10 +257,18 @@ async def get_cli_binary() -> str:
     binary_path = os.path.join(base_path, binary_name)
 
     try:
-        returncode, output = await check_output(binary_path, "--check")
+        returncode, output = await check_output(
+            binary_path, "--check", timeout=_CLI_BINARY_CHECK_TIMEOUT
+        )
         output_str = output.strip().decode()
         if returncode == 0 and "cliairplay" in output_str and "check" in output_str:
             return binary_path
+    except TimeoutError:
+        msg = (
+            f"{binary_name} did not respond to --check within "
+            f"{_CLI_BINARY_CHECK_TIMEOUT:.0f}s (first-run verification or a wedged binary)"
+        )
+        raise RuntimeError(msg) from None
     except OSError:
         pass
 

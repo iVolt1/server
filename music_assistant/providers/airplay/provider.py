@@ -5,21 +5,29 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import socket
 import time
 from contextlib import suppress
-from ipaddress import ip_address
-from typing import Final, cast
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from typing import TYPE_CHECKING, Final, cast
 
 from music_assistant_models.enums import PlaybackState
-from zeroconf import ServiceStateChange
+from zeroconf import NonUniqueNameException, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceInfo
 
-from music_assistant.constants import CONF_PLAYERS, CONF_SYNC_ADJUST, VERBOSE_LOG_LEVEL
+from music_assistant.constants import (
+    CONF_LOG_LEVEL,
+    CONF_PLAYERS,
+    CONF_PROVIDERS,
+    CONF_SYNC_ADJUST,
+    VERBOSE_LOG_LEVEL,
+)
 from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.helpers.util import (
+    get_ip_addresses,
     get_ip_pton,
     get_primary_ip_address_from_zeroconf,
     select_free_port,
@@ -54,6 +62,9 @@ from .helpers import (
 from .player import AirPlayPlayer, GenericAirPlayPlayer
 from .sendspin_bridge import SendspinBridgeManager
 
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderConfig
+
 # Marker the `cliairplay --ptp-daemon` process prints once it has bound the
 # privileged PTP ports (UDP 319/320) and opened its control channel. Until this
 # line is seen the daemon is spawned but not yet able to serve shared-clock
@@ -64,6 +75,9 @@ PTP_DAEMON_READY_MARKER: Final[str] = "[PTP] daemon up"
 # session that starts while the daemon is still coming up (or never binds) pays
 # any of this, and only up to the moment readiness is signalled.
 PTP_DAEMON_READY_TIMEOUT: Final[float] = 3.0
+# Grace period after broadcasting a goodbye for a stale DACP registration before
+# re-registering the (name-stable) service, letting the cache flush the old record.
+DACP_RECLAIM_DELAY: Final[float] = 1.0
 
 
 class AirPlayProvider(PlayerProvider):
@@ -145,7 +159,9 @@ class AirPlayProvider(PlayerProvider):
 
     def handle_remote_command(self, player: AirPlayPlayer, command: AirPlayRemoteCommand) -> None:
         """Dispatch a transport command received from an AirPlay receiver."""
-        player_id = player.player_id
+        player_id = (
+            self.bridge_manager.get_transport_command_target(player.player_id) or player.player_id
+        )
         match command:
             case AirPlayRemoteCommand.PLAY:
                 # Some receivers echo play as confirmation of a command from MA.
@@ -163,6 +179,7 @@ class AirPlayProvider(PlayerProvider):
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
+        self._set_pyatv_log_level()
         self._companion_info_by_address: dict[str, AsyncServiceInfo] = {}
         self._mrp_info_by_address: dict[str, AsyncServiceInfo] = {}
 
@@ -191,7 +208,7 @@ class AirPlayProvider(PlayerProvider):
             },
             server=f"{socket.gethostname()}.local",
         )
-        await self.mass.discovery.aiozc.async_register_service(self._dacp_info)
+        await self._register_dacp_service()
 
         self._migrate_protocol_preferences()
         self._migrate_sync_adjust()
@@ -200,6 +217,14 @@ class AirPlayProvider(PlayerProvider):
         # AirPlay 2 streams attach to it (--ptp-shared) so multi-room sync groups
         # lock to a single grandmaster while UDP 319/320 is bound only once.
         await self._start_ptp_daemon()
+
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """Handle logic when the config is updated."""
+        await super().update_config(config, changed_keys)
+        # a log level(-only) change does not reload the provider,
+        # so realign pyatv's logger here
+        if f"values/{CONF_LOG_LEVEL}" in changed_keys:
+            self._set_pyatv_log_level()
 
     async def on_mdns_service_state_change(
         self, name: str, state_change: ServiceStateChange, info: AsyncServiceInfo | None
@@ -294,6 +319,16 @@ class AirPlayProvider(PlayerProvider):
         """Return AirplayPlayer by id."""
         return cast("AirPlayPlayer | None", self.mass.players.get_player(player_id))
 
+    def _set_pyatv_log_level(self) -> None:
+        """Keep pyatv's (very chatty) logging quiet unless verbose logging is enabled."""
+        # pyatv is extremely chatty at debug level (it logs every protocol
+        # message and heartbeat of each control connection), so only pass
+        # through its debug logging when verbose logging is enabled
+        if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+            logging.getLogger("pyatv").setLevel(logging.DEBUG)
+        else:
+            logging.getLogger("pyatv").setLevel(self.logger.level + 10)
+
     async def _setup_player(
         self, player_id: str, display_name: str, discovery_info: AsyncServiceInfo
     ) -> None:
@@ -301,6 +336,14 @@ class AirPlayProvider(PlayerProvider):
         # return early if player is disabled in config
         if not self.mass.config.get_raw_player_config_value(player_id, "enabled", True):
             self.logger.debug("Ignoring %s in discovery as it is disabled.", display_name)
+            return
+        # Filter out this server's own AirPlay Receiver (shairport-sync) instances
+        # before anything else: they must never register as AirPlay players.
+        if await self._is_own_airplay_receiver(display_name, discovery_info):
+            self.logger.debug(
+                "Ignoring %s in discovery: it is an AirPlay Receiver instance of this server",
+                display_name,
+            )
             return
         raop_discovery_info: AsyncServiceInfo | None = None
         airplay_discovery_info: AsyncServiceInfo | None = None
@@ -331,24 +374,6 @@ class AirPlayProvider(PlayerProvider):
         address = get_primary_ip_address_from_zeroconf(discovery_info, prefer_ipv6=prefer_ipv6)
         if not address:
             return  # should not happen, but guard just in case
-
-        # Filter out shairport-sync instances running on THIS Music Assistant server
-        # These are managed by the AirPlay Receiver provider, not the AirPlay provider
-        # We check both model name AND that it's a local address to avoid filtering
-        # shairport-sync instances running on other machines
-        if model == "ShairportSync":
-            # Check if this is a local address (loopback or matches our server's IP)
-            if ip_address(address).is_loopback or address == self.mass.streams.publish_ip:
-                # Only filter if the port matches one of MA's own AirPlay Receiver instances.
-                # This allows user-configured shairport-sync instances on the same machine
-                # to be used as AirPlay players (e.g., multiple audio outputs via shairport-sync).
-                receiver_ports = {
-                    port
-                    for prov in self.mass.get_provider_instances("airplay_receiver")
-                    if (port := getattr(prov, "airplay_port", None)) is not None
-                }
-                if discovery_info.port in receiver_ports:
-                    return
 
         # if we reach this point, all preflights are ok and we can create the player
         self.logger.debug("Discovered AirPlay device %s on %s", display_name, address)
@@ -437,6 +462,69 @@ class AirPlayProvider(PlayerProvider):
 
         # Set up Sendspin bridge for protocol linking (if Sendspin provider is available)
         await self._bridge_manager.evaluate_bridge(player)
+
+    async def _is_own_airplay_receiver(
+        self, display_name: str, discovery_info: AsyncServiceInfo
+    ) -> bool:
+        """
+        Return whether a discovered service is an AirPlay Receiver instance of this server.
+
+        :param display_name: The advertised device name (mdns name without any id prefix).
+        :param discovery_info: The mdns service info that triggered the discovery.
+        """
+        from music_assistant.providers.airplay_receiver import (  # noqa: PLC0415
+            CONF_AIRPLAY_NAME,
+            DEFAULT_AIRPLAY_NAME,
+            airplay_receiver_port,
+        )
+
+        # Collect the advertised names and ports of all configured AirPlay Receiver
+        # instances from raw config storage: this works regardless of provider load
+        # order at boot, when the receiver instances may not be running yet.
+        receiver_names: set[str] = set()
+        receiver_ports: set[int] = set()
+        for instance_id, raw_conf in self.mass.config.get(CONF_PROVIDERS, {}).items():
+            if not isinstance(raw_conf, dict) or raw_conf.get("domain") != "airplay_receiver":
+                continue
+            if not raw_conf.get("enabled", True):
+                continue
+            values = raw_conf.get("values")
+            airplay_name = values.get(CONF_AIRPLAY_NAME) if isinstance(values, dict) else None
+            receiver_names.add(str(airplay_name) if airplay_name else DEFAULT_AIRPLAY_NAME)
+            receiver_ports.add(airplay_receiver_port(str(instance_id)))
+        # running instances are authoritative for the actual daemon ports
+        for prov in self.mass.get_provider_instances("airplay_receiver"):
+            if (port := getattr(prov, "airplay_port", None)) is not None:
+                receiver_ports.add(port)
+        if not receiver_names and not receiver_ports:
+            return False
+
+        # The advertisement must originate from this host. shairport-sync's embedded
+        # mDNS responder announces address records for every host interface and which
+        # one resolves (first) is undefined, so match the full advertised address set
+        # against all of this host's addresses instead of a single picked address.
+        advertised_ips: set[IPv4Address | IPv6Address] = set()
+        for value in discovery_info.parsed_addresses():
+            with suppress(ValueError):
+                advertised_ips.add(ip_address(value))
+        if not advertised_ips:
+            return False
+        if not any(advertised_ip.is_loopback for advertised_ip in advertised_ips):
+            host_ips: set[IPv4Address | IPv6Address] = set()
+            for value in await get_ip_addresses(include_ipv6=True):
+                with suppress(ValueError):
+                    host_ips.add(ip_address(value))
+            if advertised_ips.isdisjoint(host_ips):
+                return False
+
+        # Match by advertised name (robust even when the TXT record did not resolve).
+        if display_name in receiver_names:
+            return True
+        # Match by port, gated on the shairport-sync model so user-run AirPlay
+        # receivers on this machine (e.g. the macOS built-in receiver, which also
+        # listens on port 7000) remain usable as players when their name differs.
+        _, model = get_model_info(discovery_info)
+        return model == "ShairportSync" and discovery_info.port in receiver_ports
 
     async def _handle_companion_service_state_change(
         self,
@@ -635,6 +723,30 @@ class AirPlayProvider(PlayerProvider):
             self.instance_id, CONF_PROTOCOL_MIGRATION_MARKER, True
         )
 
+    async def _register_dacp_service(self) -> None:
+        """
+        Register the DACP ActiveRemote mDNS service, reclaiming a stale name if needed.
+
+        The service name is derived from the (persistent) server id, so it is identical
+        across every reload and restart. A previous registration that was not cleanly
+        torn down - a reload racing a slow initial load, or a leftover from a prior crash -
+        keeps the same name in the zeroconf cache and makes a plain register raise
+        NonUniqueNameException. In that case we broadcast a goodbye for the name to flush
+        the stale record, then register again.
+        """
+        aiozc = self.mass.discovery.aiozc
+        try:
+            await aiozc.async_register_service(self._dacp_info)
+            return
+        except NonUniqueNameException:
+            self.logger.debug(
+                "DACP service %s already advertised - reclaiming stale registration",
+                self._dacp_info.name,
+            )
+        await aiozc.async_unregister_service(self._dacp_info)
+        await asyncio.sleep(DACP_RECLAIM_DELAY)
+        await aiozc.async_register_service(self._dacp_info)
+
     async def _start_ptp_daemon(self) -> None:
         """Spawn the shared PTP clock daemon (cliairplay --ptp-daemon)."""
         try:
@@ -653,6 +765,11 @@ class AirPlayProvider(PlayerProvider):
         bind_ip = str(self.mass.streams.bind_ip)
         if bind_ip not in ("0.0.0.0", "::", ""):
             args += ["--if", bind_ip]
+        # The daemon runs quiet by default; only a verbose session turns on its
+        # per-packet PTP tracing (Announce/Sync/Delay_Req), so a normal debug
+        # session does not flood the log with timing chatter.
+        if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
+            args += ["--debug", "10"]
         daemon = AsyncProcess(args, stdout=True, stderr=True, name="cliairplay-ptp-daemon")
         # (Re)gate readiness for this daemon instance: not ready until a reader
         # sees the "daemon up" line (a restart clears any previous readiness).
@@ -683,8 +800,16 @@ class AirPlayProvider(PlayerProvider):
                     self._handle_ptp_daemon_line(line)
 
     def _handle_ptp_daemon_line(self, line: str) -> None:
-        """Debug-log a PTP daemon output line and detect its readiness signal."""
-        self.logger.debug("PTP daemon: %s", line)
+        """Log a PTP daemon output line and detect its readiness signal."""
+        # Routine daemon output is verbose-only so it never floods a user's log
+        # (the per-packet timing trace only runs at verbose in the first place).
+        # The daemon tags no log levels, so a genuine problem is recognised by
+        # keyword and promoted to a warning that stays visible at normal levels.
+        lowered = line.lower()
+        if any(marker in lowered for marker in ("error", "cannot", "failed", "unable")):
+            self.logger.warning("PTP daemon: %s", line)
+        else:
+            self.logger.log(VERBOSE_LOG_LEVEL, "PTP daemon: %s", line)
         # The readiness marker is matched on either pipe: the daemon's diagnostic
         # output is not contractually stdout-vs-stderr, so both readers feed this
         # handler and setting the event is idempotent.

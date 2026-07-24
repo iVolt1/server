@@ -5,10 +5,49 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from music_assistant.providers.airplay.helpers import (
+    _CLI_BINARY_CHECK_TIMEOUT,
     get_cli_binary,
+    get_decoded_property,
     serialize_txt_records,
     supports_airplay2,
+    supports_companion_pairing,
 )
+
+
+def test_get_decoded_property_matches_case_insensitively() -> None:
+    """TXT record keys resolve regardless of the casing advertised on the wire."""
+    discovery_info = MagicMock()
+    discovery_info.decoded_properties = {"rpFl": "0x367A2", "SystemBuildVersion": "21K69"}
+
+    assert get_decoded_property(discovery_info, "rpFl") == "0x367A2"
+    assert get_decoded_property(discovery_info, "rpfl") == "0x367A2"
+    assert get_decoded_property(discovery_info, "systembuildversion") == "21K69"
+    assert get_decoded_property(discovery_info, "missing") is None
+
+
+@pytest.mark.parametrize(
+    ("properties", "expected"),
+    [
+        # Apple TV advertises its flags under the mixed-case wire key "rpFl"
+        ({"rpFl": "0x367A2"}, True),
+        # HomePod: PIN pairing not supported
+        ({"rpFl": "0x62792"}, False),
+        # pairing explicitly disabled
+        ({"rpFl": "0x367A6"}, False),
+        ({"rpFl": "invalid"}, False),
+        ({}, False),
+    ],
+)
+def test_supports_companion_pairing(properties: dict[str, str], expected: bool) -> None:
+    """Companion PIN pairing support is read from the wire-cased rpFl flags."""
+    discovery_info = MagicMock()
+    discovery_info.decoded_properties = properties
+    assert supports_companion_pairing(discovery_info) is expected
+
+
+def test_supports_companion_pairing_without_service() -> None:
+    """A device without a Companion service is never pairable."""
+    assert supports_companion_pairing(None) is False
 
 
 @pytest.mark.parametrize(
@@ -84,4 +123,19 @@ async def test_get_cli_binary_uses_release_asset_name(
     result = await get_cli_binary()
 
     assert result.endswith(f"/bin/{expected_name}")
-    check_output.assert_awaited_once_with(result, "--check")
+    check_output.assert_awaited_once_with(result, "--check", timeout=_CLI_BINARY_CHECK_TIMEOUT)
+
+
+async def test_get_cli_binary_raises_when_check_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binary that never answers --check surfaces as RuntimeError, not a hang."""
+    check_output = AsyncMock(side_effect=TimeoutError)
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.helpers.platform.system", lambda: "Darwin"
+    )
+    monkeypatch.setattr(
+        "music_assistant.providers.airplay.helpers.platform.machine", lambda: "aarch64"
+    )
+    monkeypatch.setattr("music_assistant.providers.airplay.helpers.check_output", check_output)
+
+    with pytest.raises(RuntimeError, match="did not respond to --check"):
+        await get_cli_binary()
