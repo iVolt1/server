@@ -75,6 +75,7 @@ from music_assistant.controllers.tasks.context import (
     update_current_task_progress_from_index,
     update_current_task_progress_text,
 )
+from music_assistant.helpers import lyrics
 from music_assistant.helpers.compare import compare_strings, create_safe_string
 from music_assistant.helpers.json import SerializableType, json_loads
 from music_assistant.helpers.playlists import parse_m3u, parse_pls
@@ -131,7 +132,7 @@ from .helpers import (
 from .parsers import parse_album_nfo
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -157,40 +158,6 @@ async def setup(
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
     return LocalFileSystemProvider(mass, manifest, config)
-
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
-) -> tuple[ConfigEntry, ...]:
-    """
-    Return Config entries to setup this provider.
-
-    instance_id: id of an existing provider instance (None if new instance setup).
-    action: [optional] action key called from config entries UI.
-    values: the (intermediate) raw values for config entries sent with the action.
-    """
-    # content type and path are collected by the setup flow; surface the (immutable)
-    # content type read-only so the sync options' depends_on chains still resolve
-    content_type = "music"
-    if instance_id:
-        # read the persisted value so the depends_on chains resolve correctly
-        # even when the provider (instance) is not currently loaded
-        content_type = str(
-            mass.config.get_provider_setup_value(instance_id, CONF_CONTENT_TYPE, "music")
-        )
-    return (
-        ConfigEntry(key=CONF_CONTENT_TYPE, type=ConfigEntryType.LABEL, value=content_type),
-        CONF_ENTRY_MISSING_ALBUM_ARTIST,
-        CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS,
-        CONF_ENTRY_LIBRARY_SYNC_TRACKS,
-        CONF_ENTRY_LIBRARY_SYNC_PLAYLISTS,
-        CONF_ENTRY_LIBRARY_SYNC_PODCASTS,
-        CONF_ENTRY_LIBRARY_SYNC_AUDIOBOOKS,
-        CONF_ENTRY_PROPAGATE_GENRES,
-    )
 
 
 class LocalFileSystemProvider(MusicProvider):
@@ -225,6 +192,22 @@ class LocalFileSystemProvider(MusicProvider):
         self._sync_playlists: bool = True
         self.media_content_type = cast("str", self.get_setup_value(CONF_CONTENT_TYPE))
         self._cue = CueSheetHandler(self)
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        # content type and path are collected by the setup flow; surface the (immutable)
+        # content type read-only so the sync options' depends_on chains still resolve
+        content_type = str(self.get_setup_value(CONF_CONTENT_TYPE, "music"))
+        return (
+            ConfigEntry(key=CONF_CONTENT_TYPE, type=ConfigEntryType.LABEL, value=content_type),
+            CONF_ENTRY_MISSING_ALBUM_ARTIST,
+            CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS,
+            CONF_ENTRY_LIBRARY_SYNC_TRACKS,
+            CONF_ENTRY_LIBRARY_SYNC_PLAYLISTS,
+            CONF_ENTRY_LIBRARY_SYNC_PODCASTS,
+            CONF_ENTRY_LIBRARY_SYNC_AUDIOBOOKS,
+            CONF_ENTRY_PROPAGATE_GENRES,
+        )
 
     @property
     def supported_features(self) -> set[ProviderFeature]:
@@ -1512,6 +1495,8 @@ class LocalFileSystemProvider(MusicProvider):
                     lrc_path,
                     str(err),
                 )
+        elif syn_lyrics := tags.synchronized_lyrics:
+            track.metadata.lrc_lyrics = lyrics.convert_to_lrc_lyrics(syn_lyrics)
 
         return track
 

@@ -6,8 +6,6 @@ import json
 from typing import TYPE_CHECKING, cast
 from unittest import mock
 
-from music_assistant.providers.yandex_music import get_config_entries
-from music_assistant.providers.yandex_music.auth import PAGE_CONFIG
 from music_assistant.providers.yandex_music.constants import (
     QUALITY_BALANCED,
     QUALITY_EFFICIENT,
@@ -39,7 +37,11 @@ def _load_strings() -> dict[str, dict[str, object]]:
 
 async def _get_entries() -> tuple[ConfigEntry, ...]:
     """Collect the provider option config entries (auth now lives in the setup flow)."""
-    return await get_config_entries(mock.MagicMock(), None, None, {})
+    provider = mock.MagicMock(spec=YandexMusicProvider)
+    provider.get_config_value = mock.MagicMock(
+        side_effect=lambda _key, default=None, **_kw: default
+    )
+    return await YandexMusicProvider.get_config_entries(provider)
 
 
 async def test_strings_json_covers_config_entries() -> None:
@@ -89,24 +91,6 @@ async def test_quality_options_use_value_first_signature() -> None:
         QUALITY_HIGH,
         QUALITY_SUPERB,
     }
-
-
-async def test_strings_json_authors_device_page_keys() -> None:
-    """
-    Every device-code page string is authored under page.device_code.
-
-    The HTML ``lang`` attribute is presentation plumbing, not a
-    translatable string, so it stays code-side.
-    """
-    strings = _load_strings()
-    page = strings["page"]
-    assert isinstance(page, dict)
-    authored = page["device_code"]
-    assert isinstance(authored, dict)
-    # "context" is the optional provider paragraph — unused (empty) for this
-    # provider, so it is not authored in strings.json either.
-    expected = set(PAGE_CONFIG.strings_for("en")) - {"lang", "context"}
-    assert set(authored) == expected
 
 
 def _media_label_provider(authored: str | None) -> mock.MagicMock:

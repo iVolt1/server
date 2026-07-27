@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
-from urllib.parse import urlencode
 
 from libopensonic import AsyncConnection as SonicConnection
 from libopensonic.errors import (
@@ -15,7 +14,8 @@ from libopensonic.errors import (
     SonicError,
 )
 from libopensonic.media import PodcastChannel
-from music_assistant_models.enums import ContentType, MediaType, StreamType
+from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType, StreamType
 from music_assistant_models.errors import (
     ActionUnavailable,
     LoginFailed,
@@ -107,6 +107,60 @@ class OpenSonicProvider(MusicProvider):
     _id_lyrics: bool = False
     _raw_file: bool = True
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to setup this provider."""
+        return (
+            ConfigEntry(
+                key=CONF_ENABLE_PODCASTS,
+                type=ConfigEntryType.BOOLEAN,
+                required=True,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_ENABLE_LEGACY_AUTH,
+                type=ConfigEntryType.BOOLEAN,
+                required=True,
+                default_value=False,
+            ),
+            ConfigEntry(
+                key=CONF_RECO_FAVES,
+                type=ConfigEntryType.BOOLEAN,
+                required=True,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_NEW_ALBUMS,
+                type=ConfigEntryType.BOOLEAN,
+                required=True,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_PLAYED_ALBUMS,
+                type=ConfigEntryType.BOOLEAN,
+                required=True,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_RECO_SIZE,
+                type=ConfigEntryType.INTEGER,
+                required=True,
+                default_value=10,
+            ),
+            ConfigEntry(
+                key=CONF_RAW_FILE,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_PAGE_SIZE,
+                type=ConfigEntryType.INTEGER,
+                required=True,
+                default_value=200,
+                advanced=True,
+            ),
+        )
+
     async def handle_async_init(self) -> None:
         """Set up the music provider and test the connection."""
         port = self.get_setup_value(CONF_PORT)
@@ -123,6 +177,7 @@ class OpenSonicProvider(MusicProvider):
             legacy_auth=bool(self.config.get_value(CONF_ENABLE_LEGACY_AUTH)),
             port=port,
             server_path=str(path),
+            use_get=True,
             app_name="Music Assistant",
         )
 
@@ -143,25 +198,11 @@ class OpenSonicProvider(MusicProvider):
 
         try:
             extensions: list[OpenSubsonicExtension] = await self.conn.get_open_subsonic_extensions()
-        except OSError as e:
-            msg = "Failed to query server for OpenSubsonic extensions"
-            raise LoginFailed(
-                msg, translation_key="extension_failure", translation_owner=self.translation_owner
-            ) from e
-
-        formpost_supported = False
-        for entry in extensions:
-            if entry.name == "formpost":
-                formpost_supported = True
-            if entry.name == "songLyrics":
-                self._id_lyrics = True
-        if not formpost_supported:
-            msg = (
-                "Server does not support the 'formpost' OpenSubsonic extension, which is required."
-            )
-            raise LoginFailed(
-                msg, translation_key="formpost_missing", translation_owner=self.translation_owner
-            )
+            for entry in extensions:
+                if entry.name == "songLyrics":
+                    self._id_lyrics = True
+        except OSError:
+            self.logger.info("Failed to query server for OpenSubsonic extensions")
 
         self._enable_podcasts = bool(self.config.get_value(CONF_ENABLE_PODCASTS))
         self._show_faves = bool(self.config.get_value(CONF_RECO_FAVES))
@@ -762,16 +803,8 @@ class OpenSonicProvider(MusicProvider):
             msg = f"Unsupported media type encountered '{media_type}'"
             raise UnsupportedFeaturedException(msg)
 
-        # The stream URL carries no query string; id/auth/format all travel in the POST body
-        # so they never end up in proxy logs, server logs, or a `ps aux` listing. ffmpeg is
-        # handed the URL as its input and re-sends this same body on every Range-based reconnect
-        # it issues while seeking, so seeking is handled entirely by ffmpeg's own demuxer rather
-        # than the transcodeOffset extension.
         fmat = "raw" if self._raw_file else None
-        url, params = self.conn.get_stream_url(item.id, tformat=fmat, estimate_length=True)
-        # ffmpeg's -post_data is a binary AVOption: it must be given as a hex string of the
-        # raw bytes, a plain string value is silently rejected ("Invalid argument").
-        post_data = urlencode(params).encode().hex()
+        url, _ = self.conn.get_stream_url(item.id, tformat=fmat, estimate_length=True)
 
         return StreamDetails(
             item_id=item.id,
@@ -787,14 +820,6 @@ class OpenSonicProvider(MusicProvider):
             ),
             stream_type=StreamType.HTTP,
             path=url,
-            extra_input_args=[
-                "-method",
-                "POST",
-                "-content_type",
-                "application/x-www-form-urlencoded",
-                "-post_data",
-                post_data,
-            ],
             duration=item.duration or 0,
         )
 

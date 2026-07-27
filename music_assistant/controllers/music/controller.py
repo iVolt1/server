@@ -157,13 +157,9 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             raise RuntimeError("Database not initialized")
         return self._database
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict[str, ConfigValueType] | None = None,
-    ) -> tuple[ConfigEntry, ...]:
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return all Config Entries for this core module (if any)."""
-        entries: tuple[ConfigEntry, ...] = (
+        return (
             ConfigEntry(
                 key=CONF_RESET_DB,
                 type=ConfigEntryType.ACTION,
@@ -171,20 +167,24 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 advanced=True,
             ),
         )
+
+    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
+        """Handle a one-shot action button press and re-render the config entries."""
         if action == CONF_RESET_DB:
             await self._reset_database()
             await self.mass.cache.clear()
             await self.start_sync()
-            entries = (
-                *entries,
+            return (
+                *await self.get_config_entries(),
+                # distinct key so the result label doesn't collide with the action's label
                 ConfigEntry(
-                    key=CONF_RESET_DB,
+                    key="reset_db_result",
                     type=ConfigEntryType.LABEL,
-                    # distinct key so the result label doesn't collide with the action's label
-                    translation_key="reset_db_result",
+                    category="generic",
+                    advanced=True,
                 ),
             )
-        return entries
+        return await super().handle_config_action(action)
 
     async def setup(self, config: CoreConfig) -> None:
         """Async initialize of module."""
@@ -990,7 +990,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         item_id: str,
         provider_instance_id_or_domain: str,
     ) -> MediaItemType | None:
-        """Get single library music item by id and media type."""
+        """Get the library item for the given provider item, if present."""
         ctrl = self.get_controller(media_type)
         return await ctrl.get_library_item_by_prov_id(
             item_id=item_id,

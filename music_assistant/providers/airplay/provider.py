@@ -13,14 +13,13 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import TYPE_CHECKING, Final, cast
 
 from music_assistant_models.enums import PlaybackState
+from music_assistant_models.errors import MediaNotFoundError
 from zeroconf import NonUniqueNameException, ServiceStateChange
 from zeroconf.asyncio import AsyncServiceInfo
 
 from music_assistant.constants import (
     CONF_LOG_LEVEL,
-    CONF_PLAYERS,
     CONF_PROVIDERS,
-    CONF_SYNC_ADJUST,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.datetime import utc
@@ -38,14 +37,10 @@ from .constants import (
     AIRPLAY_DISCOVERY_TYPE,
     AIRPLAY_VOLUME_MUTE,
     COMPANION_DISCOVERY_TYPE,
-    CONF_FORCE_RAOP,
     CONF_IGNORE_VOLUME,
-    CONF_LEGACY_AIRPLAY_PROTOCOL,
-    CONF_LEGACY_FORCE_RAOP,
-    CONF_PROTOCOL_MIGRATION_MARKER,
     CONF_STORED_VOLUME,
-    CONF_SYNC_ADJUST_RESET_MARKER,
     DACP_DISCOVERY_TYPE,
+    EXTERNAL_ARTWORK_PATH_PREFIX,
     FALLBACK_VOLUME,
     MRP_DISCOVERY_TYPE,
     RAOP_DISCOVERY_TYPE,
@@ -59,12 +54,13 @@ from .helpers import (
     get_cli_binary,
     get_model_info,
     is_apple_device,
+    probe_audio_formats,
 )
 from .player import AirPlayPlayer, GenericAirPlayPlayer
 from .sendspin_bridge import SendspinBridgeManager
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 
 # Marker the `cliairplay --ptp-daemon` process prints once it has bound the
 # privileged PTP ports (UDP 319/320) and opened its control channel. Until this
@@ -179,6 +175,10 @@ class AirPlayProvider(PlayerProvider):
             case AirPlayRemoteCommand.PREVIOUS:
                 self.mass.create_task(self.mass.players.cmd_previous_track(player_id))
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return ()
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self._set_pyatv_log_level()
@@ -214,9 +214,6 @@ class AirPlayProvider(PlayerProvider):
             server=f"{socket.gethostname()}.local",
         )
         await self._register_dacp_service()
-
-        self._migrate_protocol_preferences()
-        self._migrate_sync_adjust()
 
         # Run one shared PTP clock daemon for the provider lifetime: all native
         # AirPlay 2 streams attach to it (--ptp-shared) so multi-room sync groups
@@ -331,6 +328,27 @@ class AirPlayProvider(PlayerProvider):
     def get_player(self, player_id: str) -> AirPlayPlayer | None:
         """Return AirplayPlayer by id."""
         return cast("AirPlayPlayer | None", self.mass.players.get_player(player_id))
+
+    async def resolve_image(self, path: str) -> bytes:
+        """
+        Resolve artwork for the current external media on an Apple device.
+
+        :param path: AirPlay artwork path produced for the image proxy.
+        :return: Raw artwork bytes.
+        :raises MediaNotFoundError: If the artwork is invalid, stale, or unavailable.
+        """
+        try:
+            prefix, player_id, artwork_id = path.split("/", 2)
+        except ValueError as err:
+            raise MediaNotFoundError("Invalid AirPlay artwork path") from err
+        player = self.get_player(player_id)
+        if (
+            prefix != EXTERNAL_ARTWORK_PATH_PREFIX
+            or not artwork_id
+            or not isinstance(player, AirPlayControlPlayer)
+        ):
+            raise MediaNotFoundError("AirPlay artwork is unavailable")
+        return await player.async_get_external_artwork(artwork_id)
 
     def _set_pyatv_log_level(self) -> None:
         """Keep pyatv's (very chatty) logging quiet unless verbose logging is enabled."""
@@ -473,12 +491,26 @@ class AirPlayProvider(PlayerProvider):
             )
         await self.mass.players.register(player)
 
+        # A receiver only publishes its audio formats (and so whether it can do
+        # 24-bit) in its /info response, never in its mDNS records, so ask it
+        # directly. Off the discovery path: mdns callbacks are serialized per
+        # provider, so an unreachable device must not hold up the next player.
+        if airplay_discovery_info and airplay_discovery_info.port:
+            self.mass.create_task(
+                self._learn_audio_formats(player, address, airplay_discovery_info.port)
+            )
+
         # Set up Sendspin bridge for protocol linking (if Sendspin provider is available)
         await self._bridge_manager.evaluate_bridge(player)
 
         # Track control players (Apple TVs) for dashboard eligibility
         if isinstance(player, AirPlayControlPlayer):
             self.dashboards.setup_player(player)
+
+    async def _learn_audio_formats(self, player: AirPlayPlayer, host: str, port: int) -> None:
+        """Read the audio formats a receiver advertises, so 24-bit can be auto-enabled."""
+        if formats := await probe_audio_formats(self.mass, host, port):
+            player.advertised_audio_formats = formats
 
     async def _is_own_airplay_receiver(
         self, display_name: str, discovery_info: AsyncServiceInfo
@@ -505,8 +537,12 @@ class AirPlayProvider(PlayerProvider):
                 continue
             if not raw_conf.get("enabled", True):
                 continue
+            setup_name = self.mass.config.get_provider_setup_value(
+                str(instance_id), CONF_AIRPLAY_NAME
+            )
             values = raw_conf.get("values")
-            airplay_name = values.get(CONF_AIRPLAY_NAME) if isinstance(values, dict) else None
+            legacy_name = values.get(CONF_AIRPLAY_NAME) if isinstance(values, dict) else None
+            airplay_name = setup_name or legacy_name
             receiver_names.add(str(airplay_name) if airplay_name else DEFAULT_AIRPLAY_NAME)
             receiver_ports.add(airplay_receiver_port(str(instance_id)))
         # running instances are authoritative for the actual daemon ports
@@ -683,62 +719,6 @@ class AirPlayProvider(PlayerProvider):
             if discovery_info is not None
             for address in discovery_info.parsed_addresses()
         }
-
-    def _migrate_sync_adjust(self) -> None:
-        """One-time reset of persisted sync_adjust values on this provider's players."""
-        # The unified cliairplay binary uses a different timing model than the old
-        # implementation, so offsets calibrated against it would now break sync
-        # instead of fixing it. Reset them once; a provider-level marker prevents
-        # wiping adjustments the user makes after the migration.
-        if self.mass.config.get_raw_provider_config_value(
-            self.instance_id, CONF_SYNC_ADJUST_RESET_MARKER, False
-        ):
-            return
-        for raw_conf in list(self.mass.config.get(CONF_PLAYERS, {}).values()):
-            if not isinstance(raw_conf, dict) or raw_conf.get("provider") != self.instance_id:
-                continue
-            if not (player_id := raw_conf.get("player_id")):
-                continue
-            stored = self.mass.config.get_raw_player_config_value(player_id, CONF_SYNC_ADJUST, 0)
-            if not stored:
-                continue
-            self.logger.warning(
-                "Resetting sync_adjust of %sms for player %s: the unified AirPlay engine "
-                "uses a different timing model, so corrections calibrated against the old "
-                "implementation no longer apply",
-                stored,
-                player_id,
-            )
-            self.mass.config.set_raw_player_config_value(player_id, CONF_SYNC_ADJUST, 0)
-        self.mass.config.set_raw_provider_config_value(
-            self.instance_id, CONF_SYNC_ADJUST_RESET_MARKER, True
-        )
-
-    def _migrate_protocol_preferences(self) -> None:
-        """Preserve explicit RAOP selections from the legacy protocol setting."""
-        if self.mass.config.get_raw_provider_config_value(
-            self.instance_id, CONF_PROTOCOL_MIGRATION_MARKER, False
-        ):
-            return
-        for raw_conf in list(self.mass.config.get(CONF_PLAYERS, {}).values()):
-            if not isinstance(raw_conf, dict) or raw_conf.get("provider") != self.instance_id:
-                continue
-            if not (player_id := raw_conf.get("player_id")):
-                continue
-            legacy_protocol = self.mass.config.get_raw_player_config_value(
-                player_id, CONF_LEGACY_AIRPLAY_PROTOCOL, 0
-            )
-            force_raop = self.mass.config.get_raw_player_config_value(
-                player_id, CONF_FORCE_RAOP, None
-            )
-            if legacy_protocol == StreamingProtocol.RAOP and force_raop is None:
-                self.mass.config.set_raw_player_config_value(player_id, CONF_FORCE_RAOP, True)
-                self.mass.config.set_raw_player_config_value(
-                    player_id, CONF_LEGACY_FORCE_RAOP, True
-                )
-        self.mass.config.set_raw_provider_config_value(
-            self.instance_id, CONF_PROTOCOL_MIGRATION_MARKER, True
-        )
 
     async def _register_dacp_service(self) -> None:
         """
