@@ -60,7 +60,7 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -107,68 +107,6 @@ async def setup(
     return LocalAudioInProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,  # noqa: ARG001
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """
-    Return config entries to set up this provider.
-
-    Only two entries are needed: the PA server address (auto-detected by
-    default) and an optional toggle to include sink monitor sources.
-    All audio sources are discovered and presented automatically with no
-    per-source configuration required.
-    """
-    pa_server_options: list[ConfigValueOption] = [
-        ConfigValueOption("", "(auto-detect)"),
-    ]
-    for path in _PA_SOCKET_CANDIDATES:
-        if os.path.exists(path):
-            uri = f"unix:{path}"
-            pa_server_options.append(ConfigValueOption(uri, uri))
-
-    # Populate the source dropdown from pactl using whatever PA server
-    # is currently configured (or auto-detected).  Gracefully returns an
-    # empty list if PA is unreachable at config time.
-    pa_server = str(values.get(CONF_PA_SERVER, "") if values else "")
-    include_monitors = bool(values.get(CONF_INCLUDE_MONITORS, False) if values else False)
-    discovered = await _enumerate_pa_sources(pa_server, include_monitors=include_monitors) or []
-
-    source_options: list[ConfigValueOption] = [
-        ConfigValueOption("", "(all sources)"),
-    ]
-    for src in discovered:
-        source_options.append(ConfigValueOption(src.name, src.display_label))
-
-    return (
-        ConfigEntry(
-            key=CONF_PA_SERVER,
-            type=ConfigEntryType.STRING,
-            label=CONF_PA_SERVER,
-            required=False,
-            default_value="",
-            options=pa_server_options,
-        ),
-        ConfigEntry(
-            key=CONF_INCLUDE_MONITORS,
-            type=ConfigEntryType.BOOLEAN,
-            label=CONF_INCLUDE_MONITORS,
-            required=False,
-            default_value=False,
-        ),
-        ConfigEntry(
-            key=CONF_SOURCE_NAME,
-            type=ConfigEntryType.STRING,
-            label=CONF_SOURCE_NAME,
-            required=False,
-            default_value="",
-            options=source_options,
-        ),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Internal data class for a discovered PA source
 # ---------------------------------------------------------------------------
@@ -198,6 +136,58 @@ class _PASource:
 # ---------------------------------------------------------------------------
 class LocalAudioInProvider(PluginProvider):
     """Plugin provider that auto-discovers and streams PulseAudio sources."""
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """
+        Return config entries for this provider instance.
+
+        The source dropdown is populated live from pactl using the currently
+        configured PA server address, so it reflects the actual sources
+        available at config-open time.
+        """
+        pa_server_options: list[ConfigValueOption] = [
+            ConfigValueOption("", "(auto-detect)"),
+        ]
+        for path in _PA_SOCKET_CANDIDATES:
+            if os.path.exists(path):
+                uri = f"unix:{path}"
+                pa_server_options.append(ConfigValueOption(uri, uri))
+
+        pa_server = cast("str", self.config.get_value(CONF_PA_SERVER)) or ""
+        include_monitors = bool(self.config.get_value(CONF_INCLUDE_MONITORS))
+        discovered = await _enumerate_pa_sources(pa_server, include_monitors=include_monitors) or []
+
+        source_options: list[ConfigValueOption] = [
+            ConfigValueOption("", "(all sources)"),
+        ]
+        for src in discovered:
+            source_options.append(ConfigValueOption(src.name, src.display_label))
+
+        return (
+            ConfigEntry(
+                key=CONF_PA_SERVER,
+                type=ConfigEntryType.STRING,
+                label=CONF_PA_SERVER,
+                required=False,
+                default_value="",
+                options=pa_server_options,
+            ),
+            ConfigEntry(
+                key=CONF_INCLUDE_MONITORS,
+                type=ConfigEntryType.BOOLEAN,
+                label=CONF_INCLUDE_MONITORS,
+                required=False,
+                default_value=False,
+            ),
+            ConfigEntry(
+                key=CONF_SOURCE_NAME,
+                type=ConfigEntryType.STRING,
+                label=CONF_SOURCE_NAME,
+                required=False,
+                default_value="",
+                options=source_options,
+            ),
+        )
 
     async def handle_async_init(self) -> None:
         """Initialise: resolve PA server address and log discovered sources."""
