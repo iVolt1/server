@@ -57,6 +57,7 @@ if sys.platform == "linux":
         compute_remap_topology,
         connector_label,
         normalize_card_name,
+        remap_zone_suffix,
     )
 
 if TYPE_CHECKING:
@@ -852,7 +853,31 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
                         device.get("description", device_name),
                     )
                     continue
-                device_map[get_device_uuid(device_name, device.get("hostapi", 0))] = device
+                # Identity is derived from the remap sink's master_device
+                # (a property PulseAudio sets natively on every remap sink —
+                # not something we write ourselves, so no proplist-parsing
+                # risk) plus its zone suffix (recovered via
+                # remap_topology.remap_zone_suffix against this sink's own
+                # name — reliable since these suffixes are literal strings
+                # this module controls). This is independent of the sink's
+                # card-index/connector-label naming, which can change for
+                # reasons unrelated to this specific device (e.g. a second
+                # identical card appearing shifts the first's index) and
+                # would otherwise orphan the existing player and silently
+                # create a new one in its place. Sinks with no
+                # master_device or unrecognized suffix (raw master sinks —
+                # 2ch-or-fewer devices, or a multichannel master not yet
+                # covered by remap topology) fall back to device_name,
+                # which PulseAudio generates from the physical bus path and
+                # is already stable on its own.
+                master_device: str | None = device.get("master_device")
+                zone_suffix = remap_zone_suffix(device_name)
+                identity_seed: str = (
+                    f"{master_device}::{zone_suffix}"
+                    if master_device and zone_suffix
+                    else device_name
+                )
+                device_map[get_device_uuid(identity_seed, device.get("hostapi", 0))] = device
             self._devices = device_map
 
             for device_uuid, device in self._devices.items():
