@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+import hashlib
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
@@ -95,6 +96,29 @@ def _now_us() -> int:
 def get_device_uuid(device_name: str, hostapi_index: int) -> str:
     """Generate a stable UUID for a local audio device."""
     return str(uuid.uuid5(DEVICE_UUID_NAMESPACE, f"{device_name}:{hostapi_index}"))
+
+
+def short_hardware_tag(bus_identity: str, length: int = 4) -> str:
+    """
+    Short, stable hex tag derived from a physical identity string (e.g.
+    master_device) for display/grouping purposes only — e.g. hinting that
+    several players (front_stereo, rear_stereo, multichannel_stereo, ...)
+    all originate from the same physical card, without needing the full
+    card_name/label string repeated in each one.
+
+    NOT a replacement for get_device_uuid()'s player identity — that stays
+    the actual player_id mechanism. A short tag has real, non-negligible
+    collision risk (4 hex digits = 65,536 possible values) and is only
+    appropriate as a cosmetic hint, never as anything relied on to be
+    truly unique.
+
+    Uses hashlib.sha1 rather than the built-in hash() — Python's built-in
+    hash() is randomized per process (PYTHONHASHSEED) unless explicitly
+    disabled, so it would produce a different tag every restart, defeating
+    the entire point of a stable tag.
+    """
+    digest = hashlib.sha1(bus_identity.encode("utf-8")).hexdigest()
+    return digest[:length]
 
 
 class SendspinLocalAudioBridge:
@@ -897,26 +921,35 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
     @staticmethod
     def _labeled_display_name(device: dict[str, Any]) -> str:
         """
-        Return a raw master sink's display name with a connector-type label applied.
+        Return a device's display name with connector-type and hardware-card labels applied.
 
-        Applies the same hdmi/analog/usb labeling used for remap-sink names
-        (see remap_topology.connector_label) to a raw master sink that
-        registers as its own player — a 2-channel-or-fewer card, or a
-        multichannel card not yet covered by remap-sink topology — so it
+        Applies hdmi/analog/usb labeling (see remap_topology.connector_label)
+        so a raw master sink registering as its own player — a 2ch-or-fewer
+        card, or a multichannel card not yet covered by remap-sink topology —
         doesn't rely solely on PulseAudio's own per-profile description,
         which gives no distinguishing signal when two identical cards
         (same alsa_card_name, same profile) produce identical descriptions.
 
-        Skips adding the label if PA's own description already mentions it
-        (case-insensitive) — e.g. an HDMI port's description is often
-        already "... Digital Stereo (HDMI 2)" — to avoid a redundant
+        Skips adding the connector label if PA's own description already
+        mentions it (case-insensitive) — e.g. an HDMI port's description is
+        often already "... Digital Stereo (HDMI 2)" — to avoid a redundant
         "(HDMI) (HDMI 2)"-style display name.
+
+        Also appends a short hardware tag (see short_hardware_tag) derived
+        from master_device — present only for remap-sink zones, not raw
+        master sinks (a device has no master_device pointing to itself) —
+        so every zone belonging to the same physical card (front_stereo,
+        rear_stereo, multichannel_stereo, ...) visibly shares one tag,
+        distinct from other cards' tags at a glance.
         """
         raw_name: str = device.get("description", device["name"])
         label = connector_label(device.get("device_bus"), device["name"])
-        if not label or label.lower() in raw_name.lower():
-            return raw_name
-        return f"{raw_name} ({label.upper()})"
+        if label and label.lower() not in raw_name.lower():
+            raw_name = f"{raw_name} ({label.upper()})"
+        master_device: str | None = device.get("master_device")
+        if master_device:
+            raw_name = f"{raw_name} [{short_hardware_tag(master_device)}]"
+        return raw_name
 
     async def evaluate_bridge(self, player: Player) -> None:
         """
