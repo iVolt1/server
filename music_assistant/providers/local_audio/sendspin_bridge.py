@@ -1087,25 +1087,36 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             if not alsa_card_name or not channel_map:
                 continue
 
-            # When two identical cards share the same alsa.card_name (e.g.
-            # two Creative X-Fi cards both report "Creative X-Fi"), their
-            # normalized names would collide, causing the second card's remap
-            # sinks to be silently skipped as "already exists". Append the
-            # ALSA card index to disambiguate: "Creative_X_Fi_card0" vs
-            # "Creative_X_Fi_card3".
-            all_card_names = [d.get("alsa_card_name") for d in devices if not d.get("is_remap")]
-            is_duplicate_card_name = all_card_names.count(alsa_card_name) > 1
-            alsa_card_index: str | None = (
-                device.get("alsa_card_index") if is_duplicate_card_name else None
-            )
             master_sink_name: str = device["name"]
             # Label the connector type (hdmi/analog/usb) so an HDMI output
             # and an analog output on the same physical chip — which share
             # an identical alsa_card_name and would otherwise differ only
             # by an opaque card index — are distinguishable at a glance.
-            # Applied unconditionally (unlike the card index above) since
+            # Applied unconditionally (unlike the card index below) since
             # it's informative on its own, not just a collision workaround.
             label = connector_label(device.get("device_bus"), master_sink_name)
+
+            # When two candidates would produce the *same labeled name* —
+            # not just the same alsa_card_name — their normalized names
+            # would collide, causing the second card's remap sinks to be
+            # silently skipped as "already exists". Checking the labeled
+            # key (name+label) rather than raw alsa_card_name means a card
+            # index is only added when it's actually needed: two identical
+            # X-Fi cards both label "analog" and still collide, so still
+            # get "_card0"/"_card3" — but an HDMI output and an analog
+            # output sharing "HD-Audio Generic" already differ by label
+            # alone ("hdmi" vs "analog") and no longer need one.
+            def _labeled_key(d: dict[str, Any]) -> str:
+                name = d.get("alsa_card_name") or ""
+                lbl = connector_label(d.get("device_bus"), d.get("name", ""))
+                return f"{name}::{lbl}" if lbl else name
+
+            labeled_key = _labeled_key(device)
+            all_labeled_keys = [_labeled_key(d) for d in devices if not d.get("is_remap")]
+            is_duplicate_labeled_name = all_labeled_keys.count(labeled_key) > 1
+            alsa_card_index: str | None = (
+                device.get("alsa_card_index") if is_duplicate_labeled_name else None
+            )
             card_name = normalize_card_name(alsa_card_name, alsa_card_index, label)
             for spec in compute_remap_topology(card_name, channel_map, channels):
                 if spec.sink_name in existing_names:
