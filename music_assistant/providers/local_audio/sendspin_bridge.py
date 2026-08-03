@@ -98,6 +98,31 @@ def get_device_uuid(device_name: str, hostapi_index: int) -> str:
     return str(uuid.uuid5(DEVICE_UUID_NAMESPACE, f"{device_name}:{hostapi_index}"))
 
 
+def identity_seed(device_name: str, device_info: dict[str, Any]) -> str:
+    """
+    Return the stable identity input for get_device_uuid().
+
+    Uses master_device + the recovered zone suffix when present (a remap
+    sink this provider created — see remap_topology.remap_zone_suffix),
+    falling back to the device's own PA sink name otherwise (already
+    stable, since PulseAudio generates it from the physical bus path, not
+    from anything this module names).
+
+    MUST be the single source of truth for this computation. It's called
+    both by discover_and_register() (which registers the MA player) and by
+    SendspinLocalAudioBridge.start() (which registers the bridge as that
+    same player's output protocol) — the two must always resolve to the
+    identical UUID for the same device, or MA has a player with no
+    attached protocol. Computing this independently in two places is
+    exactly how they drifted out of sync previously; do not duplicate it.
+    """
+    master_device: str | None = device_info.get("master_device")
+    zone_suffix = remap_zone_suffix(device_name)
+    if master_device and zone_suffix:
+        return f"{master_device}::{zone_suffix}"
+    return device_name
+
+
 def short_hardware_tag(bus_identity: str, length: int = 4) -> str:
     """
     Short, stable hex tag derived from a physical identity string (e.g.
@@ -230,7 +255,9 @@ class SendspinLocalAudioBridge:
     async def start(self) -> None:
         """Register the local audio device as an external Sendspin client."""
         hostapi_index: int = self.device_info.get("hostapi", 0)
-        self._device_uuid = get_device_uuid(self.device_name, hostapi_index)
+        self._device_uuid = get_device_uuid(
+            identity_seed(self.device_name, self.device_info), hostapi_index
+        )
         self._bridge_client_id = bridge_client_id_from_uuid(self._device_uuid)
 
         if sendspin_prov := self._get_sendspin_provider():
@@ -893,15 +920,12 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
                 # 2ch-or-fewer devices, or a multichannel master not yet
                 # covered by remap topology) fall back to device_name,
                 # which PulseAudio generates from the physical bus path and
-                # is already stable on its own.
-                master_device: str | None = device.get("master_device")
-                zone_suffix = remap_zone_suffix(device_name)
-                identity_seed: str = (
-                    f"{master_device}::{zone_suffix}"
-                    if master_device and zone_suffix
-                    else device_name
-                )
-                device_map[get_device_uuid(identity_seed, device.get("hostapi", 0))] = device
+                # is already stable on its own. See identity_seed() —
+                # SendspinLocalAudioBridge.start() must use the exact same
+                # function so the player and its bridge always agree.
+                device_map[
+                    get_device_uuid(identity_seed(device_name, device), device.get("hostapi", 0))
+                ] = device
             self._devices = device_map
 
             for device_uuid, device in self._devices.items():
