@@ -935,20 +935,24 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
         often already "... Digital Stereo (HDMI 2)" — to avoid a redundant
         "(HDMI) (HDMI 2)"-style display name.
 
-        Also appends a short hardware tag (see short_hardware_tag) derived
-        from master_device — present only for remap-sink zones, not raw
-        master sinks (a device has no master_device pointing to itself) —
-        so every zone belonging to the same physical card (front_stereo,
-        rear_stereo, multichannel_stereo, ...) visibly shares one tag,
-        distinct from other cards' tags at a glance.
+        Also appends a short hardware tag (see short_hardware_tag): derived
+        from master_device for remap-sink zones, so every zone belonging to
+        the same physical card (front_stereo, rear_stereo,
+        multichannel_stereo, ...) visibly shares one tag, distinct from
+        other cards' tags at a glance. For a raw master sink with no
+        master_device pointing to itself, falls back to the device's own PA
+        sink name — PulseAudio always assigns unique sink names, typically
+        differentiated by a serial or bus-path suffix, even for two
+        otherwise-identical products (e.g. two of the same model USB DAC)
+        whose PA *description* could otherwise read identically with no
+        visible way to tell them apart in the player list.
         """
         raw_name: str = device.get("description", device["name"])
         label = connector_label(device.get("device_bus"), device["name"])
         if label and label.lower() not in raw_name.lower():
             raw_name = f"{raw_name} ({label.upper()})"
-        master_device: str | None = device.get("master_device")
-        if master_device:
-            raw_name = f"{raw_name} [{short_hardware_tag(master_device)}]"
+        tag_source: str = device.get("master_device") or device["name"]
+        raw_name = f"{raw_name} [{short_hardware_tag(tag_source)}]"
         return raw_name
 
     async def evaluate_bridge(self, player: Player) -> None:
