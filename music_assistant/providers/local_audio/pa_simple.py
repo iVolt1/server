@@ -619,6 +619,11 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
         is_remap = master_device is not None or driver == "module-remap-sink.c"
         alsa_card_name: str | None = properties.get("alsa.card_name")
         alsa_card_index: str | None = properties.get("alsa.card")
+        # Structured connection-type signal from PulseAudio's own kernel-bus
+        # detection ("pci", "usb", "bluetooth", ...) — not vendor-supplied
+        # naming, so it's reliable even for USB devices whose card/product
+        # name gives no hint they're USB (e.g. some class-compliant DACs).
+        device_bus: str | None = properties.get("device.bus")
         # pactl --format=json represents channel_map as a comma-separated
         # string (e.g. "front-left,front-right,rear-left,rear-right,...").
         channel_map_str: str = sink.get("channel_map", "")
@@ -662,6 +667,7 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
                 "channel_map": channel_map,
                 "alsa_card_name": alsa_card_name,
                 "alsa_card_index": alsa_card_index,
+                "device_bus": device_bus,
             }
         )
 
