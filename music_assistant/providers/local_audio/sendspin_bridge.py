@@ -55,6 +55,7 @@ if sys.platform == "linux":
     from .remap_topology import (
         build_remap_sink_argument,
         compute_remap_topology,
+        connector_label,
         normalize_card_name,
     )
 
@@ -861,12 +862,36 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
                     # previous provider instance (players survive a provider reload):
                     # (re)register so the player is bound to this provider instance
                     player = await self._register_player(
-                        device_uuid, device.get("description", device["name"])
+                        device_uuid, self._labeled_display_name(device)
                     )
                 if player is None:
                     # registration skipped - the player is disabled
                     continue
                 await self.evaluate_bridge(player)
+
+    @staticmethod
+    def _labeled_display_name(device: dict[str, Any]) -> str:
+        """
+        Return a raw master sink's display name with a connector-type label applied.
+
+        Applies the same hdmi/analog/usb labeling used for remap-sink names
+        (see remap_topology.connector_label) to a raw master sink that
+        registers as its own player — a 2-channel-or-fewer card, or a
+        multichannel card not yet covered by remap-sink topology — so it
+        doesn't rely solely on PulseAudio's own per-profile description,
+        which gives no distinguishing signal when two identical cards
+        (same alsa_card_name, same profile) produce identical descriptions.
+
+        Skips adding the label if PA's own description already mentions it
+        (case-insensitive) — e.g. an HDMI port's description is often
+        already "... Digital Stereo (HDMI 2)" — to avoid a redundant
+        "(HDMI) (HDMI 2)"-style display name.
+        """
+        raw_name: str = device.get("description", device["name"])
+        label = connector_label(device.get("device_bus"), device["name"])
+        if not label or label.lower() in raw_name.lower():
+            return raw_name
+        return f"{raw_name} ({label.upper()})"
 
     async def evaluate_bridge(self, player: Player) -> None:
         """
@@ -1015,8 +1040,15 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             alsa_card_index: str | None = (
                 device.get("alsa_card_index") if is_duplicate_card_name else None
             )
-            card_name = normalize_card_name(alsa_card_name, alsa_card_index)
             master_sink_name: str = device["name"]
+            # Label the connector type (hdmi/analog/usb) so an HDMI output
+            # and an analog output on the same physical chip — which share
+            # an identical alsa_card_name and would otherwise differ only
+            # by an opaque card index — are distinguishable at a glance.
+            # Applied unconditionally (unlike the card index above) since
+            # it's informative on its own, not just a collision workaround.
+            label = connector_label(device.get("device_bus"), master_sink_name)
+            card_name = normalize_card_name(alsa_card_name, alsa_card_index, label)
             for spec in compute_remap_topology(card_name, channel_map, channels):
                 if spec.sink_name in existing_names:
                     continue
