@@ -172,3 +172,27 @@ def build_remap_sink_argument(spec: RemapSinkSpec, master_sink_name: str) -> str
         f"channel_map={','.join(spec.channel_map)} "
         f"remix=no"
     )
+
+
+# Canonical set of remap-sink suffixes this module ever creates. Used to
+# recover which zone a given remap sink represents purely from its own PA
+# sink name — reliable because these are literal strings we control and
+# construct sink names from ("{card_name}_{suffix}"), not inferred from
+# anything vendor- or driver-supplied.
+KNOWN_REMAP_SUFFIXES: Final[tuple[str, ...]] = (*STEREO_PAIRS.keys(), "multichannel_stereo")
+
+
+def remap_zone_suffix(sink_name: str) -> str | None:
+    """
+    Recover which zone a remap sink represents from its own PA sink name.
+
+    :param sink_name: A remap sink's own PA sink name (e.g.
+        "HD_Audio_Generic_hdmi_card2_multichannel_stereo").
+    :returns: The matching suffix (e.g. "multichannel_stereo"), or None if
+        sink_name doesn't end with any known suffix — e.g. it isn't a
+        remap sink this module created.
+    """
+    for suffix in KNOWN_REMAP_SUFFIXES:
+        if sink_name.endswith(f"_{suffix}"):
+            return suffix
+    return None
