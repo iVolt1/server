@@ -1188,17 +1188,37 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
                 unmute_status = await self.mass.loop.run_in_executor(
                     None, unmute_playback_switches, str(device_alsa_card_index)
                 )
-                if unmute_status.startswith("ok"):
+                if unmute_status.startswith("ok") and "set_failed" not in unmute_status:
                     self.logger.debug(
                         "unmute_playback_switches on ALSA card %s: %s",
                         device_alsa_card_index,
                         unmute_status,
                     )
-                else:
+                elif unmute_status in ("no_libasound", "attach_failed"):
+                    # Expected in containerized deployments without direct
+                    # /dev/snd access — suspend_resume_sink via PA is
+                    # unaffected either way.
                     self.logger.debug(
                         "unmute_playback_switches on ALSA card %s did not "
                         "complete (%s) — likely no direct /dev/snd access "
                         "from this process; suspend_resume_sink via PA is "
+                        "unaffected",
+                        device_alsa_card_index,
+                        unmute_status,
+                    )
+                else:
+                    # open_failed / register_failed / load_failed mean the
+                    # process DID have some libasound access but the mixer
+                    # sequence broke partway through — a real anomaly, not
+                    # the expected no-/dev/snd-access case above.
+                    # "set_failed" means a target element was correctly
+                    # identified as muted but the actual unmute call itself
+                    # reported failure — that element's true state is
+                    # unknown, worth surfacing rather than assuming success.
+                    self.logger.warning(
+                        "unmute_playback_switches on ALSA card %s reported "
+                        "%s — surround/center/side channels on this card "
+                        "may still be muted; suspend_resume_sink via PA is "
                         "unaffected",
                         device_alsa_card_index,
                         unmute_status,
