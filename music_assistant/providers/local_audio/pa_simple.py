@@ -746,6 +746,55 @@ _UNMUTE_TARGET_ELEMENTS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _load_asound_lib() -> ctypes.CDLL:
+    lib = ctypes.CDLL("libasound.so.2")
+    lib.snd_mixer_open.restype = ctypes.c_int
+    lib.snd_mixer_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+    lib.snd_mixer_attach.restype = ctypes.c_int
+    lib.snd_mixer_attach.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.snd_mixer_selem_register.restype = ctypes.c_int
+    lib.snd_mixer_selem_register.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.snd_mixer_load.restype = ctypes.c_int
+    lib.snd_mixer_load.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_first_elem.restype = ctypes.c_void_p
+    lib.snd_mixer_first_elem.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_elem_next.restype = ctypes.c_void_p
+    lib.snd_mixer_elem_next.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_selem_has_playback_switch.restype = ctypes.c_int
+    lib.snd_mixer_selem_has_playback_switch.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_selem_get_playback_switch.restype = ctypes.c_int
+    lib.snd_mixer_selem_get_playback_switch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.snd_mixer_selem_set_playback_switch_all.restype = ctypes.c_int
+    lib.snd_mixer_selem_set_playback_switch_all.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    lib.snd_mixer_selem_get_name.restype = ctypes.c_char_p
+    lib.snd_mixer_selem_get_name.argtypes = [ctypes.c_void_p]
+    lib.snd_mixer_close.restype = None
+    lib.snd_mixer_close.argtypes = [ctypes.c_void_p]
+    return lib
+
+
+_asound_lib: ctypes.CDLL | None = None
+
+
+def _get_asound_lib() -> ctypes.CDLL:
+    """Load and cache libasound.so.2 with prototypes declared once, not per call."""
+    global _asound_lib  # noqa: PLW0603
+    if _asound_lib is None:
+        _asound_lib = _load_asound_lib()
+    return _asound_lib
+
+
 def unmute_playback_switches(alsa_card_index: str) -> str:
     """
     Detect-then-correct: unmute only the channel-enable elements this
@@ -789,46 +838,16 @@ def unmute_playback_switches(alsa_card_index: str) -> str:
         target element already read as unmuted, the expected result on a
         healthy card), or one of "no_libasound", "open_failed",
         "attach_failed", "register_failed", "load_failed" describing
-        where it stopped.
+        where it stopped. A "set_failed:<n>" suffix is appended to a
+        successful "ok:<n>" result if any individual
+        set_playback_switch_all call itself reported failure (n = how
+        many) — those elements' actual state is unknown, since the
+        library call that was supposed to change them didn't confirm it.
     """
     try:
-        lib = ctypes.CDLL("libasound.so.2")
+        lib = _get_asound_lib()
     except OSError:
         return "no_libasound"
-
-    lib.snd_mixer_open.restype = ctypes.c_int
-    lib.snd_mixer_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
-    lib.snd_mixer_attach.restype = ctypes.c_int
-    lib.snd_mixer_attach.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.snd_mixer_selem_register.restype = ctypes.c_int
-    lib.snd_mixer_selem_register.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    lib.snd_mixer_load.restype = ctypes.c_int
-    lib.snd_mixer_load.argtypes = [ctypes.c_void_p]
-    lib.snd_mixer_first_elem.restype = ctypes.c_void_p
-    lib.snd_mixer_first_elem.argtypes = [ctypes.c_void_p]
-    lib.snd_mixer_elem_next.restype = ctypes.c_void_p
-    lib.snd_mixer_elem_next.argtypes = [ctypes.c_void_p]
-    lib.snd_mixer_selem_has_playback_switch.restype = ctypes.c_int
-    lib.snd_mixer_selem_has_playback_switch.argtypes = [ctypes.c_void_p]
-    lib.snd_mixer_selem_get_playback_switch.restype = ctypes.c_int
-    lib.snd_mixer_selem_get_playback_switch.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_int),
-    ]
-    lib.snd_mixer_selem_set_playback_switch_all.restype = ctypes.c_int
-    lib.snd_mixer_selem_set_playback_switch_all.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-    ]
-    lib.snd_mixer_selem_get_name.restype = ctypes.c_char_p
-    lib.snd_mixer_selem_get_name.argtypes = [ctypes.c_void_p]
-    lib.snd_mixer_close.restype = None
-    lib.snd_mixer_close.argtypes = [ctypes.c_void_p]
 
     mixer = ctypes.c_void_p()
     if lib.snd_mixer_open(ctypes.byref(mixer), 0) < 0:
@@ -851,6 +870,7 @@ def unmute_playback_switches(alsa_card_index: str) -> str:
         mono_channel = 0
 
         changed_count = 0
+        set_failed_count = 0
         elem = lib.snd_mixer_first_elem(mixer)
         while elem:
             if lib.snd_mixer_selem_has_playback_switch(elem):
@@ -862,9 +882,14 @@ def unmute_playback_switches(alsa_card_index: str) -> str:
                         elem, mono_channel, ctypes.byref(current)
                     )
                     if got >= 0 and current.value == 0:
-                        lib.snd_mixer_selem_set_playback_switch_all(elem, 1)
-                        changed_count += 1
+                        if lib.snd_mixer_selem_set_playback_switch_all(elem, 1) < 0:
+                            set_failed_count += 1
+                        else:
+                            changed_count += 1
             elem = lib.snd_mixer_elem_next(elem)
-        return f"ok:{changed_count}"
+        result = f"ok:{changed_count}"
+        if set_failed_count:
+            result += f":set_failed:{set_failed_count}"
+        return result
     finally:
         lib.snd_mixer_close(mixer)
