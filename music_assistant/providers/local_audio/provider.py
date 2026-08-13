@@ -72,18 +72,26 @@ class LocalAudioProvider(PlayerProvider):
         unavailable (no PA at runtime, initial setup flow, etc.) —
         profile selection then just isn't offered.
         """
-        from .card_profiles import (  # noqa: PLC0415
-            PROFILE_AUTO,
-            PROFILE_OFF,
-            card_config_label,
-            conf_card_profile_key,
-        )
+        try:
+            from .card_profiles import (  # noqa: PLC0415
+                PROFILE_AUTO,
+                PROFILE_OFF,
+                card_config_label,
+                conf_card_profile_key,
+            )
+            from .pa_simple import enumerate_pa_cards  # noqa: PLC0415
+        except ImportError as err:
+            self.logger.warning(
+                "Card profile config entries unavailable — module out of date "
+                "(deploy matching card_profiles.py/pa_simple.py): %s",
+                err,
+            )
+            return []
 
         try:
-            from .pa_simple import enumerate_pa_cards  # noqa: PLC0415
-
             cards = await self.mass.loop.run_in_executor(None, enumerate_pa_cards)
-        except (FileNotFoundError, RuntimeError, OSError):
+        except (FileNotFoundError, RuntimeError, OSError) as err:
+            self.logger.debug("Card profile config entries skipped: %s", err)
             return []
 
         entries: list[ConfigEntry] = []
