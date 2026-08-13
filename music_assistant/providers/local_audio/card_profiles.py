@@ -8,7 +8,9 @@ isn't there. Historically fixing this required host access (pavucontrol,
 `ha audio`, or a hand-written custom.pa) — expert-level steps for someone
 who just wants multiroom audio.
 
-This module makes profile selection a local_audio concern:
+This module holds the pure decision logic (I/O — enumerate_pa_cards()
+and set_card_profile() — lives in pa_simple, sharing its pactl/PULSE_SERVER
+idiom). Profile selection becomes a local_audio concern:
 
   - resolve_profile() is a pure decision function: given a card snapshot
     and an optional user override, it returns what the active profile
@@ -43,9 +45,7 @@ selects them.
 
 from __future__ import annotations
 
-import json
 import re
-import subprocess
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -289,8 +289,9 @@ def cards_in_use(
     This is the scoping rule that keeps the policy polite: local_audio
     only manages the profile of cards it is actually using. Matching is
     by the "alsa.card" index property (same value enumerate_pa_sinks()
-    reports as alsa_card_index), with alsa_card_name as fallback for
-    sinks whose proplist lacks the index.
+    reports as alsa_card_index); alsa_card_name is a fallback used only
+    for sinks whose proplist lacks the index, since names are shared by
+    identical cards and by sibling functions of one chip.
 
     :param cards: All cards from enumerate_pa_cards().
     :param devices: Current enumerate_pa_sinks() result.
@@ -298,12 +299,23 @@ def cards_in_use(
     used_indexes = {
         str(d["alsa_card_index"]) for d in devices if d.get("alsa_card_index") is not None
     }
-    used_names = {d["alsa_card_name"] for d in devices if d.get("alsa_card_name")}
+    # Name-based fallback ONLY for sinks whose proplist lacks the index
+    # property. alsa_card_name is shared both by identical cards and by
+    # sibling functions of the same chip (an "HD-Audio Generic" HDMI
+    # function next to an "HD-Audio Generic" analog function), so a name
+    # contributed by an index-bearing sink must not widen the match to
+    # cards that sink already identified precisely — otherwise an unused
+    # sibling card gets managed on the strength of its twin's sink.
+    fallback_names = {
+        d["alsa_card_name"]
+        for d in devices
+        if d.get("alsa_card_name") and d.get("alsa_card_index") is None
+    }
     return [
         card
         for card in cards
         if (card.alsa_card_index is not None and card.alsa_card_index in used_indexes)
-        or (card.alsa_card_name is not None and card.alsa_card_name in used_names)
+        or (card.alsa_card_name is not None and card.alsa_card_name in fallback_names)
     ]
 
 
@@ -337,86 +349,38 @@ def plan_profile_changes(
         resolve_profile(card, overrides.get(card.name)) for card in managed.values()
     ]
 
-
 # ---------------------------------------------------------------------------
-# PA I/O — provisional pactl-based implementation.
-#
-# NOTE: intended to move into (or be rewritten against) pa_simple.py so card
-# introspection shares whatever connection/idiom enumerate_pa_sinks() uses.
-# Kept subprocess-based and synchronous here (call via run_in_executor, like
-# every other PA touchpoint in sendspin_bridge) so it is drop-in either way.
+# Config-entry plumbing for the per-card override dropdowns.
 # ---------------------------------------------------------------------------
 
+# Prefix for per-card profile config-entry keys.
+CONF_CARD_PROFILE_PREFIX: Final = "card_profile_"
 
-def enumerate_pa_cards() -> list[CardSnapshot]:
+
+def conf_card_profile_key(card_name: str) -> str:
     """
-    Enumerate PulseAudio/PipeWire cards with their profiles.
+    Config-entry key for one card's profile override.
 
-    :returns: One CardSnapshot per card.
-    :raises FileNotFoundError: pactl not installed.
-    :raises RuntimeError: pactl failed or returned unparseable output.
+    Derived from the card's PA name (bus-path-based, stable across reboots
+    and enumeration order — the same property class the sink-side hardware
+    tag relies on), sanitized to a plain identifier so the key is safe in
+    any config store. Two X-Fis differ by bus path, so their keys differ.
+
+    :param card_name: CardSnapshot.name, e.g. "alsa_card.pci-0000_01_00.0".
     """
-    try:
-        result = subprocess.run(  # noqa: S603
-            ["pactl", "-f", "json", "list", "cards"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as err:
-        raise RuntimeError("pactl list cards timed out") from err
-    if result.returncode != 0:
-        raise RuntimeError(f"pactl list cards failed: {result.stderr.strip()}")
-    try:
-        raw_cards = json.loads(result.stdout)
-    except json.JSONDecodeError as err:
-        raise RuntimeError(f"pactl list cards returned invalid JSON: {err}") from err
-
-    cards: list[CardSnapshot] = []
-    for raw in raw_cards:
-        properties: dict[str, Any] = raw.get("properties", {})
-        profiles = tuple(
-            CardProfile(
-                name=name,
-                description=str(info.get("description", name)),
-                n_sinks=int(info.get("sinks", 0)),
-                n_sources=int(info.get("sources", 0)),
-                priority=int(info.get("priority", 0)),
-                available=bool(info.get("available", True)),
-            )
-            for name, info in raw.get("profiles", {}).items()
-        )
-        cards.append(
-            CardSnapshot(
-                name=str(raw.get("name", "")),
-                index=int(raw.get("index", -1)),
-                active_profile=str(raw.get("active_profile", "")),
-                profiles=profiles,
-                alsa_card_name=properties.get("alsa.card_name"),
-                alsa_card_index=properties.get("alsa.card"),
-            )
-        )
-    return cards
+    return CONF_CARD_PROFILE_PREFIX + re.sub(r"[^A-Za-z0-9_]", "_", card_name)
 
 
-def set_card_profile(card_name: str, profile_name: str) -> bool:
+def card_config_label(card: CardSnapshot) -> str:
     """
-    Activate a profile on a card.
+    Human label for one card's config entry.
 
-    :param card_name: The card's PA name (CardSnapshot.name).
-    :param profile_name: The profile's machine name.
-    :returns: True on success.
-    :raises FileNotFoundError: pactl not installed.
+    Combines the vendor card name with the bus-path suffix so identical
+    cards are distinguishable ("Creative X-Fi (pci-0000_01_00.0)") and the
+    label matches the card identifier the provider logs next to every
+    profile decision.
     """
-    try:
-        result = subprocess.run(  # noqa: S603
-            ["pactl", "set-card-profile", card_name, profile_name],  # noqa: S607
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    return result.returncode == 0
+    bus_suffix = card.name.removeprefix("alsa_card.")
+    if card.alsa_card_name:
+        return f"{card.alsa_card_name} ({bus_suffix})"
+    return bus_suffix
