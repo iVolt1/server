@@ -46,7 +46,7 @@ from .constants import (
 )
 
 if sys.platform == "linux":
-    from .card_profiles import enumerate_pa_cards, plan_profile_changes
+    from .card_profiles import enumerate_pa_cards, plan_profile_changes, set_card_profile
     from .pa_simple import (
         PASimpleStream,
         PAVolumeController,
@@ -1199,7 +1199,7 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
 
             await self._ensure_volume_controller(resolved_backend)
             if resolved_backend == "pulse":
-                await self._log_card_profile_plan(devices)
+                devices = await self._apply_card_profiles(devices)
                 devices = await self._refresh_after_remap_topology(devices)
 
             self._backend = resolved_backend
@@ -1627,26 +1627,52 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
         )
         return new_devices
 
-    async def _log_card_profile_plan(self, devices: list[dict[str, Any]]) -> None:
+    async def _apply_card_profiles(self, devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
-        Dry-run: log what card-profile auto-selection WOULD do, changing nothing.
+        Resolve and apply card profiles for cards local_audio is using.
 
-        Step 1 of the profile-selection feature — inspection only, so the
-        decisions and their reasons can be validated against real hardware
-        (per card: current profile, would-be target, rationale) before any
-        set_card_profile call is wired in. Scoping mirrors the eventual
-        live behavior: only cards backing a currently-enumerated output
-        sink are considered (see card_profiles.plan_profile_changes).
+        Runs the card_profiles resolver (most output channels,
+        duplex-preferred; see that module) over every card backing a
+        currently-enumerated output sink and activates any decided
+        switch. Set-only-if-different by construction — the resolver
+        returns no target for an already-correct card — and PA's
+        module-card-restore persists an applied switch, so after the
+        first successful run every subsequent provider start is a no-op
+        that logs "keeping" for each card.
+
+        Overrides are not wired up yet (config entries land with the
+        per-card dropdown); until then every card uses the automatic
+        policy.
+
+        :param devices: Current enumerate_pa_sinks() result.
+        :returns: The original devices list, or a freshly re-enumerated
+            list if any profile was switched — a profile switch tears
+            down the card's old sinks and creates the new profile's
+            sinks, so the pre-switch enumeration is stale for that card.
         """
         try:
             cards = await self.mass.loop.run_in_executor(None, enumerate_pa_cards)
         except (FileNotFoundError, RuntimeError) as err:
             self.logger.debug("Card profile inspection unavailable: %s", err)
-            return
+            return devices
+        switched_any = False
         for decision in plan_profile_changes(cards, devices, overrides={}):
-            if decision.target_profile:
+            if not decision.target_profile:
+                self.logger.debug(
+                    "Card %s (%s): keeping profile %s (%s)",
+                    decision.card_display_name,
+                    decision.card_name,
+                    decision.current_profile,
+                    decision.reason,
+                )
+                continue
+            ok = await self.mass.loop.run_in_executor(
+                None, set_card_profile, decision.card_name, decision.target_profile
+            )
+            if ok:
+                switched_any = True
                 self.logger.info(
-                    "[profile dry-run] %s (%s): would switch %s -> %s (%s)",
+                    "Card %s (%s): switched profile %s -> %s (%s)",
                     decision.card_display_name,
                     decision.card_name,
                     decision.current_profile,
@@ -1654,14 +1680,32 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
                     decision.reason,
                 )
             else:
-                self.logger.info(
-                    "[profile dry-run] %s (%s): keeping %s (%s)",
+                self.logger.warning(
+                    "Card %s (%s): failed to switch profile %s -> %s — "
+                    "continuing with the active profile",
                     decision.card_display_name,
                     decision.card_name,
                     decision.current_profile,
-                    decision.reason,
+                    decision.target_profile,
                 )
-        self.logger.info("[profile dry-run] no changes applied — inspection only")
+        if not switched_any:
+            return devices
+        # A profile switch replaces the card's sinks; give PA a moment to
+        # finish creating them (mirrors the settle waits used elsewhere in
+        # this file) before re-enumerating.
+        await asyncio.sleep(0.5)
+        try:
+            new_devices = await self.mass.loop.run_in_executor(None, enumerate_pa_sinks)
+        except (FileNotFoundError, RuntimeError) as err:
+            self.logger.warning(
+                "Failed to re-enumerate after switching card profiles: %s", err
+            )
+            return devices
+        self.logger.info(
+            "Found %d local audio output device(s) after switching card profiles",
+            len(new_devices),
+        )
+        return new_devices
 
     @staticmethod
     def _enumerate_output_devices(backend: str) -> tuple[str, list[dict[str, Any]]]:
