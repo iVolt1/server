@@ -129,6 +129,7 @@ class LocalAudioProvider(PlayerProvider):
                     category="advanced",
                 )
             )
+        self.logger.debug("Generated %d card profile config entries", len(entries))
         return entries
 
     async def handle_async_init(self) -> None:
