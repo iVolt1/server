@@ -46,12 +46,14 @@ from .constants import (
 )
 
 if sys.platform == "linux":
-    from .card_profiles import enumerate_pa_cards, plan_profile_changes, set_card_profile
+    from .card_profiles import PROFILE_AUTO, conf_card_profile_key, plan_profile_changes
     from .pa_simple import (
         PASimpleStream,
         PAVolumeController,
         enumerate_alsa_devices,
+        enumerate_pa_cards,
         enumerate_pa_sinks,
+        set_card_profile,
         suspend_resume_sink,
         unmute_playback_switches,
     )
@@ -1640,9 +1642,9 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
         first successful run every subsequent provider start is a no-op
         that logs "keeping" for each card.
 
-        Overrides are not wired up yet (config entries land with the
-        per-card dropdown); until then every card uses the automatic
-        policy.
+        Per-card user overrides (the settings-page dropdowns) take
+        precedence over the automatic policy; a card set to "auto" or
+        never configured follows the resolver.
 
         :param devices: Current enumerate_pa_sinks() result.
         :returns: The original devices list, or a freshly re-enumerated
@@ -1655,8 +1657,17 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
         except (FileNotFoundError, RuntimeError) as err:
             self.logger.debug("Card profile inspection unavailable: %s", err)
             return devices
+        # Per-card user overrides from the provider config. Keys are derived
+        # from the card's stable PA name (see conf_card_profile_key); a card
+        # whose entry is absent (never saved — get_value returns None for
+        # unknown keys) or set to "auto" uses the automatic policy.
+        overrides: dict[str, str] = {}
+        for card in cards:
+            value = self.provider.config.get_value(conf_card_profile_key(card.name))
+            if value and str(value) != PROFILE_AUTO:
+                overrides[card.name] = str(value)
         switched_any = False
-        for decision in plan_profile_changes(cards, devices, overrides={}):
+        for decision in plan_profile_changes(cards, devices, overrides=overrides):
             if not decision.target_profile:
                 self.logger.debug(
                     "Card %s (%s): keeping profile %s (%s)",
