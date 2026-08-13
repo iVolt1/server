@@ -126,61 +126,9 @@ class LocalAudioProvider(PlayerProvider):
                     ),
                     options=options,
                     default_value=PROFILE_AUTO,
-                    category="advanced",
+                    advanced=True,
                 )
             )
-        # --- TEMPORARY rendering probes (remove once the UI issue is solved).
-        # Three entries, each varying one attribute, to identify what the
-        # frontend requires before it renders an entry:
-        #   PROBE A: in-code label, default category, simple option values.
-        #   PROBE B: in-code label, category=advanced, REAL profile-style
-        #            option values (colons/plus signs).
-        #   PROBE C: no label at all — translation_key reusing the existing
-        #            prewarm_streams translation from strings.json.
-        entries.append(
-            ConfigEntry(
-                key="card_profile_probe_a",
-                type=ConfigEntryType.STRING,
-                label="PROBE A plain",
-                options=[ConfigValueOption("auto", "Auto"), ConfigValueOption("x", "X")],
-                default_value="auto",
-            )
-        )
-        entries.append(
-            ConfigEntry(
-                key="card_profile_probe_b",
-                type=ConfigEntryType.STRING,
-                label="PROBE B advanced",
-                options=[
-                    ConfigValueOption("auto", "Auto"),
-                    ConfigValueOption(
-                        "output:analog-surround-71+input:analog-stereo",
-                        "Analog Surround 7.1 Output + Analog Stereo Input",
-                    ),
-                ],
-                default_value="auto",
-                category="advanced",
-            )
-        )
-        entries.append(
-            ConfigEntry(
-                key="card_profile_probe_c",
-                type=ConfigEntryType.BOOLEAN,
-                translation_key="prewarm_streams",
-                default_value=True,
-                category="advanced",
-            )
-        )
-        entries.append(
-            ConfigEntry(
-                key="card_profile_probe_d",
-                type=ConfigEntryType.STRING,
-                label="PROBE D advanced-flag",
-                options=[ConfigValueOption("auto", "Auto"), ConfigValueOption("x", "X")],
-                default_value="auto",
-                advanced=True,
-            )
-        )
         self.logger.debug("Generated %d card profile config entries", len(entries))
         return entries
 
