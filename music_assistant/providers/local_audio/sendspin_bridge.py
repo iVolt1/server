@@ -46,6 +46,7 @@ from .constants import (
 )
 
 if sys.platform == "linux":
+    from .card_profiles import enumerate_pa_cards, plan_profile_changes
     from .pa_simple import (
         PASimpleStream,
         PAVolumeController,
@@ -1198,6 +1199,7 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
 
             await self._ensure_volume_controller(resolved_backend)
             if resolved_backend == "pulse":
+                await self._log_card_profile_plan(devices)
                 devices = await self._refresh_after_remap_topology(devices)
 
             self._backend = resolved_backend
@@ -1624,6 +1626,42 @@ class LocalAudioBridgeManager(SendspinBridgeManagerBase[SendspinLocalAudioBridge
             "Found %d local audio output device(s) after creating remap sinks", len(new_devices)
         )
         return new_devices
+
+    async def _log_card_profile_plan(self, devices: list[dict[str, Any]]) -> None:
+        """
+        Dry-run: log what card-profile auto-selection WOULD do, changing nothing.
+
+        Step 1 of the profile-selection feature — inspection only, so the
+        decisions and their reasons can be validated against real hardware
+        (per card: current profile, would-be target, rationale) before any
+        set_card_profile call is wired in. Scoping mirrors the eventual
+        live behavior: only cards backing a currently-enumerated output
+        sink are considered (see card_profiles.plan_profile_changes).
+        """
+        try:
+            cards = await self.mass.loop.run_in_executor(None, enumerate_pa_cards)
+        except (FileNotFoundError, RuntimeError) as err:
+            self.logger.debug("Card profile inspection unavailable: %s", err)
+            return
+        for decision in plan_profile_changes(cards, devices, overrides={}):
+            if decision.target_profile:
+                self.logger.info(
+                    "[profile dry-run] %s (%s): would switch %s -> %s (%s)",
+                    decision.card_display_name,
+                    decision.card_name,
+                    decision.current_profile,
+                    decision.target_profile,
+                    decision.reason,
+                )
+            else:
+                self.logger.info(
+                    "[profile dry-run] %s (%s): keeping %s (%s)",
+                    decision.card_display_name,
+                    decision.card_name,
+                    decision.current_profile,
+                    decision.reason,
+                )
+        self.logger.info("[profile dry-run] no changes applied — inspection only")
 
     @staticmethod
     def _enumerate_output_devices(backend: str) -> tuple[str, list[dict[str, Any]]]:
