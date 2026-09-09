@@ -208,11 +208,35 @@ def build_shairport_config(zone: SinkZone, config_path: Path) -> None:
     """Write a shairport-sync .conf for one zone.
 
     Content is carried over directly from generate_airplay_services.sh,
-    already debugged and confirmed working over this session: the `pa`
-    section name (not `pulseaudio` -- that was a real, previously-shipped
-    bug that silently sent audio to PulseAudio's default sink instead of
-    the intended zone), the 0.5s buffer, output_format left unset.
+    already debugged and confirmed working over this session against a
+    4.3.7-class shairport-sync build: the `pa` section name (not
+    `pulseaudio` -- that was a real, previously-shipped bug on THAT build
+    that silently sent audio to PulseAudio's default sink instead of the
+    intended zone), the 0.5s buffer, output_format left unset.
+
+    output_backend / section name are overridable via
+    AIRPLAY_MULTIROOM_SPS_BACKEND because they are NOT universal across
+    shairport-sync versions -- confirmed directly: a newer 5.6-dev build
+    rejected "pa" outright ("the audio backend selected: pa is not
+    supported"), and its own -h output lists the real backend names as
+    "pipewire" and "pulseaudio" instead. Default stays "pa" here because
+    every other pinned build in this whole project (the standalone
+    addon's Dockerfile, MA's own Dockerfile.base, the 5.5.1-classic image
+    extracted from Docker Hub) is 4.3.7-class, where "pa" is the
+    confirmed-correct value.
+
+    IMPORTANT CAVEAT, not yet verified either way: this assumes the
+    section header (`pa { ... }` vs `pulseaudio { ... }`) renamed in step
+    with the output_backend selector string on the newer build. That's a
+    plausible guess, not confirmed -- and if it's wrong, the failure mode
+    is silent (libconfig ignores an unrecognized section rather than
+    erroring, the exact same failure shape as the pa/pulseaudio
+    section-name bug this session already hit once on the 4.3.7 build).
+    Before trusting this on the 5.6-dev build: check that version's
+    actual bundled sample shairport-sync.conf for the real current
+    section name, rather than assuming it tracks the backend selector.
     """
+    backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pa")
     interface_line = (
         f'  interface = "{AIRPLAY_INTERFACE}";\n' if AIRPLAY_INTERFACE else ""
     )
@@ -221,7 +245,7 @@ def build_shairport_config(zone: SinkZone, config_path: Path) -> None:
 {{
   name = "{zone.sink_name}";
   port = {zone.port};
-{interface_line}  output_backend = "pa";
+{interface_line}  output_backend = "{backend}";
   udp_port_base = {zone.udp_port_base};
   audio_backend_buffer_desired_length_in_seconds = 0.5;
 }};
@@ -229,7 +253,7 @@ sessioncontrol :
 {{
   allow_session_interruption = "yes";
 }};
-pa :
+{backend} :
 {{
   sink = "{zone.sink_name}";
   application_name = "Shairport Sync";
