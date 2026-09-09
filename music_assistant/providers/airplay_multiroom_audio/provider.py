@@ -147,17 +147,29 @@ async def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
 
 
 async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[str]:
-    """List PulseAudio remap-sink names, retrying if the Multiroom Audio
-    addon's topology hasn't been created yet.
+    """List PulseAudio sink names, retrying if none are found yet.
 
-    This directly encodes a lesson from tonight's live debugging: the
+    By default, only lists module-remap-sink sinks -- matching the
+    original standalone addon's deliberate scoping (its own header
+    comments: masters that don't get a remap sink from the Multiroom
+    Audio addon get no AirPlay instance either, "by design"). This
+    directly encodes a lesson from tonight's live debugging too: the
     standalone addon's generator script had a known, and eventually
-    actually-hit, startup-order race against the Multiroom Audio addon --
-    its own header comments flagged the risk months ago ("if that ever
-    proves to be a real problem... the fix is a short retry/wait loop"),
-    and it did prove to be a real problem, repeatedly, during testing.
-    Build the retry in from day one here rather than waiting to hit it.
+    actually-hit, startup-order race against that addon -- its own header
+    comments flagged the risk months ago ("if that ever proves to be a
+    real problem... the fix is a short retry/wait loop"), and it did
+    prove to be a real problem, repeatedly, during testing. Build the
+    retry in from day one here rather than waiting to hit it.
+
+    Set AIRPLAY_MULTIROOM_ALL_SINKS=1 to include every PulseAudio sink,
+    not just remap-sink ones -- for dev/POC testing on a box that doesn't
+    have the Multiroom Audio addon running at all (module-remap-sink sinks
+    can never exist there, no matter how long the retry loop waits). Not
+    the intended default for a real deployment: it changes which physical
+    outputs get an AirPlay instance, silently, versus what the original
+    addon's scoping decision intended.
     """
+    include_all = os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS", "").lower() in ("1", "true", "yes")
     for attempt in range(1, retries + 1):
         returncode, stdout, stderr = await _run(["pactl", "list", "sinks", "short"])
         if returncode != 0:
@@ -168,15 +180,16 @@ async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[st
             sinks = [
                 line.split()[1]
                 for line in stdout.splitlines()
-                if "module-remap-sink" in line and len(line.split()) > 1
+                if len(line.split()) > 1 and (include_all or "module-remap-sink" in line)
             ]
             if sinks:
                 return sinks
             LOGGER.info(
-                "No module-remap-sink sinks found yet (attempt %d/%d) -- "
-                "Multiroom Audio addon topology may not exist yet",
+                "No %ssinks found yet (attempt %d/%d)%s",
+                "" if include_all else "module-remap-sink ",
                 attempt,
                 retries,
+                "" if include_all else " -- Multiroom Audio addon topology may not exist yet",
             )
         await asyncio.sleep(delay)
     raise RuntimeError(
