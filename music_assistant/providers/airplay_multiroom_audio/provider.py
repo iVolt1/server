@@ -34,38 +34,38 @@ replaces (all confirmed working over a long debugging session):
     cmd_set_volume() below for what's actually confirmed vs. what needs
     verifying against current MA AirPlay-player volume-command code.
 
-TODO before this file will actually run, none of which are guesses I'm
-confident enough to have filled in blind -- confirm each against current
-music-assistant/server source before relying on it (the whole point of
-building it this way rather than fabricating a complete-looking file is
-that guessing at MA-internal API surface wasted real hours tonight; better
-to hand you an honestly partial file than a confidently wrong complete one):
-  1. Import path / exact base class for PlayerProvider -- confirm against
-     music_assistant/models/player_provider.py (or wherever it currently
-     lives; this moved at least once already in the MA codebase history
-     visible in this conversation).
-  2. Player object construction -- exact required/optional fields, enums
+RESOLVED this session, against real source (not guessed):
+  - PlayerProvider base class found and subclassed properly (see the
+    import comment above class AirplayMultiroomProvider below). Its own
+    base, Provider, was also found -- __init__ signature, the instance_id
+    property, get_config_entries()'s real default implementation,
+    unload()'s real signature (is_removed: bool = False), and the
+    self.available flag (starts False, must be set True once actually
+    ready) are all confirmed directly from that source, not inferred.
+  - discover_players() confirmed as the correct override point for a
+    provider that registers players directly instead of via mDNS.
+  - self.mass.players.register(player) confirmed real (pulled directly
+    from the built-in airplay provider's own source).
+
+STILL OPEN, genuinely unverified -- don't assume these are right just
+because the rest of the file now runs further than it used to:
+  1. Player object construction -- exact required/optional fields, enums
      for PlayerType/DeviceInfo etc. Confirm against
-     music_assistant/models/player.py or equivalent.
-  3. self.mass.players.register(player) -- this ONE call is confirmed real,
-     pulled directly from the current airplay/provider.py source during
-     this conversation. Everything around how `player` gets constructed
-     before that call is what needs verifying.
-  4. get_config_entries() signature and ConfigEntry class -- confirmed to
-     exist as a PlayerProvider instance method (not a module-level
-     __init__.py function) as of the local_audio work referenced in this
-     session's memory, but the exact current signature isn't verified here.
-  5. Volume-set command routing -- whether MA's current AirPlay player
+     music_assistant/models/player.py or equivalent. This is the next
+     concrete blocker: discover_players() spawns processes successfully
+     but never actually registers a Player with MA yet.
+  2. Volume-set command routing -- whether MA's current AirPlay player
      volume commands go out over raw RTSP (as described earlier in this
      conversation) or via the newer cliairplay CLI binary discovered during
      this same session (MA's AirPlay provider now shells out to a unified
      `cliairplay` binary rather than doing raw RTSP in Python, per the
-     airplay-cli repo found searching for this). If it's the latter, the
-     cmd_set_volume() sketch below is very likely wrong for THIS provider's
-     purposes anyway -- this provider spawns its own shairport-sync-pa
-     process directly and can send it an RTSP SET_PARAMETER volume command
-     itself, without needing MA's sender-side machinery at all. Confirm
-     which one is actually simplest before implementing either.
+     airplay-cli repo found searching for this). If it's the latter, a
+     cmd_set_volume() implementation modeled on that would very likely be
+     wrong for THIS provider's purposes anyway -- this provider spawns its
+     own shairport-sync-pa process directly and can send it an RTSP
+     SET_PARAMETER volume command itself, without needing MA's sender-side
+     machinery at all. Confirm which one is actually simplest before
+     implementing either.
 """
 
 from __future__ import annotations
@@ -76,6 +76,15 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+# Module path inferred, not independently confirmed via a file listing:
+# PlayerProvider's own source used `from .provider import Provider` as a
+# relative import, and the file containing Provider itself is titled
+# "Model/base for a Provider implementation within Music Assistant" --
+# strongly suggesting music_assistant/models/provider.py, with
+# PlayerProvider as the sibling music_assistant/models/player_provider.py.
+# If this import fails, that's the thing to double check first.
+from music_assistant.models.player_provider import PlayerProvider
 
 LOGGER = logging.getLogger(__name__)
 
@@ -398,61 +407,43 @@ async def resolve_binary() -> Path:
     return await ensure_binary(CACHE_DIR)
 
 
-class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
-    """Sketch of the provider. Not yet a complete PlayerProvider.
+class AirplayMultiroomProvider(PlayerProvider):
+    """AirPlay Multiroom Audio player provider.
 
-    Confirmed against real source this round:
-      - __init__ signature: (mass, manifest, config), matching
-        AirPlayReceiverProvider(mass, manifest, config) in the real
-        built-in provider's __init__.py.
-      - discover_players() is the correct override point for a provider
-        that registers players directly instead of via mDNS -- confirmed
-        from the real PlayerProvider base class's own docstring for that
-        method.
+    Properly subclasses PlayerProvider now that its real base (Provider)
+    has been confirmed against actual source. Two stopgaps from earlier
+    rounds are gone, not just fixed:
+      - instance_id: turned out to be a read-only @property on Provider
+        (`return self.config.instance_id`) -- the manual
+        `self.instance_id = ...` assignment from before wouldn't just be
+        redundant now, it would actively break (AttributeError: can't set
+        attribute) once this class inherits the property. Removed
+        entirely, not reimplemented.
+      - get_config_entries(): Provider already defines a real default
+        (`async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        return ()`) -- the stopgap's `list` return was even the wrong
+        type. No override needed at all unless this provider grows actual
+        user-configurable settings later.
 
-    Still needed: PlayerProvider subclasses Provider (music_assistant.models
-    .provider, going by the `from .provider import Provider` relative
-    import in the PlayerProvider source found this session -- module path
-    not yet confirmed). Provider's own __init__ almost certainly sets
-    self.instance_id from manifest/config automatically, based on
-    on_player_enabled()/players() in PlayerProvider both using
-    self.instance_id as something already present by the time they run.
-    The manual `self.instance_id = getattr(config, "instance_id", None)`
-    stopgap below should very likely be deleted once this class actually
-    subclasses PlayerProvider and calls super().__init__(mass, manifest,
-    config) -- but confirm Provider's real __init__ first rather than
-    assuming.
+    unload()'s signature also needed a real fix, not just a guess: the
+    base class takes `is_removed: bool = False`, which the previous
+    version didn't have at all.
     """
 
     def __init__(self, mass, manifest, config) -> None:
-        self.mass = mass
-        self.manifest = manifest
-        self.config = config
-        # TODO: stopgap only -- delete once subclassing PlayerProvider
-        # properly makes this redundant (see class docstring above).
-        self.instance_id = getattr(config, "instance_id", None)
+        super().__init__(mass, manifest, config)
         self._processes: dict[str, AirplayMultiroomProcess] = {}
-
-    # TODO: stopgap only, same category as the instance_id patch above --
-    # MA's setup flow calls this before the provider finishes registering
-    # and it doesn't exist without a real base class. An empty list is a
-    # safe guess (no user-configurable settings needed for this provider
-    # yet) but the real signature/return type should be confirmed against
-    # the actual Provider/PlayerProvider base class, not assumed. Delete
-    # once that class is found and this is properly inherited instead.
-    def get_config_entries(self) -> list:
-        return []
 
     async def discover_players(self) -> None:
         """Discover and register players for this provider.
 
         Overriding this method (rather than mDNS-style auto-discovery) is
-        confirmed correct for this use case: the real PlayerProvider base
-        class's own docstring for this method says "For providers that
-        support dynamic discovery of players via mdns, there is no need
-        to implement this method" -- meaning it's specifically the
-        intended override point for a provider that, like this one,
-        deliberately skips mDNS and registers its players directly.
+        confirmed correct for this use case: PlayerProvider's own
+        docstring for this method says "For providers that support
+        dynamic discovery of players via mdns, there is no need to
+        implement this method" -- meaning it's specifically the intended
+        override point for a provider that, like this one, deliberately
+        skips mDNS and registers its players directly.
         """
         binary_path = await resolve_binary()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -476,5 +467,13 @@ class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
             port += 1
             udp_base += 10
 
-    async def unload(self) -> None:
+        # Newly-confirmed requirement (from the real Provider base class):
+        # self.available starts False and doesn't flip automatically.
+        # Setting it here, at the end of a successful discover_players(),
+        # on the reasoning that "available" should mean "actually did the
+        # setup work and has running processes" -- not yet confirmed
+        # against how other providers decide exactly when to set this.
+        self.available = True
+
+    async def unload(self, is_removed: bool = False) -> None:
         await asyncio.gather(*(p.stop() for p in self._processes.values()))
