@@ -77,8 +77,6 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .binary_fetch import ensure_binary
-
 LOGGER = logging.getLogger(__name__)
 
 CONFIG_DIR = Path("/config/dbase_and_logs/airplay-multiroom-audio")
@@ -273,6 +271,67 @@ class AirplayMultiroomProcess:
 # ---------------------------------------------------------------------------
 
 
+async def resolve_binary() -> Path:
+    """Find a usable shairport-sync-pa binary, preferring a system install.
+
+    Resolution order:
+      1. AIRPLAY_MULTIROOM_SPS_BINARY env var, if set -- explicit override,
+         highest priority, no further checks beyond existence+executable.
+      2. `shairport-sync` on $PATH, if present -- covers exactly the
+         Linux Mint POC case: you already compiled and installed one
+         yourself with the right flags, no reason to also download a
+         second copy just to satisfy this provider.
+      3. Fall back to the download/verify/cache path (ensure_binary()),
+         for environments (the actual MA dev-server / HAOS deployment)
+         where there's no pre-installed binary to find.
+
+    For paths 1 and 2, this does NOT re-verify against the pinned SHA256
+    in binary_fetch.py -- that check only applies to what this module
+    downloads itself. A system-installed binary is trusted as-is, same as
+    trusting whatever you already built and ran `-V` on by hand. Worth
+    remembering if this ever stops being "just me testing on my own Mint
+    box" and becomes something other people run.
+    """
+    override = os.environ.get("AIRPLAY_MULTIROOM_SPS_BINARY")
+    if override:
+        override_path = Path(override)
+        if not override_path.exists():
+            raise RuntimeError(
+                f"AIRPLAY_MULTIROOM_SPS_BINARY is set to {override_path}, "
+                "but that path does not exist."
+            )
+        if not os.access(override_path, os.X_OK):
+            raise RuntimeError(f"{override_path} exists but is not executable.")
+        LOGGER.info("Using shairport-sync binary from AIRPLAY_MULTIROOM_SPS_BINARY: %s", override_path)
+        return override_path
+
+    system_binary = shutil.which("shairport-sync")
+    if system_binary:
+        binary_path = Path(system_binary)
+        LOGGER.info(
+            "Using system shairport-sync from PATH: %s -- assuming it was built "
+            "with --with-pa (this provider does not verify that; confirm with "
+            "'shairport-sync -V' yourself if unsure)",
+            binary_path,
+        )
+        return binary_path
+
+    LOGGER.info(
+        "No system shairport-sync found (no AIRPLAY_MULTIROOM_SPS_BINARY set, "
+        "none on PATH) -- falling back to downloading a verified binary"
+    )
+    try:
+        from .binary_fetch import ensure_binary
+    except ImportError as exc:
+        raise RuntimeError(
+            "No system shairport-sync found, and binary_fetch.py is not "
+            "present to fall back to downloading one. Either install "
+            "shairport-sync (with --with-pa) and ensure it's on PATH or set "
+            "AIRPLAY_MULTIROOM_SPS_BINARY, or restore binary_fetch.py."
+        ) from exc
+    return await ensure_binary(CACHE_DIR)
+
+
 class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
     """Sketch of the provider's setup flow. Not a complete PlayerProvider."""
 
@@ -281,7 +340,7 @@ class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
         self._processes: dict[str, AirplayMultiroomProcess] = {}
 
     async def setup(self) -> None:
-        binary_path = await ensure_binary(CACHE_DIR)
+        binary_path = await resolve_binary()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
         sinks = await discover_remap_sinks()
