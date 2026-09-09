@@ -433,6 +433,16 @@ class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
         self.instance_id = getattr(config, "instance_id", None)
         self._processes: dict[str, AirplayMultiroomProcess] = {}
 
+    # TODO: stopgap only, same category as the instance_id patch above --
+    # MA's setup flow calls this before the provider finishes registering
+    # and it doesn't exist without a real base class. An empty list is a
+    # safe guess (no user-configurable settings needed for this provider
+    # yet) but the real signature/return type should be confirmed against
+    # the actual Provider/PlayerProvider base class, not assumed. Delete
+    # once that class is found and this is properly inherited instead.
+    def get_config_entries(self) -> list:
+        return []
+
     async def discover_players(self) -> None:
         """Discover and register players for this provider.
 
