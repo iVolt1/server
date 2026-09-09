@@ -399,13 +399,51 @@ async def resolve_binary() -> Path:
 
 
 class AirplayMultiroomProvider:  # TODO: subclass the real PlayerProvider base
-    """Sketch of the provider's setup flow. Not a complete PlayerProvider."""
+    """Sketch of the provider. Not yet a complete PlayerProvider.
 
-    def __init__(self, mass) -> None:  # TODO: real __init__ signature
+    Confirmed against real source this round:
+      - __init__ signature: (mass, manifest, config), matching
+        AirPlayReceiverProvider(mass, manifest, config) in the real
+        built-in provider's __init__.py.
+      - discover_players() is the correct override point for a provider
+        that registers players directly instead of via mDNS -- confirmed
+        from the real PlayerProvider base class's own docstring for that
+        method.
+
+    Still needed: PlayerProvider subclasses Provider (music_assistant.models
+    .provider, going by the `from .provider import Provider` relative
+    import in the PlayerProvider source found this session -- module path
+    not yet confirmed). Provider's own __init__ almost certainly sets
+    self.instance_id from manifest/config automatically, based on
+    on_player_enabled()/players() in PlayerProvider both using
+    self.instance_id as something already present by the time they run.
+    The manual `self.instance_id = getattr(config, "instance_id", None)`
+    stopgap below should very likely be deleted once this class actually
+    subclasses PlayerProvider and calls super().__init__(mass, manifest,
+    config) -- but confirm Provider's real __init__ first rather than
+    assuming.
+    """
+
+    def __init__(self, mass, manifest, config) -> None:
         self.mass = mass
+        self.manifest = manifest
+        self.config = config
+        # TODO: stopgap only -- delete once subclassing PlayerProvider
+        # properly makes this redundant (see class docstring above).
+        self.instance_id = getattr(config, "instance_id", None)
         self._processes: dict[str, AirplayMultiroomProcess] = {}
 
-    async def setup(self) -> None:
+    async def discover_players(self) -> None:
+        """Discover and register players for this provider.
+
+        Overriding this method (rather than mDNS-style auto-discovery) is
+        confirmed correct for this use case: the real PlayerProvider base
+        class's own docstring for this method says "For providers that
+        support dynamic discovery of players via mdns, there is no need
+        to implement this method" -- meaning it's specifically the
+        intended override point for a provider that, like this one,
+        deliberately skips mDNS and registers its players directly.
+        """
         binary_path = await resolve_binary()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -1,31 +1,36 @@
 """Package entry point for the AirPlay Multiroom Audio provider.
 
-TODO: this file's shape (an async setup() returning the provider instance)
-is a best-effort guess based on the common pattern of "manifest declares a
-domain, MA dynamically imports that package and calls setup()" seen across
-similar plugin-loading frameworks -- and is consistent with
-get_config_entries() living as a PlayerProvider *instance* method rather
-than a bare module function (something has to construct that instance
-first). It is NOT confirmed against a real MA provider's actual __init__.py
-in this session. Before relying on this: open an existing provider's
-__init__.py (e.g. the built-in airplay provider, or local_audio if it's
-still present) and compare the real setup() signature -- what arguments it
-receives (mass instance? manifest? config?), and what it's expected to
-return -- against what's sketched here, and correct as needed.
+setup() signature and pattern confirmed directly against the real
+built-in AirPlay Receiver plugin's __init__.py: construct the provider
+directly with (mass, manifest, config), no separate awaited setup() call
+from here. The earlier version of this file guessed at a
+construct-then-await-setup() pattern that was wrong -- almost certainly
+why AirplayMultiroomProvider was missing an instance_id attribute, since
+that's very likely set inside the base PlayerProvider's own __init__ from
+manifest/config, which the wrong pattern never passed through at all.
+
+Still unconfirmed: whether AirplayMultiroomProvider actually needs to
+subclass a real PlayerProvider base class for this to work end to end
+(almost certainly yes, given instance_id and presumably other attributes
+come from that base __init__) -- see provider.py's own TODOs.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .provider import AirplayMultiroomProvider
 
-# TODO: confirm real signature. This guess assumes MA's core calls
-# setup(mass, manifest, config) and awaits a provider instance back, based
-# on the general "dynamic import + setup() entry point" pattern -- but the
-# actual parameter set, and whether config setup happens here or inside
-# the provider's own async setup()/start() lifecycle method, needs
-# verifying against real source before this is trustworthy.
-async def setup(mass, manifest, config) -> AirplayMultiroomProvider:
-    """Entry point MA's provider loader is expected to call."""
-    provider = AirplayMultiroomProvider(mass)
-    await provider.setup()
-    return provider
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.provider import ProviderManifest
+
+    from music_assistant.mass import MusicAssistant
+    from music_assistant.models import ProviderInstanceType
+
+
+async def setup(
+    mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+) -> ProviderInstanceType:
+    """Initialize provider(instance) with given configuration."""
+    return AirplayMultiroomProvider(mass, manifest, config)
