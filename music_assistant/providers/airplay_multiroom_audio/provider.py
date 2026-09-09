@@ -79,7 +79,18 @@ from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
-CONFIG_DIR = Path("/config/dbase_and_logs/airplay-multiroom-audio")
+# TODO: same issue as CACHE_DIR below -- /config is a HAOS/container
+# convention, not guaranteed to exist or be writable when running MA
+# directly as a regular user (confirmed: this failed with PermissionError
+# the same way CACHE_DIR did). Should eventually come from MA's own
+# provider-storage API if one exists; for now, same env-var-with-writable-
+# default pattern as CACHE_DIR.
+CONFIG_DIR = Path(
+    os.environ.get(
+        "AIRPLAY_MULTIROOM_CONFIG_DIR",
+        Path.home() / ".cache" / "airplay-multiroom-audio" / "config",
+    )
+)
 # TODO: /data is not guaranteed writable -- confirmed the hard way (this
 # hardcoded path failed with PermissionError running MA directly, outside
 # any container, as a regular user). This should come from whatever MA's
