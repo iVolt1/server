@@ -1,0 +1,9 @@
+{
+  "type": "player",
+  "domain": "airplay_multiroom_audio",
+  "name": "AirPlay Multiroom Audio",
+  "description": "Spawns one shairport-sync-pa (RAOP/AirPlay 1) receiver per PulseAudio remap-sink zone created by the Multiroom Audio addon, registering each directly as a player without mDNS discovery.",
+  "codeowners": ["@iVolt1"],
+  "requirements": ["aiohttp"],
+  "_comment_TODO": "This is a placeholder structure, not confirmed against a real manifest.json from the current MA source tree. Compare directly against an existing provider (e.g. the airplay provider's own manifest.json) before assuming any of these keys are correct or complete -- multi_instance, documentation, codeowners format, and requirements handling have all changed across MA versions referenced elsewhere in this session's own history."
+}
