@@ -82,7 +82,15 @@ from .binary_fetch import ensure_binary
 LOGGER = logging.getLogger(__name__)
 
 CONFIG_DIR = Path("/config/dbase_and_logs/airplay-multiroom-audio")
-CACHE_DIR = Path("/data/airplay-multiroom-audio-bin")
+# TODO: /data is not guaranteed writable -- confirmed the hard way (this
+# hardcoded path failed with PermissionError running MA directly, outside
+# any container, as a regular user). This should come from whatever MA's
+# own API for provider persistent-storage location is (something like
+# mass.storage_path, if that exists -- unverified, same category as the
+# other MA-internal TODOs in provider.py) rather than being hardcoded here.
+# For now, points at a location under the current user's home so local
+# testing can proceed; do not ship this default as-is.
+CACHE_DIR = Path(os.environ.get("AIRPLAY_MULTIROOM_CACHE_DIR", Path.home() / ".cache" / "airplay-multiroom-audio-bin"))
 
 PORT_BASE_DEFAULT = 5020
 UDP_PORT_BASE_DEFAULT = 6001
