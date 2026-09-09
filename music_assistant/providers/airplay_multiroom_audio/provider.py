@@ -170,6 +170,11 @@ async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[st
     addon's scoping decision intended.
     """
     include_all = os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS", "").lower() in ("1", "true", "yes")
+    LOGGER.info(
+        "AIRPLAY_MULTIROOM_ALL_SINKS raw value: %r -- include_all resolved to %s",
+        os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS"),
+        include_all,
+    )
     for attempt in range(1, retries + 1):
         returncode, stdout, stderr = await _run(["pactl", "list", "sinks", "short"])
         if returncode != 0:
@@ -251,8 +256,9 @@ class AirplayMultiroomProcess:
             str(self.zone.port),
             "-c",
             str(self.config_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            "-vv",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         # TODO: confirm readiness before registering with MA (see module
         # docstring / earlier conversation) -- a bounded poll of the
@@ -261,9 +267,21 @@ class AirplayMultiroomProcess:
         # immediately ready. Not implemented here since it depends on #1.
         await asyncio.sleep(0.2)
         if self._proc.returncode is not None:
+            # Process already exited -- read whatever it printed before
+            # dying instead of discarding it. This is exactly the output
+            # that would have been dumped straight to DEVNULL before;
+            # don't repeat the "guess at the failure instead of reading
+            # the actual error text" mistake from earlier tonight.
+            output = b""
+            if self._proc.stdout is not None:
+                try:
+                    output = await asyncio.wait_for(self._proc.stdout.read(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
             raise RuntimeError(
                 f"shairport-sync-pa for {self.zone.sink_name} exited immediately "
-                f"with code {self._proc.returncode} -- check the binary and config"
+                f"with code {self._proc.returncode}:\n"
+                f"{output.decode(errors='replace')}"
             )
 
     async def stop(self, timeout: float = 5.0) -> None:
