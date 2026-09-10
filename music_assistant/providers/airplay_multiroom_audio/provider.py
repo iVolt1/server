@@ -695,7 +695,27 @@ class AirplayMultiroomProvider(PlayerProvider):
         implement this method" -- meaning it's specifically the intended
         override point for a provider that, like this one, deliberately
         skips mDNS and registers its players directly.
+
+        Body wrapped in try/except purely for diagnostics: MA's own task
+        wrapper logs "Exception in task ... target: <coroutine>:" with
+        nothing after the colon when this fails, no traceback, no message
+        -- not something this file controls. LOGGER.exception() here
+        guarantees the real error actually gets logged somewhere, whatever
+        MA's own wrapper does or doesn't show. Re-raises unchanged so
+        MA's own error handling/state (provider load failure, etc.) still
+        happens exactly as it would have.
         """
+        try:
+            await self._discover_players_impl()
+        except Exception:
+            LOGGER.exception(
+                "discover_players() failed -- full traceback follows "
+                "(MA's own task-exception log line for this doesn't "
+                "include one)"
+            )
+            raise
+
+    async def _discover_players_impl(self) -> None:
         binary_path = await resolve_binary()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
