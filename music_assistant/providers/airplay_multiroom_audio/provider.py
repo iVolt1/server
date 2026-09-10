@@ -502,6 +502,12 @@ async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[st
             await asyncio.sleep(delay)
             continue
 
+        LOGGER.debug(
+            "pactl list sinks found %d sink(s): %s",
+            len(all_sinks),
+            [s["name"] for s in all_sinks],
+        )
+
         if force_all:
             return [s["name"] for s in all_sinks]
 
@@ -509,6 +515,12 @@ async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[st
         masters_with_children = {
             s["master_device"] for s in remap_sinks if s.get("master_device")
         }
+        LOGGER.debug(
+            "%d remap sink(s): %s -- master_device values found: %s",
+            len(remap_sinks),
+            [s["name"] for s in remap_sinks],
+            masters_with_children or "(none)",
+        )
         if remap_sinks and not masters_with_children:
             LOGGER.warning(
                 "Found %d remap sink(s) but could not determine any master/child "
@@ -527,6 +539,23 @@ async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[st
             if "module-remap-sink" in s.get("driver", "")
             or s["name"] not in masters_with_children
         ]
+        excluded = [
+            s["name"]
+            for s in all_sinks
+            if "module-remap-sink" not in s.get("driver", "")
+            and s["name"] in masters_with_children
+        ]
+        if excluded:
+            LOGGER.debug(
+                "Excluded %d sink(s) as masters with remap children: %s -- "
+                "if any of these should actually have gotten their own "
+                "AirPlay instance, the master_device detection likely "
+                "matched incorrectly; check against real `pactl list "
+                "sinks` output for that specific sink.",
+                len(excluded),
+                excluded,
+            )
+        LOGGER.debug("Final selected sink list (%d): %s", len(selected), selected)
         if selected:
             return selected
         LOGGER.info("No eligible sinks found yet (attempt %d/%d)", attempt, retries)
