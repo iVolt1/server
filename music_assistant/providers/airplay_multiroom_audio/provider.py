@@ -111,14 +111,21 @@ SYNTHETIC_AIRPLAY_TXT = {"am": "ShairportSync", "txtvers": "1"}
 
 async def announce_as_airplay_device(
     mass, zone: SinkZone, raop_wait_timeout: float = 5.0
-):
+) -> tuple[object | None, str | None]:
     """Register a synthetic _airplay._tcp record so the built-in AirPlayProvider
     discovers this zone's shairport-sync-pa instance immediately instead of
     stalling ~10s per device.
 
-    Returns the registered AsyncServiceInfo (so the caller can unregister it
-    on unload -- see AirplayMultiroomProvider.unload()), or None if no RAOP
-    record was found to announce against.
+    Returns (airplay_info, raop_name):
+      - airplay_info: the registered AsyncServiceInfo (so the caller can
+        unregister it on unload), or None if registration was skipped/failed.
+      - raop_name: the real RAOP mDNS service name found for this zone
+        (e.g. "<MAC>@<announce_name>._raop._tcp.local."), or None if no
+        RAOP record was found at all. Needed separately from airplay_info
+        because it's what AirPlayProvider.on_mdns_service_state_change()
+        needs to cleanly unregister the player when this zone's process
+        stops -- see notify_airplay_provider_removed() -- and is still
+        useful for that even when the synthetic record itself failed.
 
     Root cause this addresses, confirmed directly from real
     DiscoveryController/AirPlayProvider source pulled during this session:
@@ -185,7 +192,7 @@ async def announce_as_airplay_device(
             zone.sink_name,
             raop_wait_timeout,
         )
-        return
+        return None, None
 
     # raop_info.name is "<pseudo-MAC>@<sink_name>._raop._tcp.local." -- the
     # pseudo-MAC prefix is generated internally by tinysvcmdns, not something
@@ -260,13 +267,58 @@ async def announce_as_airplay_device(
                 airplay_info.name,
                 zone.sink_name,
             )
-            return None
+            return None, raop_info.name
     LOGGER.debug(
         "Registered synthetic _airplay._tcp record for %s (as %s)",
         zone.sink_name,
         airplay_info.name,
     )
-    return airplay_info
+    return airplay_info, raop_info.name
+
+
+async def notify_airplay_provider_removed(mass, raop_name: str) -> None:
+    """Tell the built-in AirPlayProvider directly that a zone's RAOP
+    receiver is going away, instead of waiting on shairport-sync's own
+    mDNS goodbye (if it sends one at all -- not confirmed either way) or
+    a real record's TTL to expire.
+
+    Calls AirPlayProvider.on_mdns_service_state_change() directly with
+    ServiceStateChange.Removed -- the exact same real, confirmed teardown
+    path (remove the Sendspin bridge, unregister the player) that a real
+    device going offline triggers normally. Same "reuse the real, already-
+    working logic" approach as the registration side of this file.
+
+    UNVERIFIED: mass.get_provider_instances("airplay") is inferred from
+    one confirmed real usage elsewhere in this session
+    (get_provider_instances("airplay_receiver") in AirPlayProvider's own
+    _is_own_airplay_receiver source) plus AirPlayProvider's confirmed
+    DOMAIN = "airplay" constant -- not independently confirmed that this
+    exact call returns what's expected here. If this silently does
+    nothing, that's the first thing to check.
+    """
+    from zeroconf import ServiceStateChange  # noqa: PLC0415
+
+    providers = mass.get_provider_instances("airplay")
+    if not providers:
+        LOGGER.debug(
+            "No AirPlayProvider instance found -- cannot notify it that "
+            "%s is being removed (it'll fall back to noticing on its own, "
+            "however/whenever that happens)",
+            raop_name,
+        )
+        return
+    for provider in providers:
+        try:
+            await provider.on_mdns_service_state_change(
+                raop_name, ServiceStateChange.Removed, None
+            )
+        except Exception:
+            LOGGER.exception(
+                "Error notifying AirPlayProvider that %s was removed -- "
+                "it may end up with a stale player entry until it notices "
+                "some other way",
+                raop_name,
+            )
 
 
 class AirplayMultiroomPlayer(Player):
@@ -800,6 +852,9 @@ class AirplayMultiroomProvider(PlayerProvider):
         self._processes: dict[str, AirplayMultiroomProcess] = {}
         self._airplay_infos: dict[str, object] = {}  # AsyncServiceInfo, kept as
         # `object` to avoid importing zeroconf at module scope just for a type hint
+        self._raop_names: dict[str, str] = {}  # real RAOP mDNS name per sink,
+        # needed at teardown to notify AirPlayProvider -- see unload() and
+        # notify_airplay_provider_removed()
 
     async def discover_players(self) -> None:
         """Discover and register players for this provider.
@@ -856,9 +911,11 @@ class AirplayMultiroomProvider(PlayerProvider):
             # actually playing through). This announces the record that lets
             # that discovery happen fast instead of ~10s/device, rather than
             # registering a second, non-functional, competing player entry.
-            airplay_info = await announce_as_airplay_device(self.mass, zone)
+            airplay_info, raop_name = await announce_as_airplay_device(self.mass, zone)
             if airplay_info is not None:
                 self._airplay_infos[sink_name] = airplay_info
+            if raop_name is not None:
+                self._raop_names[sink_name] = raop_name
 
             port += 1
             udp_base += 10
@@ -872,6 +929,23 @@ class AirplayMultiroomProvider(PlayerProvider):
         self.available = True
 
     async def unload(self, is_removed: bool = False) -> None:
+        # Tell the real AirPlayProvider directly, before anything else, that
+        # every one of these players is going away -- rather than leaving it
+        # to notice on its own via an mDNS goodbye (not confirmed shairport-
+        # sync even sends one) or TTL expiry. This is very plausibly the
+        # actual source of the stale/duplicate player entries seen requiring
+        # manual provider-and-settings deletion on other MA instances: a
+        # provider reload/disable cycle stopped the processes without ever
+        # telling AirPlayProvider they were gone.
+        await asyncio.gather(
+            *(
+                notify_airplay_provider_removed(self.mass, raop_name)
+                for raop_name in self._raop_names.values()
+            ),
+            return_exceptions=True,
+        )
+        self._raop_names.clear()
+
         await asyncio.gather(*(p.stop() for p in self._processes.values()))
         # No self._players to unregister anymore -- see discover_players()'s
         # comment on why native player registration was replaced with the
