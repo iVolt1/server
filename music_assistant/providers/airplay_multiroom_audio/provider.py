@@ -165,7 +165,21 @@ async def announce_as_airplay_device(
     # built-in AirPlayProvider register a player literally named "alsa_output"
     # for exactly this kind of sink. Matching against the same truncated form
     # is what makes the lookup agree with what's actually in the cache.
-    name_filter = zone.sink_name.split(".", 1)[0]
+    #
+    # SECOND, separate truncation, confirmed on real HAOS hardware: DNS
+    # labels have a hard 63-byte wire-format limit (RFC 1035). The
+    # advertised name is "<12-hex-char pseudo-MAC>@<sink_name>" -- 13 fixed
+    # bytes of prefix, leaving 50 for the sink name itself. A sink name
+    # longer than that gets silently truncated by the mDNS stack before
+    # it's ever announced. Confirmed exactly: a real HAOS sink name
+    # ("HD_Audio_Generic_Digital_Surround_7_1_HDMI_2_fc_lfe", 51 chars,
+    # 64 combined with the MAC prefix -- one byte over) consistently failed
+    # this lookup, while announcing/registering fine as its own truncated
+    # 50-char form (missing exactly the trailing "e") via the slower
+    # built-in mDNS path. Truncating our own search target to the same
+    # 50-byte budget is what makes the lookup match what's actually on
+    # the wire.
+    name_filter = zone.sink_name.split(".", 1)[0][:50]
     raop_info = await mass.discovery.async_find_mdns_service(
         RAOP_DISCOVERY_TYPE, name_filter=name_filter, timeout=raop_wait_timeout
     )
