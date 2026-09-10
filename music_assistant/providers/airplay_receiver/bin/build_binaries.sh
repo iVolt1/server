@@ -51,6 +51,8 @@ build_linux() {
                 libssl-dev \
                 libdbus-1-dev \
                 libglib2.0-dev \
+                libpulse-dev \
+                libsoxr-dev \
                 ca-certificates
 
             # Fetch the pinned tag and verify it against the commit SHA from Dockerfile.base
@@ -70,9 +72,12 @@ build_linux() {
                 --with-metadata \
                 --without-avahi \
                 --without-dns-sd \
+                --without-alsa \
                 --with-tinysvcmdns \
                 --with-ssl=openssl \
                 --with-stdout \
+                --with-pa \
+                --with-soxr \
                 --sysconfdir=/etc
 
             make -j\$(nproc)
