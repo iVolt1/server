@@ -111,10 +111,14 @@ SYNTHETIC_AIRPLAY_TXT = {"am": "ShairportSync", "txtvers": "1"}
 
 async def announce_as_airplay_device(
     mass, zone: SinkZone, raop_wait_timeout: float = 5.0
-) -> None:
+):
     """Register a synthetic _airplay._tcp record so the built-in AirPlayProvider
     discovers this zone's shairport-sync-pa instance immediately instead of
     stalling ~10s per device.
+
+    Returns the registered AsyncServiceInfo (so the caller can unregister it
+    on unload -- see AirplayMultiroomProvider.unload()), or None if no RAOP
+    record was found to announce against.
 
     Root cause this addresses, confirmed directly from real
     DiscoveryController/AirPlayProvider source pulled during this session:
@@ -187,6 +191,7 @@ async def announce_as_airplay_device(
     # first "@" in whichever info.name it's given.
     base_name = raop_info.name.split(".", 1)[0]  # "<MAC>@<sink_name>"
 
+    from zeroconf import NonUniqueNameException  # noqa: PLC0415
     from zeroconf.asyncio import AsyncServiceInfo  # noqa: PLC0415
 
     airplay_info = AsyncServiceInfo(
@@ -202,12 +207,29 @@ async def announce_as_airplay_device(
         properties=SYNTHETIC_AIRPLAY_TXT,
         server=raop_info.server,
     )
-    await mass.discovery.aiozc.async_register_service(airplay_info)
+    aiozc = mass.discovery.aiozc
+    try:
+        await aiozc.async_register_service(airplay_info)
+    except NonUniqueNameException:
+        # Same reclaim pattern as AirPlayProvider._register_dacp_service()'s
+        # real source (confirmed this session): our service name is
+        # deterministic per sink, so a prior run's registration that was
+        # never cleanly unregistered on unload collides with this one.
+        # Flush the stale record and register again, rather than fail.
+        LOGGER.debug(
+            "Synthetic _airplay._tcp record %s already registered "
+            "(stale from a prior load) -- reclaiming",
+            airplay_info.name,
+        )
+        await aiozc.async_unregister_service(airplay_info)
+        await asyncio.sleep(1.0)  # matches DACP_RECLAIM_DELAY's real value
+        await aiozc.async_register_service(airplay_info)
     LOGGER.debug(
         "Registered synthetic _airplay._tcp record for %s (as %s)",
         zone.sink_name,
         airplay_info.name,
     )
+    return airplay_info
 
 
 class AirplayMultiroomPlayer(Player):
@@ -684,6 +706,8 @@ class AirplayMultiroomProvider(PlayerProvider):
     def __init__(self, mass, manifest, config) -> None:
         super().__init__(mass, manifest, config)
         self._processes: dict[str, AirplayMultiroomProcess] = {}
+        self._airplay_infos: dict[str, object] = {}  # AsyncServiceInfo, kept as
+        # `object` to avoid importing zeroconf at module scope just for a type hint
 
     async def discover_players(self) -> None:
         """Discover and register players for this provider.
@@ -740,7 +764,9 @@ class AirplayMultiroomProvider(PlayerProvider):
             # actually playing through). This announces the record that lets
             # that discovery happen fast instead of ~10s/device, rather than
             # registering a second, non-functional, competing player entry.
-            await announce_as_airplay_device(self.mass, zone)
+            airplay_info = await announce_as_airplay_device(self.mass, zone)
+            if airplay_info is not None:
+                self._airplay_infos[sink_name] = airplay_info
 
             port += 1
             udp_base += 10
@@ -758,7 +784,21 @@ class AirplayMultiroomProvider(PlayerProvider):
         # No self._players to unregister anymore -- see discover_players()'s
         # comment on why native player registration was replaced with the
         # synthetic mDNS announcement. The built-in AirPlayProvider owns
-        # unregistering its own players when their mDNS records disappear
-        # (that record teardown isn't handled here yet -- worth adding:
-        # unregister the synthetic service on unload so a removed zone's
-        # AirPlay entry doesn't linger as a stale advertisement).
+        # unregistering its own players when their mDNS records disappear.
+        #
+        # This part closes a gap that was actually hit, not just a
+        # theoretical one: without it, a synthetic _airplay._tcp record
+        # (deterministically named per sink) survives across a
+        # disable/enable cycle and collides with the next registration
+        # attempt, raising zeroconf.NonUniqueNameException. The reclaim
+        # logic in announce_as_airplay_device() recovers from that when it
+        # happens, but not registering a stale record in the first place is
+        # better than recovering from one every time.
+        await asyncio.gather(
+            *(
+                self.mass.discovery.aiozc.async_unregister_service(info)
+                for info in self._airplay_infos.values()
+            ),
+            return_exceptions=True,
+        )
+        self._airplay_infos.clear()
