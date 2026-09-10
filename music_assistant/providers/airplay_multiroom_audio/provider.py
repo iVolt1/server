@@ -149,8 +149,21 @@ async def announce_as_airplay_device(
     -- if it still takes the full timeout, this assumption was wrong and the
     mechanism needs rethinking, not just retrying.
     """
+    # name_filter must be the truncated first-DNS-label form of the sink
+    # name, not the raw sink name -- confirmed the hard way. DNS names are
+    # dot-separated by definition; neither DiscoveryController's own matcher
+    # nor AirPlayProvider's real name parser (info.name.split(".")[0]
+    # .split("@", 1), confirmed from source) escapes dots in the device-name
+    # portion. A sink name containing a literal dot (e.g. raw PipeWire/ALSA
+    # names like "alsa_output.pci-....analog-stereo.2" -- NOT the addon's own
+    # underscore-only sink names, which are unaffected) gets silently
+    # truncated everywhere in the real system, confirmed by watching the
+    # built-in AirPlayProvider register a player literally named "alsa_output"
+    # for exactly this kind of sink. Matching against the same truncated form
+    # is what makes the lookup agree with what's actually in the cache.
+    name_filter = zone.sink_name.split(".", 1)[0]
     raop_info = await mass.discovery.async_find_mdns_service(
-        RAOP_DISCOVERY_TYPE, name_filter=zone.sink_name, timeout=raop_wait_timeout
+        RAOP_DISCOVERY_TYPE, name_filter=name_filter, timeout=raop_wait_timeout
     )
     if raop_info is None:
         LOGGER.warning(
@@ -311,61 +324,132 @@ async def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
-async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[str]:
-    """List PulseAudio sink names, retrying if none are found yet.
+def _parse_pactl_sinks_verbose(output: str) -> list[dict[str, str]]:
+    """Parse `pactl list sinks` (verbose) output into a list of per-sink dicts.
 
-    By default, only lists module-remap-sink sinks -- matching the
-    original standalone addon's deliberate scoping (its own header
-    comments: masters that don't get a remap sink from the Multiroom
-    Audio addon get no AirPlay instance either, "by design"). This
-    directly encodes a lesson from tonight's live debugging too: the
-    standalone addon's generator script had a known, and eventually
-    actually-hit, startup-order race against that addon -- its own header
-    comments flagged the risk months ago ("if that ever proves to be a
-    real problem... the fix is a short retry/wait loop"), and it did
-    prove to be a real problem, repeatedly, during testing. Build the
-    retry in from day one here rather than waiting to hit it.
-
-    Set AIRPLAY_MULTIROOM_ALL_SINKS=1 to include every PulseAudio sink,
-    not just remap-sink ones -- for dev/POC testing on a box that doesn't
-    have the Multiroom Audio addon running at all (module-remap-sink sinks
-    can never exist there, no matter how long the retry loop waits). Not
-    the intended default for a real deployment: it changes which physical
-    outputs get an AirPlay instance, silently, versus what the original
-    addon's scoping decision intended.
+    Each dict has at least "name" and "driver"; "master_device" is present
+    only when the sink's Properties block carries a device.master_device
+    key. UNVERIFIED: this property name/format is inferred from this
+    project's own local_audio provider history (its remap_topology.py used
+    device.master_device for exactly this kind of relationship detection),
+    not confirmed against a real `pactl list sinks` dump for this addon's
+    actual remap sinks. Verify directly: `pactl list sinks | grep -A 40
+    module-remap-sink` on the real system, and check the Properties block
+    for whatever key actually links a remap sink back to its master --
+    fix the property name below if it's different.
     """
-    include_all = os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS", "").lower() in ("1", "true", "yes")
-    LOGGER.info(
-        "AIRPLAY_MULTIROOM_ALL_SINKS raw value: %r -- include_all resolved to %s",
-        os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS"),
-        include_all,
-    )
+    sinks: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    in_properties = False
+    for line in output.splitlines():
+        if line.startswith("Sink #"):
+            if current.get("name"):
+                sinks.append(current)
+            current = {}
+            in_properties = False
+            continue
+        stripped = line.strip()
+        if stripped.startswith("Name:"):
+            current["name"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Driver:"):
+            current["driver"] = stripped.split(":", 1)[1].strip()
+        elif stripped == "Properties:":
+            in_properties = True
+        elif in_properties and stripped.startswith("device.master_device"):
+            # Property lines look like: device.master_device = "some-value"
+            value = stripped.split("=", 1)[1].strip().strip('"')
+            current["master_device"] = value
+        elif in_properties and stripped and not stripped.startswith(('"', "device.")):
+            # A non-property-looking line (e.g. the next section header)
+            # ends the Properties block for this sink.
+            in_properties = False
+    if current.get("name"):
+        sinks.append(current)
+    return sinks
+
+
+async def discover_remap_sinks(retries: int = 10, delay: float = 2.0) -> list[str]:
+    """List PulseAudio sink names to create AirPlay instances for, retrying
+    if none are found yet.
+
+    Selection rule: every module-remap-sink sink, PLUS every sink that has
+    no remap-sink children of its own -- but NOT a multichannel card's bare
+    master sink when it DOES have remap children (that card's real zones
+    already cover it; a redundant raw-master AirPlay instance alongside
+    them would just be confusing). This matches what the goal actually is:
+    AirPlay coverage for every real audio destination, whether or not the
+    Multiroom Audio addon happened to create a remap zone for it -- not
+    "only what that addon explicitly created," which was the older,
+    narrower scoping this replaces.
+
+    Master/child relationship is detected via each remap sink's
+    device.master_device property -- see _parse_pactl_sinks_verbose()'s
+    docstring for why that's an inference, not a confirmed fact, and how to
+    check it directly. If that detection fails to identify any relationship
+    at all (property missing/unparseable on every remap sink found), this
+    falls back to including everything rather than silently dropping a
+    legitimate standalone sink -- the safer failure direction given the
+    stated goal is broader coverage, not narrower.
+
+    Set AIRPLAY_MULTIROOM_ALL_SINKS=1 to skip the master-exclusion logic
+    entirely and include literally every sink, remap or not, master-with-
+    children or not -- useful for debugging this selection logic itself,
+    not the intended normal mode now that the rule above is the default.
+
+    This also directly encodes a lesson from tonight's live debugging: the
+    standalone addon's generator script had a known, and eventually
+    actually-hit, startup-order race against the Multiroom Audio addon --
+    build the retry in from day one here rather than waiting to hit it.
+    """
+    force_all = os.environ.get("AIRPLAY_MULTIROOM_ALL_SINKS", "").lower() in ("1", "true", "yes")
     for attempt in range(1, retries + 1):
-        returncode, stdout, stderr = await _run(["pactl", "list", "sinks", "short"])
+        returncode, stdout, stderr = await _run(["pactl", "list", "sinks"])
         if returncode != 0:
             LOGGER.warning(
                 "pactl list sinks failed (attempt %d/%d): %s", attempt, retries, stderr.strip()
             )
-        else:
-            sinks = [
-                line.split()[1]
-                for line in stdout.splitlines()
-                if len(line.split()) > 1 and (include_all or "module-remap-sink" in line)
-            ]
-            if sinks:
-                return sinks
-            LOGGER.info(
-                "No %ssinks found yet (attempt %d/%d)%s",
-                "" if include_all else "module-remap-sink ",
-                attempt,
-                retries,
-                "" if include_all else " -- Multiroom Audio addon topology may not exist yet",
+            await asyncio.sleep(delay)
+            continue
+
+        all_sinks = _parse_pactl_sinks_verbose(stdout)
+        if not all_sinks:
+            LOGGER.info("No PulseAudio sinks found yet (attempt %d/%d)", attempt, retries)
+            await asyncio.sleep(delay)
+            continue
+
+        if force_all:
+            return [s["name"] for s in all_sinks]
+
+        remap_sinks = [s for s in all_sinks if "module-remap-sink" in s.get("driver", "")]
+        masters_with_children = {
+            s["master_device"] for s in remap_sinks if s.get("master_device")
+        }
+        if remap_sinks and not masters_with_children:
+            LOGGER.warning(
+                "Found %d remap sink(s) but could not determine any master/child "
+                "relationship (device.master_device property missing or "
+                "unparseable) -- falling back to including every sink rather "
+                "than risk silently dropping a legitimate standalone one. "
+                "Verify the property name in _parse_pactl_sinks_verbose() "
+                "against real `pactl list sinks` output.",
+                len(remap_sinks),
             )
+            return [s["name"] for s in all_sinks]
+
+        selected = [
+            s["name"]
+            for s in all_sinks
+            if "module-remap-sink" in s.get("driver", "")
+            or s["name"] not in masters_with_children
+        ]
+        if selected:
+            return selected
+        LOGGER.info("No eligible sinks found yet (attempt %d/%d)", attempt, retries)
         await asyncio.sleep(delay)
     raise RuntimeError(
-        f"No PulseAudio remap-sink zones found after {retries} attempts "
-        f"({retries * delay:.0f}s). Confirm the Multiroom Audio addon is "
-        "running and has created its sink topology."
+        f"No PulseAudio sinks found after {retries} attempts "
+        f"({retries * delay:.0f}s). Confirm PulseAudio/the Multiroom Audio "
+        "addon is running."
     )
 
 
