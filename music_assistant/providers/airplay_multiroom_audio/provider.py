@@ -153,23 +153,16 @@ async def announce_as_airplay_device(
     -- if it still takes the full timeout, this assumption was wrong and the
     mechanism needs rethinking, not just retrying.
     """
-    # name_filter must be the truncated first-DNS-label form of the sink
-    # name, not the raw sink name -- confirmed the hard way. DNS names are
-    # dot-separated by definition; neither DiscoveryController's own matcher
-    # nor AirPlayProvider's real name parser (info.name.split(".")[0]
-    # .split("@", 1), confirmed from source) escapes dots in the device-name
-    # portion. A sink name containing a literal dot (e.g. raw PipeWire/ALSA
-    # names like "alsa_output.pci-....analog-stereo.2" -- NOT the addon's own
-    # underscore-only sink names, which are unaffected) gets silently
-    # truncated everywhere in the real system, confirmed by watching the
-    # built-in AirPlayProvider register a player literally named "alsa_output"
-    # for exactly this kind of sink. Matching against the same truncated form
-    # is what makes the lookup agree with what's actually in the cache.
+    # Dot-splitting is no longer a concern here: zone.announce_name has
+    # dots stripped at the source (see SinkZone.announce_name), so
+    # shairport-sync never has a literal dot to announce in the first
+    # place -- fixing the root cause rather than matching around it, as
+    # an earlier version of this code did.
     #
-    # SECOND, separate truncation, confirmed on real HAOS hardware: DNS
-    # labels have a hard 63-byte wire-format limit (RFC 1035). The
-    # advertised name is "<12-hex-char pseudo-MAC>@<sink_name>" -- 13 fixed
-    # bytes of prefix, leaving 50 for the sink name itself. A sink name
+    # DNS-label-length truncation is still real and separate, confirmed
+    # on real HAOS hardware: labels have a hard 63-byte wire-format limit
+    # (RFC 1035). The advertised name is "<12-hex-char pseudo-MAC>@<name>"
+    # -- 13 fixed bytes of prefix, leaving 50 for the name itself. A name
     # longer than that gets silently truncated by the mDNS stack before
     # it's ever announced. Confirmed exactly: a real HAOS sink name
     # ("HD_Audio_Generic_Digital_Surround_7_1_HDMI_2_fc_lfe", 51 chars,
@@ -179,7 +172,7 @@ async def announce_as_airplay_device(
     # built-in mDNS path. Truncating our own search target to the same
     # 50-byte budget is what makes the lookup match what's actually on
     # the wire.
-    name_filter = zone.sink_name.split(".", 1)[0][:50]
+    name_filter = zone.announce_name[:50]
     raop_info = await mass.discovery.async_find_mdns_service(
         RAOP_DISCOVERY_TYPE, name_filter=name_filter, timeout=raop_wait_timeout
     )
@@ -364,6 +357,32 @@ class SinkZone:
     sink_name: str
     port: int
     udp_port_base: int
+
+    @property
+    def announce_name(self) -> str:
+        """The name to actually announce over mDNS -- sink_name with dots
+        replaced, NOT the raw PA sink name itself.
+
+        Root-cause fix, not a workaround: DNS labels split on literal dots,
+        and PipeWire's own sink-naming convention always puts the generic
+        class prefix first and the identifying hardware descriptor after
+        the first dot (e.g. "alsa_output.pci-0000_00_1b.0.analog-stereo.2"
+        or "alsa_output.usb-Generic_ELEGIANT_SR030..."). Confirmed on real
+        hardware: every dotted sink name truncates to the same generic,
+        non-identifying "alsa_output" once announced, colliding with every
+        other dotted sink on the same host, in both our own mDNS lookup
+        and MA's own real _setup_player() name parsing (neither of which
+        can be changed from this side). Removing the dot at the source,
+        before shairport-sync ever announces anything, means there's
+        nothing left to truncate on -- the full identifying name survives
+        intact everywhere downstream.
+
+        sink_name itself is deliberately untouched and must stay that way:
+        it's the real PulseAudio sink identifier used in the .conf's
+        `sink = "..."` line, and has to match exactly for audio routing
+        to actually work. Only the announced name changes.
+        """
+        return self.sink_name.replace(".", "_")
 
 
 async def _run(cmd: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
@@ -558,7 +577,7 @@ def build_shairport_config(zone: SinkZone, config_path: Path) -> None:
     config_path.write_text(
         f"""general :
 {{
-  name = "{zone.sink_name}";
+  name = "{zone.announce_name}";
   port = {zone.port};
 {interface_line}  output_backend = "{backend}";
   udp_port_base = {zone.udp_port_base};
@@ -599,7 +618,7 @@ class AirplayMultiroomProcess:
         self._proc = await asyncio.create_subprocess_exec(
             str(self.binary_path),
             "-a",
-            self.zone.sink_name,
+            self.zone.announce_name,
             "-p",
             str(self.zone.port),
             "-c",
