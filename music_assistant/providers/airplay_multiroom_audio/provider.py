@@ -84,9 +84,165 @@ from pathlib import Path
 # strongly suggesting music_assistant/models/provider.py, with
 # PlayerProvider as the sibling music_assistant/models/player_provider.py.
 # If this import fails, that's the thing to double check first.
+from music_assistant.models.player import Player
 from music_assistant.models.player_provider import PlayerProvider
 
 LOGGER = logging.getLogger(__name__)
+
+# Hardcoded rather than imported from music_assistant.providers.airplay.constants,
+# to avoid a hard dependency on another provider's internal module (not a
+# guaranteed-stable public API). Confirmed exact values directly from that
+# module's real source during this session.
+RAOP_DISCOVERY_TYPE = "_raop._tcp.local."
+AIRPLAY_DISCOVERY_TYPE = "_airplay._tcp.local."
+
+# Deliberately minimal TXT record. get_model_info() (confirmed from real
+# source) falls through to the "am" property when manufacturer/model are
+# absent, producing ("AirPlay", "ShairportSync") -- confirmed non-Apple, so
+# is_apple_device() returns False and _setup_player() takes the simpler
+# GenericAirPlayPlayer path rather than AirPlayControlPlayer's Companion/MRP
+# machinery. "features"/"ft" are deliberately omitted too, so
+# supports_airplay2() reads False and cliairplay never attempts an AirPlay2
+# negotiation these RAOP-only receivers can't do -- the exact failure mode
+# hit earlier this session ("session SETUP -> 501") when a build genuinely
+# did advertise AirPlay2 capability it couldn't back up.
+SYNTHETIC_AIRPLAY_TXT = {"am": "ShairportSync", "txtvers": "1"}
+
+
+async def announce_as_airplay_device(
+    mass, zone: SinkZone, raop_wait_timeout: float = 5.0
+) -> None:
+    """Register a synthetic _airplay._tcp record so the built-in AirPlayProvider
+    discovers this zone's shairport-sync-pa instance immediately instead of
+    stalling ~10s per device.
+
+    Root cause this addresses, confirmed directly from real
+    DiscoveryController/AirPlayProvider source pulled during this session:
+    every shairport-sync-pa instance advertises RAOP (_raop._tcp) only --
+    confirmed via avahi-browse against every instance in this whole project,
+    both this provider's and the standalone addon's -- never a companion
+    _airplay._tcp record. AirPlayProvider._setup_player() always tries to
+    find that companion record for a newly-seen RAOP device
+    (async_find_mdns_service(AIRPLAY_DISCOVERY_TYPE, ..., timeout=10.0)) and,
+    since it structurally never exists for these receivers, always burns the
+    full 10-second timeout. That lookup is also serialized behind a single
+    per-provider asyncio.Lock in DiscoveryController, so N devices cost
+    N x ~10s in strict sequence -- confirmed by a real-world capture showing
+    11 devices registering at almost exactly 10.00s/device apart.
+
+    Registering this record ourselves, right after learning the real mDNS
+    name shairport-sync's embedded tinysvcmdns responder announced for this
+    zone, gives that lookup something to find from local cache/self-response
+    instead of exhausting the timeout -- letting _setup_player()'s existing,
+    already-correct logic run fast and register a real, fully-working
+    GenericAirPlayPlayer, same as it already does for a real AirPlay device.
+
+    UNVERIFIED, the one real assumption this whole mechanism rests on: that
+    a service registered on our own Zeroconf instance
+    (mass.discovery.aiozc.async_register_service) shows up in that same
+    instance's *inbound* cache (zeroconf.cache.cache) fast enough for
+    async_find_mdns_service()'s cache-scan to find it -- python-zeroconf's
+    register/cache internals were not part of what was pulled and confirmed
+    this session, unlike everything else this function relies on. Verify
+    directly: after this returns, watch whether _setup_player() actually
+    registers a real player for this zone within a second or two (not ~10s)
+    -- if it still takes the full timeout, this assumption was wrong and the
+    mechanism needs rethinking, not just retrying.
+    """
+    raop_info = await mass.discovery.async_find_mdns_service(
+        RAOP_DISCOVERY_TYPE, name_filter=zone.sink_name, timeout=raop_wait_timeout
+    )
+    if raop_info is None:
+        LOGGER.warning(
+            "Could not find RAOP mDNS record for %s within %.1fs -- "
+            "skipping synthetic AirPlay announcement for this zone "
+            "(built-in AirPlayProvider will still find it eventually, just "
+            "slowly, via its own ~10s-per-device path)",
+            zone.sink_name,
+            raop_wait_timeout,
+        )
+        return
+
+    # raop_info.name is "<pseudo-MAC>@<sink_name>._raop._tcp.local." -- the
+    # pseudo-MAC prefix is generated internally by tinysvcmdns, not something
+    # we control or can predict, so it has to be learned via lookup rather
+    # than assembled ourselves. Reusing the identical "<MAC>@<sink_name>"
+    # portion for the synthetic _airplay record is what makes
+    # _setup_player()'s name parsing derive the same raw_id/display_name (and
+    # therefore the same player_id) regardless of which record type it sees
+    # first -- confirmed from real _setup_player() source: it splits on the
+    # first "@" in whichever info.name it's given.
+    base_name = raop_info.name.split(".", 1)[0]  # "<MAC>@<sink_name>"
+
+    from zeroconf.asyncio import AsyncServiceInfo  # noqa: PLC0415
+
+    airplay_info = AsyncServiceInfo(
+        AIRPLAY_DISCOVERY_TYPE,
+        name=f"{base_name}.{AIRPLAY_DISCOVERY_TYPE}",
+        addresses=raop_info.addresses,
+        # Deliberately 0, not a real port: _setup_player() only uses this to
+        # fire a background /info probe (probe_audio_formats) for 24-bit
+        # capability detection -- an AirPlay2-only HTTP endpoint our RAOP-only
+        # receivers don't serve. 0 is falsy, so that probe is skipped
+        # entirely rather than left to fail/timeout harmlessly.
+        port=0,
+        properties=SYNTHETIC_AIRPLAY_TXT,
+        server=raop_info.server,
+    )
+    await mass.discovery.aiozc.async_register_service(airplay_info)
+    LOGGER.debug(
+        "Registered synthetic _airplay._tcp record for %s (as %s)",
+        zone.sink_name,
+        airplay_info.name,
+    )
+
+
+class AirplayMultiroomPlayer(Player):
+    """Minimal Player for one spawned shairport-sync-pa instance.
+
+    Deliberately declares NO supported_features. This provider's Python
+    code never actually handles a play/stop/volume command -- the AirPlay
+    protocol itself does, driven by whatever external sender (a phone, or
+    MA's own built-in AirPlay provider via cliairplay) connects to the
+    spawned shairport-sync-pa process. An empty feature set is a design
+    choice reflecting that reality, not an unfinished stub.
+
+    Construction order matters and is easy to get backwards (confirmed
+    from the real Player.__init__ source): _attr_name must be set BEFORE
+    calling super().__init__(), since it's read during that call for
+    create_default_player_config() and is NOT one of the attributes the
+    base class resets afterward. Everything else that base __init__ DOES
+    unconditionally reset (_attr_supported_features, _attr_device_info,
+    etc.) must be set AFTER calling super().__init__(), or the reset
+    silently wipes it back to an empty default.
+
+    OPEN RISK, not yet resolved by anything in this codebase -- confirmed
+    from tonight's own logs, not a guess: MA's built-in AirPlay provider
+    already creates its own separate "protocol" player for a shairport-
+    sync instance purely from its own mDNS discovery, completely
+    independent of what this provider does (`Player (type protocol)
+    registered: ap70cd60aadede/alsa_output` appeared in the logs with
+    zero involvement from this provider's code). If this class's players
+    get registered AND the built-in provider's mDNS discovery also finds
+    the same shairport-sync-pa process, that's very likely two separate
+    entries for the same physical device once mDNS catches up -- their
+    player_ids are scoped to different provider instances, so nothing
+    here would deduplicate them automatically. The airplay_receiver
+    plugin's own "skip same-host instances" filter is specific to THAT
+    plugin's domain and has no reason to apply to this one. Test this
+    directly before assuming either way: register one player, then watch
+    whether a second one for the same zone appears once mDNS would have
+    had time to catch up.
+    """
+
+    def __init__(self, provider: PlayerProvider, player_id: str, display_name: str) -> None:
+        # Must happen before super().__init__() -- see class docstring.
+        self._attr_name = display_name
+        super().__init__(provider, player_id)
+        # Must happen after super().__init__() -- the base class resets
+        # these unconditionally during its own __init__, so setting them
+        # any earlier would just get silently wiped.
+        self._attr_supported_features = set()
 
 # TODO: same issue as CACHE_DIR below -- /config is a HAOS/container
 # convention, not guaranteed to exist or be writable when running MA
@@ -471,9 +627,16 @@ class AirplayMultiroomProvider(PlayerProvider):
             await process.start()
             self._processes[sink_name] = process
 
-            # TODO (confirmed-real call, unconfirmed construction of `player`):
-            # player = Player(...)  # needs real Player() fields
-            # await self.mass.players.register(player)
+            # Was: registering our own AirplayMultiroomPlayer here directly.
+            # Replaced with this: that class declares zero supported_features
+            # (see its own docstring) -- it was never able to actually play
+            # anything. The functional player has always been the one the
+            # built-in AirPlayProvider registers via its own mDNS discovery
+            # (confirmed: that's what "sound working on two players" was
+            # actually playing through). This announces the record that lets
+            # that discovery happen fast instead of ~10s/device, rather than
+            # registering a second, non-functional, competing player entry.
+            await announce_as_airplay_device(self.mass, zone)
 
             port += 1
             udp_base += 10
@@ -488,3 +651,10 @@ class AirplayMultiroomProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         await asyncio.gather(*(p.stop() for p in self._processes.values()))
+        # No self._players to unregister anymore -- see discover_players()'s
+        # comment on why native player registration was replaced with the
+        # synthetic mDNS announcement. The built-in AirPlayProvider owns
+        # unregistering its own players when their mDNS records disappear
+        # (that record teardown isn't handled here yet -- worth adding:
+        # unregister the synthetic service on unload so a removed zone's
+        # AirPlay entry doesn't linger as a stale advertisement).
