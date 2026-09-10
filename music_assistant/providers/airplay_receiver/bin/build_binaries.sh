@@ -6,20 +6,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Single source of truth: read the pinned version and commit SHA from Dockerfile.base,
-# so the local build always matches what the base image ships.
-DOCKERFILE_BASE="${SCRIPT_DIR}/../../../../Dockerfile.base"
-read_docker_arg() {
-    local name="$1" value
-    value="$(sed -n -E "s/^ARG[[:space:]]+${name}=([^[:space:]]+).*/\1/p" "${DOCKERFILE_BASE}" | head -n1)"
-    if [[ -z "${value}" ]]; then
-        echo "Error: ${name} not found in ${DOCKERFILE_BASE}" >&2
-        exit 1
-    fi
-    printf '%s' "${value}"
-}
-SHAIRPORT_VERSION="$(read_docker_arg SHAIRPORT_VERSION)"
-SHAIRPORT_SHA="$(read_docker_arg SHAIRPORT_SHA)"
+# Pinned version and commit SHA, hardcoded rather than read from
+# Dockerfile.base -- that file belongs to the upstream MA dev addon and
+# isn't reliably reachable from wherever this script actually runs (e.g.
+# from inside an installed site-packages tree, which has no relative path
+# back to a repo root at all). Snapshot taken directly from
+# Dockerfile.base's shairport-builder stage as of 2026-09-10; re-check that
+# file if this ever needs bumping, since these two values can now drift
+# out of sync with it silently.
+SHAIRPORT_VERSION="4.3.7"
+SHAIRPORT_SHA="0b1c4391ffd398e7b145eb4b98416261380adeea"
 
 echo "Building shairport-sync ${SHAIRPORT_VERSION} (${SHAIRPORT_SHA}) binaries..."
 
