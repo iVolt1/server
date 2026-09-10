@@ -281,6 +281,15 @@ class AirplayMultiroomProcess:
         self._proc: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
+        # Explicit -o flag as defense-in-depth, not just belt-and-suspenders
+        # for its own sake: confirmed directly (manual CLI test) that
+        # shairport-sync's -o flag overrides whatever output_backend says
+        # in the .conf file. Reusing the same env var build_shairport_config()
+        # already uses, rather than a second hardcoded "pa", so the two
+        # can never silently drift apart -- that class of "two things that
+        # were supposed to agree, didn't, and nobody noticed" bug already
+        # cost real time earlier this session.
+        backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pa")
         self._proc = await asyncio.create_subprocess_exec(
             str(self.binary_path),
             "-a",
@@ -289,6 +298,8 @@ class AirplayMultiroomProcess:
             str(self.zone.port),
             "-c",
             str(self.config_path),
+            "-o",
+            backend,
             "-vv",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
