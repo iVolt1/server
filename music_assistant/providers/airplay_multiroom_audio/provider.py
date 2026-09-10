@@ -231,13 +231,43 @@ async def announce_as_airplay_device(
         # never cleanly unregistered on unload collides with this one.
         # Flush the stale record and register again, rather than fail.
         LOGGER.debug(
-            "Synthetic _airplay._tcp record %s already registered "
-            "(stale from a prior load) -- reclaiming",
+            "Synthetic _airplay._tcp record %s already registered -- reclaiming",
             airplay_info.name,
         )
         await aiozc.async_unregister_service(airplay_info)
         await asyncio.sleep(1.0)  # matches DACP_RECLAIM_DELAY's real value
-        await aiozc.async_register_service(airplay_info)
+        try:
+            await aiozc.async_register_service(airplay_info)
+        except NonUniqueNameException:
+            # A second collision, right after unregistering, means this
+            # isn't a stale leftover from a prior run -- it's a LIVE,
+            # currently-valid registration from a DIFFERENT zone that
+            # happens to truncate to the identical name. Confirmed real
+            # cause on real hardware: several distinct raw PA sinks whose
+            # names all start "alsa_output." collapse to the identical
+            # truncated device name everywhere in this whole pipeline
+            # (our own lookup's truncation, and MA's own real
+            # _setup_player() name parsing, confirmed from source) --
+            # genuinely ambiguous, not something either side can
+            # disambiguate after the fact. Log and skip this one zone
+            # rather than letting the exception propagate and abort every
+            # zone still left in discover_players()'s loop.
+            LOGGER.warning(
+                "Synthetic _airplay._tcp record %s collides with a "
+                "currently-live registration from a different zone (not "
+                "a stale leftover) -- skipping synthetic announcement for "
+                "%s. This usually means multiple distinct sink names "
+                "truncate to the same name once DNS label limits/dot "
+                "splitting apply (confirmed cause: several raw "
+                "'alsa_output.*'-style sink names collapsing to the "
+                "identical 'alsa_output'). The built-in AirPlayProvider "
+                "will still eventually find this zone via its own slower "
+                "mDNS path, just without this speedup, and its identity "
+                "may be ambiguous among the colliding sinks either way.",
+                airplay_info.name,
+                zone.sink_name,
+            )
+            return None
     LOGGER.debug(
         "Registered synthetic _airplay._tcp record for %s (as %s)",
         zone.sink_name,
