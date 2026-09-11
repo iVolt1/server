@@ -744,8 +744,7 @@ class AirplayMultiroomProcess:
             str(self.zone.port),
             "-c",
             str(self.config_path),
-            "-o",
-            backend,
+            "-o pulseaudio",
             "-vv",
         ]
         LOGGER.info(
