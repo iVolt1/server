@@ -652,7 +652,7 @@ def build_shairport_config(zone: SinkZone, config_path: Path) -> None:
     actual bundled sample shairport-sync.conf for the real current
     section name, rather than assuming it tracks the backend selector.
     """
-    backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pa")
+    backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pulseaudio")
     interface_line = (
         f'  interface = "{AIRPLAY_INTERFACE}";\n' if AIRPLAY_INTERFACE else ""
     )
@@ -735,7 +735,7 @@ class AirplayMultiroomProcess:
         # can never silently drift apart -- that class of "two things that
         # were supposed to agree, didn't, and nobody noticed" bug already
         # cost real time earlier this session.
-        backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pa")
+        backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pulseaudio")
         cmd = [
             str(self.binary_path),
             "-a",
@@ -744,7 +744,8 @@ class AirplayMultiroomProcess:
             str(self.zone.port),
             "-c",
             str(self.config_path),
-            "-o pa",
+            "-o",
+            backend,
             "-vv",
         ]
         LOGGER.info(
