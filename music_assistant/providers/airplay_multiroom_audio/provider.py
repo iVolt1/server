@@ -673,8 +673,8 @@ sessioncontrol :
 {{
   sink = "{zone.sink_name}";
   application_name = "Shairport Sync";
-  output_rate = "44100"; // Specify "auto", or a single rate, e.g. 48000, or a bracketed comma-separated list of rates, e.g. (44100, 48000, 64000). Default is "auto" -- try to match the input. See the "Rates, Formats and Channels" discussion above.
-  output_format = "S16_LE"; // Specify "auto", or a single format, e.g. "S32_LE", or a bracketed comma-separated list of formats, e.g. ("S32_LE", "S16_LE"). Default is "auto". See the "Rates, Formats and Channels" discussion above.
+  output_rate = "auto"; // Specify "auto", or a single rate, e.g. 48000, or a bracketed comma-separated list of rates, e.g. (44100, 48000, 64000). Default is "auto" -- try to match the input. See the "Rates, Formats and Channels" discussion above.
+  output_format = "auto"; // Specify "auto", or a single format, e.g. "S32_LE", or a bracketed comma-separated list of formats, e.g. ("S32_LE", "S16_LE"). Default is "auto". See the "Rates, Formats and Channels" discussion above.
 }};
 """
     )
