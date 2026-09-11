@@ -71,6 +71,7 @@ because the rest of the file now runs further than it used to:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -685,6 +686,45 @@ class AirplayMultiroomProcess:
         self.binary_path = binary_path
         self.config_path = config_path
         self._proc: asyncio.subprocess.Process | None = None
+        self._drain_task: asyncio.Task | None = None
+        self._recent_lines: list[str] = []  # bounded, for the crash-diagnostic path
+
+    async def _drain_stdout(self) -> None:
+        """Continuously read and log shairport-sync-pa's stdout for the
+        process's whole lifetime.
+
+        This isn't just for visibility -- it's a real fix for a real bug.
+        Before this, start() read stdout exactly once, during the 0.2s
+        immediate-crash check, and NOTHING ever read from the pipe again
+        for the rest of the process's life. -vv produces a large, continuous
+        volume of output (thousands of lines seen in short test captures
+        this session). OS pipe buffers are small (commonly 64KB); with
+        nothing draining it, shairport-sync's own writes to stdout would
+        eventually block once the buffer filled during real playback --
+        and since it's a single-threaded-per-stream process, a blocked
+        logging write stalls its audio handling right along with it. That's
+        a plausible direct explanation for "process alive, no crash, but
+        silent," not merely a missing diagnostic.
+
+        Same pattern MA's own AirPlayProvider already uses for its own
+        subprocess (_ptp_daemon_stdout_reader, confirmed real source
+        pulled earlier this session) -- reused here rather than reinvented.
+        """
+        if self._proc is None or self._proc.stdout is None:
+            return
+        try:
+            async for raw_line in self._proc.stdout:
+                line = raw_line.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                LOGGER.debug("[%s] %s", self.zone.sink_name, line)
+                self._recent_lines.append(line)
+                if len(self._recent_lines) > 50:
+                    self._recent_lines.pop(0)
+        except Exception:
+            LOGGER.exception(
+                "Error draining shairport-sync-pa stdout for %s", self.zone.sink_name
+            )
 
     async def start(self) -> None:
         # Explicit -o flag as defense-in-depth, not just belt-and-suspenders
@@ -696,7 +736,7 @@ class AirplayMultiroomProcess:
         # were supposed to agree, didn't, and nobody noticed" bug already
         # cost real time earlier this session.
         backend = os.environ.get("AIRPLAY_MULTIROOM_SPS_BACKEND", "pa")
-        self._proc = await asyncio.create_subprocess_exec(
+        cmd = [
             str(self.binary_path),
             "-a",
             self.zone.announce_name,
@@ -707,9 +747,16 @@ class AirplayMultiroomProcess:
             "-o",
             backend,
             "-vv",
+        ]
+        LOGGER.info(
+            "Starting shairport-sync-pa for %s: %s", self.zone.sink_name, " ".join(cmd)
+        )
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+        self._drain_task = asyncio.create_task(self._drain_stdout())
         # TODO: confirm readiness before registering with MA (see module
         # docstring / earlier conversation) -- a bounded poll of the
         # assigned port being open is the cheap, already-discussed fix if
@@ -717,24 +764,22 @@ class AirplayMultiroomProcess:
         # immediately ready. Not implemented here since it depends on #1.
         await asyncio.sleep(0.2)
         if self._proc.returncode is not None:
-            # Process already exited -- read whatever it printed before
-            # dying instead of discarding it. This is exactly the output
-            # that would have been dumped straight to DEVNULL before;
-            # don't repeat the "guess at the failure instead of reading
-            # the actual error text" mistake from earlier tonight.
-            output = b""
-            if self._proc.stdout is not None:
-                try:
-                    output = await asyncio.wait_for(self._proc.stdout.read(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
+            # Process already exited -- report whatever it printed before
+            # dying (now captured by _drain_stdout's running buffer, since
+            # a separate one-shot read here would race the drain task for
+            # the same bytes and likely get nothing).
+            output = "\n".join(self._recent_lines)
             raise RuntimeError(
                 f"shairport-sync-pa for {self.zone.sink_name} exited immediately "
-                f"with code {self._proc.returncode}:\n"
-                f"{output.decode(errors='replace')}"
+                f"with code {self._proc.returncode}:\n{output}"
             )
 
     async def stop(self, timeout: float = 5.0) -> None:
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._drain_task
+            self._drain_task = None
         if self._proc is None or self._proc.returncode is not None:
             return
         self._proc.terminate()
