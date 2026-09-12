@@ -74,7 +74,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import shutil
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -401,6 +403,66 @@ UDP_PORT_BASE_DEFAULT = 6001
 # single interface name here -- unlike the addon (single host, confirmed
 # interface name), a provider install could run on arbitrary hardware.
 AIRPLAY_INTERFACE = os.environ.get("AIRPLAY_INTERFACE")  # None = let shairport-sync guess
+
+
+async def resolve_local_addresses() -> list[bytes]:
+    """Resolve the host IPv4 address(es) to advertise in our own synthetic
+    RAOP/_airplay ServiceInfo records, since there's no more tinysvcmdns/
+    avahi announcement to copy an already-correct address list from.
+
+    STILL UNVERIFIED, the biggest risk in this function: AirPlayProvider's
+    own _register_dacp_service() already solves this exact problem (it
+    also self-registers a service on mass.discovery.aiozc and needs a
+    real host address). Pull that source and compare before trusting
+    this -- it was written fresh against general zeroconf/socket
+    knowledge, not confirmed against MA's own established pattern for it,
+    unlike everything else in this file that's been checked against real
+    source.
+
+    Honors AIRPLAY_INTERFACE if set -- same env var build_shairport_config()
+    already threads into shairport-sync's own interface= line, and the
+    same reason applies here: under host_network, "pick automatically"
+    can resolve the internal Docker/hassio bridge instead of the real LAN
+    interface (documented on AIRPLAY_INTERFACE's own definition above).
+    """
+    if AIRPLAY_INTERFACE:
+        returncode, stdout, _ = await _run(
+            ["ip", "-4", "-o", "addr", "show", AIRPLAY_INTERFACE]
+        )
+        if returncode == 0:
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", stdout)
+            if match:
+                addr = match.group(1)
+                LOGGER.debug(
+                    "Resolved %s -> %s via `ip addr show`", AIRPLAY_INTERFACE, addr
+                )
+                return [socket.inet_aton(addr)]
+        LOGGER.warning(
+            "AIRPLAY_INTERFACE=%s set, but could not resolve its IPv4 "
+            "address via `ip -4 addr show` (rc=%d) -- falling back to "
+            "auto-detection, which may pick the wrong interface under "
+            "host_network",
+            AIRPLAY_INTERFACE,
+            returncode,
+        )
+
+    from zeroconf import get_all_addresses  # noqa: PLC0415
+
+    addrs = [a for a in get_all_addresses() if not a.startswith("127.")]
+    if not addrs:
+        raise RuntimeError(
+            "Could not resolve any non-loopback IPv4 address for this "
+            "host -- set AIRPLAY_INTERFACE explicitly."
+        )
+    if len(addrs) > 1:
+        LOGGER.warning(
+            "Multiple host IPv4 addresses found (%s) and AIRPLAY_INTERFACE "
+            "is not set -- using %s; set AIRPLAY_INTERFACE if this is "
+            "wrong for your setup",
+            addrs,
+            addrs[0],
+        )
+    return [socket.inet_aton(addrs[0])]
 
 
 @dataclass
