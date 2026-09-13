@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, PlaybackState
 from music_assistant_models.errors import MediaNotFoundError
 from zeroconf import NonUniqueNameException, ServiceStateChange
-from zeroconf.asyncio import AsyncServiceInfo
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo
 
 from music_assistant.constants import (
     CONF_LOG_LEVEL,
@@ -105,6 +106,11 @@ class AirPlayProvider(PlayerProvider):
     _dacp_info: AsyncServiceInfo
     _bridge_manager: SendspinBridgeManager
     dashboards: AirPlayDashboards
+    # Dedicated RAOP/AirPlay browser with its own independent startup-query
+    # schedule -- see handle_async_init() for why this exists separately
+    # from DiscoveryController's shared, server-wide browser. None until
+    # handle_async_init() creates it; cleared again on unload().
+    _dedicated_mdns_browser: AsyncServiceBrowser | None = None
     _ptp_daemon: AsyncProcess | None = None
     _ptp_daemon_stdout_task: asyncio.Task[None] | None = None
     _ptp_daemon_started: float = 0.0
@@ -279,6 +285,72 @@ class AirPlayProvider(PlayerProvider):
         # lock to a single grandmaster while UDP 319/320 is bound only once.
         await self._start_ptp_daemon()
 
+        # Dedicated browser for RAOP/AirPlay discovery, separate from
+        # DiscoveryController's single shared browser that covers every
+        # mDNS-discovering provider on the whole server. That shared browser's
+        # startup-query burst (RFC 6762's continuous-querying schedule: this
+        # library's own choice is 1s/4s/9s/16s, then a flat 10s steady state
+        # -- confirmed directly against python-zeroconf's real source,
+        # QueryScheduler._process_startup_queries / _BROWSER_TIME) is timed
+        # from MA's own process start, not from whenever this provider
+        # happens to load. AirPlay typically loads well after several other
+        # providers, so by the time it's ready the shared browser has
+        # usually already burned through its startup burst and settled into
+        # the 10s steady state -- meaning every RAOP/AirPlay device on the
+        # network, not just ones spawned locally, only gets discovered at
+        # whatever pace that already-steady-state schedule delivers, one
+        # query round at a time. Confirmed via real capture logs: every kind
+        # of AirPlay device (a real Apple TV, USB/analog outputs, addon-
+        # spawned receivers) arrived at ~10s intervals regardless of type
+        # or origin, with this provider's own registration path independently
+        # confirmed fast (sub-20ms) once a device was actually delivered to it.
+        #
+        # A second browser instance, scoped to just these two types and
+        # created here, gets its OWN startup schedule counted from ITS OWN
+        # creation time -- so it reliably sweeps up every currently-live
+        # RAOP/AirPlay device within ~16 seconds of this provider loading,
+        # independent of whatever state the shared browser is in. It shares
+        # the same underlying Zeroconf instance/cache/socket as the shared
+        # browser (just a second, independent query schedule layered on
+        # top) and feeds the exact same on_mdns_service_state_change()
+        # pipeline -- this is purely about getting a fresh query schedule,
+        # not new discovery or registration logic. Both browsers can
+        # therefore each deliver the same device; on_mdns_service_state_change()
+        # and _setup_player()'s own "already registered" checks (both
+        # pre-existing, unrelated to this browser) already make that safe.
+        self._dedicated_mdns_browser = AsyncServiceBrowser(
+            self.mass.discovery.aiozc.zeroconf,
+            [RAOP_DISCOVERY_TYPE, AIRPLAY_DISCOVERY_TYPE],
+            handlers=[self._on_dedicated_mdns_service_state_change],
+        )
+
+    def _on_dedicated_mdns_service_state_change(
+        self,
+        zeroconf: object,
+        service_type: str,
+        name: str,
+        state_change: ServiceStateChange,
+    ) -> None:
+        """
+        Handle a state change from this provider's own dedicated browser.
+
+        Mirrors DiscoveryController._on_mdns_service_state_change's dispatch
+        exactly (resolve full info for a non-Removed event, then call
+        on_mdns_service_state_change) -- this second browser exists purely
+        to get its own fresh startup-query schedule (see handle_async_init),
+        not to duplicate or diverge from any of that existing logic.
+        """
+
+        async def process() -> None:
+            if state_change == ServiceStateChange.Removed:
+                info = None
+            else:
+                info = AsyncServiceInfo(service_type, name)
+                await info.async_request(zeroconf, 3000)
+            await self.on_mdns_service_state_change(name, state_change, info)
+
+        self.mass.create_task(process())
+
     async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
         """Handle logic when the config is updated."""
         await super().update_config(config, changed_keys)
@@ -338,6 +410,20 @@ class AirPlayProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        # cancel the dedicated RAOP/AirPlay browser (see handle_async_init)
+        dedicated_browser = getattr(self, "_dedicated_mdns_browser", None)
+        if dedicated_browser is not None:
+            async_cancel = getattr(dedicated_browser, "async_cancel", None)
+            cancel = getattr(dedicated_browser, "cancel", None)
+            if callable(async_cancel):
+                result = async_cancel()
+                if inspect.isawaitable(result):
+                    await result
+                elif callable(cancel):
+                    cancel()
+            elif callable(cancel):
+                cancel()
+            self._dedicated_mdns_browser = None
         # Unregister all dashboard endpoints
         dashboards = getattr(self, "dashboards", None)
         if dashboards:
@@ -499,17 +585,7 @@ class AirPlayProvider(PlayerProvider):
         # section (plus the Companion/MRP gather below, which touches this
         # provider's shared address caches) is still serialized, matching the
         # original guarantee exactly -- just scoped to what actually needs it.
-        # Instrumented temporarily to diagnose a silent hang: logs immediately
-        # before/after lock acquisition (to tell "stuck acquiring the lock"
-        # apart from "stuck inside it"), and force-logs any exception with a
-        # full traceback in case MA's task wrapper is swallowing it silently
-        # (observed doing exactly that elsewhere in this codebase's history).
-        # Remove this instrumentation once the actual hang is identified.
-        self.logger.debug("About to acquire provider lock for %s", player_id)
-        lock = self.mass.discovery.provider_lock(self.instance_id)
-        await lock.acquire()
-        self.logger.debug("Acquired provider lock for %s", player_id)
-        try:
+        async with self.mass.discovery.provider_lock(self.instance_id):
             # Final check before registration to handle race conditions
             # (multiple MDNS events processed in parallel for same device)
             if self.mass.players.get_player(player_id):
@@ -542,7 +618,6 @@ class AirPlayProvider(PlayerProvider):
             companion_info: AsyncServiceInfo | None = None
             mrp_info: AsyncServiceInfo | None = None
             if enhanced_control:
-                self.logger.debug("Starting Companion/MRP gather for %s", player_id)
                 companion_info, mrp_info = await asyncio.gather(
                     self._get_related_discovery_info(
                         COMPANION_DISCOVERY_TYPE,
@@ -557,7 +632,6 @@ class AirPlayProvider(PlayerProvider):
                         display_name,
                     ),
                 )
-                self.logger.debug("Finished Companion/MRP gather for %s", player_id)
 
             player: AirPlayPlayer
             if enhanced_control:
@@ -586,19 +660,7 @@ class AirPlayProvider(PlayerProvider):
                     model=model,
                     initial_volume=volume,
                 )
-            self.logger.debug("About to call players.register() for %s", player_id)
             await self.mass.players.register(player)
-            self.logger.debug("players.register() returned for %s", player_id)
-        except Exception:
-            self.logger.exception(
-                "Unhandled exception while setting up player %s (forced full "
-                "traceback -- MA's own task-exception logging may not show one)",
-                player_id,
-            )
-            raise
-        finally:
-            lock.release()
-            self.logger.debug("Released provider lock for %s", player_id)
 
         # A receiver only publishes its audio formats (and so whether it can do
         # 24-bit) in its /info response, never in its mDNS records, so ask it
