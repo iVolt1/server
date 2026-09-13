@@ -487,80 +487,94 @@ class AirPlayProvider(PlayerProvider):
             )
         )
 
-        # Final check before registration to handle race conditions
-        # (multiple MDNS events processed in parallel for same device)
-        if self.mass.players.get_player(player_id):
+        # Everything from here on used to run under a provider-wide lock held
+        # for this whole method (see DiscoveryController.process_mdns_state_change).
+        # That lock's actual job is narrow -- prevent two mDNS events for the
+        # SAME device from both slipping past the "not yet registered" check
+        # below -- but holding it for the entire method also serialized the
+        # companion-record lookups above (up to ~10s each) across *every*
+        # device on the network, one at a time. Those lookups are read-only
+        # per-device mDNS queries with no shared state, so they now run
+        # unlocked/concurrently; only this remaining check-through-registration
+        # section (plus the Companion/MRP gather below, which touches this
+        # provider's shared address caches) is still serialized, matching the
+        # original guarantee exactly -- just scoped to what actually needs it.
+        async with self.mass.discovery.provider_lock(self.instance_id):
+            # Final check before registration to handle race conditions
+            # (multiple MDNS events processed in parallel for same device)
+            if self.mass.players.get_player(player_id):
+                self.logger.debug(
+                    "Player %s already registered during setup, skipping registration",
+                    player_id,
+                )
+                return
+
             self.logger.debug(
-                "Player %s already registered during setup, skipping registration", player_id
-            )
-            return
-
-        self.logger.debug(
-            "Setting up player %s: manufacturer=%s, model=%s",
-            display_name,
-            manufacturer,
-            model,
-        )
-
-        player_addresses = self._get_discovery_addresses(
-            airplay_discovery_info,
-            raop_discovery_info,
-        )
-        player_addresses.add(address)
-        # Apple TVs and HomePods are standalone players with a native control
-        # plane (Companion/MRP); all other receivers are protocol endpoints.
-        # The model is decided from the device's own identity only: it defines
-        # the player id exposed to API consumers (e.g. Home Assistant), so it
-        # must not vary with the discovery timing of the separate Companion/MRP
-        # mDNS records. Which control features are offered on a control player
-        # is decided from the advertised capabilities instead.
-        enhanced_control = is_apple_device(manufacturer, model)
-        companion_info: AsyncServiceInfo | None = None
-        mrp_info: AsyncServiceInfo | None = None
-        if enhanced_control:
-            companion_info, mrp_info = await asyncio.gather(
-                self._get_related_discovery_info(
-                    COMPANION_DISCOVERY_TYPE,
-                    self._companion_info_by_address,
-                    player_addresses,
-                    display_name,
-                ),
-                self._get_related_discovery_info(
-                    MRP_DISCOVERY_TYPE,
-                    self._mrp_info_by_address,
-                    player_addresses,
-                    display_name,
-                ),
+                "Setting up player %s: manufacturer=%s, model=%s",
+                display_name,
+                manufacturer,
+                model,
             )
 
-        player: AirPlayPlayer
-        if enhanced_control:
-            player = AirPlayControlPlayer(
-                provider=self,
-                player_id=player_id,
-                raop_discovery_info=raop_discovery_info,
-                airplay_discovery_info=airplay_discovery_info,
-                companion_discovery_info=companion_info,
-                mrp_discovery_info=mrp_info,
-                address=address,
-                display_name=display_name,
-                manufacturer=manufacturer,
-                model=model,
-                initial_volume=volume,
+            player_addresses = self._get_discovery_addresses(
+                airplay_discovery_info,
+                raop_discovery_info,
             )
-        else:
-            player = GenericAirPlayPlayer(
-                provider=self,
-                player_id=player_id,
-                raop_discovery_info=raop_discovery_info,
-                airplay_discovery_info=airplay_discovery_info,
-                address=address,
-                display_name=display_name,
-                manufacturer=manufacturer,
-                model=model,
-                initial_volume=volume,
-            )
-        await self.mass.players.register(player)
+            player_addresses.add(address)
+            # Apple TVs and HomePods are standalone players with a native control
+            # plane (Companion/MRP); all other receivers are protocol endpoints.
+            # The model is decided from the device's own identity only: it defines
+            # the player id exposed to API consumers (e.g. Home Assistant), so it
+            # must not vary with the discovery timing of the separate Companion/MRP
+            # mDNS records. Which control features are offered on a control player
+            # is decided from the advertised capabilities instead.
+            enhanced_control = is_apple_device(manufacturer, model)
+            companion_info: AsyncServiceInfo | None = None
+            mrp_info: AsyncServiceInfo | None = None
+            if enhanced_control:
+                companion_info, mrp_info = await asyncio.gather(
+                    self._get_related_discovery_info(
+                        COMPANION_DISCOVERY_TYPE,
+                        self._companion_info_by_address,
+                        player_addresses,
+                        display_name,
+                    ),
+                    self._get_related_discovery_info(
+                        MRP_DISCOVERY_TYPE,
+                        self._mrp_info_by_address,
+                        player_addresses,
+                        display_name,
+                    ),
+                )
+
+            player: AirPlayPlayer
+            if enhanced_control:
+                player = AirPlayControlPlayer(
+                    provider=self,
+                    player_id=player_id,
+                    raop_discovery_info=raop_discovery_info,
+                    airplay_discovery_info=airplay_discovery_info,
+                    companion_discovery_info=companion_info,
+                    mrp_discovery_info=mrp_info,
+                    address=address,
+                    display_name=display_name,
+                    manufacturer=manufacturer,
+                    model=model,
+                    initial_volume=volume,
+                )
+            else:
+                player = GenericAirPlayPlayer(
+                    provider=self,
+                    player_id=player_id,
+                    raop_discovery_info=raop_discovery_info,
+                    airplay_discovery_info=airplay_discovery_info,
+                    address=address,
+                    display_name=display_name,
+                    manufacturer=manufacturer,
+                    model=model,
+                    initial_volume=volume,
+                )
+            await self.mass.players.register(player)
 
         # A receiver only publishes its audio formats (and so whether it can do
         # 24-bit) in its /info response, never in its mDNS records, so ask it

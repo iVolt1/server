@@ -152,6 +152,19 @@ class DiscoveryController(CoreController):
         self._upnp_locks.pop(instance_id, None)
         self._schedule_periodic_upnp_discovery()
 
+    def provider_lock(self, instance_id: str) -> asyncio.Lock:
+        """
+        Return the per-provider mDNS-processing lock for the given provider instance.
+
+        process_mdns_state_change() no longer holds this lock around the full
+        on_mdns_service_state_change() call (see there for why) -- a provider
+        that needs a critical section serialized against concurrent mDNS
+        events for its own instance (e.g. a check-then-register race between
+        two events for the same device) acquires this explicitly around just
+        that section, rather than the whole handler.
+        """
+        return self._mdns_locks.setdefault(instance_id, asyncio.Lock())
+
     async def async_find_mdns_service(
         self, service_type: str, name_filter: str | None = None, timeout: float = 3.0
     ) -> AsyncServiceInfo | None:
@@ -313,14 +326,19 @@ class DiscoveryController(CoreController):
         """Handle mDNS service state callbacks."""
 
         async def process_mdns_state_change(provider: ProviderInstanceType) -> None:
-            lock = self._mdns_locks.setdefault(provider.instance_id, asyncio.Lock())
             if state_change == ServiceStateChange.Removed:
                 info = None
             else:
                 info = AsyncServiceInfo(service_type, name)
                 await info.async_request(zeroconf, 3000)
-            async with lock:
-                await provider.on_mdns_service_state_change(name, state_change, info)
+            # No lock held here any more: on_mdns_service_state_change() is now
+            # free to run concurrently across devices. A provider that needs to
+            # serialize part of its own handling (e.g. a check-then-register
+            # critical section) opts in explicitly via provider_lock() around
+            # just that part -- see AirPlayProvider._setup_player() for the
+            # motivating case: a per-device companion-record mDNS wait (up to
+            # ~10s) no longer blocks every other device's discovery behind it.
+            await provider.on_mdns_service_state_change(name, state_change, info)
 
         self.logger.log(
             VERBOSE_LOG_LEVEL,
