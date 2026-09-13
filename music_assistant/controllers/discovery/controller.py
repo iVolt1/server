@@ -358,17 +358,25 @@ class DiscoveryController(CoreController):
 
     async def _replay_mdns_discovery(self, provider: ProviderInstanceType) -> None:
         """Replay cached mDNS results for a provider after it loads."""
-        lock = self._mdns_locks.setdefault(provider.instance_id, asyncio.Lock())
-        async with lock:
-            for mdns_type in provider.manifest.mdns_discovery or []:
-                for mdns_name in set(self.aiozc.zeroconf.cache.cache):
-                    if mdns_type not in mdns_name or mdns_type == mdns_name:
-                        continue
-                    info = AsyncServiceInfo(mdns_type, mdns_name)
-                    if await info.async_request(self.aiozc.zeroconf, 3000):
-                        await provider.on_mdns_service_state_change(
-                            mdns_name, ServiceStateChange.Added, info
-                        )
+        # No lock held here any more, for the same reason as
+        # process_mdns_state_change() above: on_mdns_service_state_change()
+        # can (as of the AirPlay provider's own change) acquire this same
+        # per-provider lock itself via provider_lock() for its own critical
+        # section. asyncio.Lock is not reentrant, so holding it here around
+        # the call into on_mdns_service_state_change() would deadlock a
+        # provider that does that -- on literally the first cached record
+        # replayed at load time, every time. Whatever serialization a
+        # provider's replay handling needs, it now opts into explicitly,
+        # the same as the live-discovery path.
+        for mdns_type in provider.manifest.mdns_discovery or []:
+            for mdns_name in set(self.aiozc.zeroconf.cache.cache):
+                if mdns_type not in mdns_name or mdns_type == mdns_name:
+                    continue
+                info = AsyncServiceInfo(mdns_type, mdns_name)
+                if await info.async_request(self.aiozc.zeroconf, 3000):
+                    await provider.on_mdns_service_state_change(
+                        mdns_name, ServiceStateChange.Added, info
+                    )
 
     def _schedule_periodic_upnp_discovery(self) -> None:
         """Ensure the periodic SSDP discovery cycle matches active subscriptions."""
