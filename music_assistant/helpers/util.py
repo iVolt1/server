@@ -1786,9 +1786,24 @@ async def get_mac_address(ip_address: str) -> str | None:
     try:
         from getmac import get_mac_address as getmac_lookup  # noqa: PLC0415
 
-        return await asyncio.to_thread(getmac_lookup, ip=ip_address)
+        # No timeout is enforced by the getmac library itself, and its
+        # underlying OS-level ARP lookup can hang indefinitely rather than
+        # failing fast for certain addresses -- notably an address matching
+        # this host's own IP (self-ARP is not guaranteed to resolve the
+        # normal way) and addresses on unreachable/isolated subnets that
+        # never answer. Since this is awaited from inside a provider's
+        # per-instance registration lock (see PlayerController.register() /
+        # _resolve_mac_addresses()), a hang here doesn't just fail one
+        # player -- it silently blocks every other device queued behind
+        # the same lock, indefinitely, with nothing logged. Bound it.
+        return await asyncio.wait_for(
+            asyncio.to_thread(getmac_lookup, ip=ip_address), timeout=3.0
+        )
     except ImportError:
         LOGGER.debug("getmac module not available, cannot resolve MAC from IP")
+        return None
+    except TimeoutError:
+        LOGGER.debug("Timed out resolving MAC address for %s", ip_address)
         return None
     except Exception as err:
         LOGGER.debug("Failed to resolve MAC address for %s: %s", ip_address, err)
