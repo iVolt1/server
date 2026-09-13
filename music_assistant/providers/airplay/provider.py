@@ -499,7 +499,17 @@ class AirPlayProvider(PlayerProvider):
         # section (plus the Companion/MRP gather below, which touches this
         # provider's shared address caches) is still serialized, matching the
         # original guarantee exactly -- just scoped to what actually needs it.
-        async with self.mass.discovery.provider_lock(self.instance_id):
+        # Instrumented temporarily to diagnose a silent hang: logs immediately
+        # before/after lock acquisition (to tell "stuck acquiring the lock"
+        # apart from "stuck inside it"), and force-logs any exception with a
+        # full traceback in case MA's task wrapper is swallowing it silently
+        # (observed doing exactly that elsewhere in this codebase's history).
+        # Remove this instrumentation once the actual hang is identified.
+        self.logger.debug("About to acquire provider lock for %s", player_id)
+        lock = self.mass.discovery.provider_lock(self.instance_id)
+        await lock.acquire()
+        self.logger.debug("Acquired provider lock for %s", player_id)
+        try:
             # Final check before registration to handle race conditions
             # (multiple MDNS events processed in parallel for same device)
             if self.mass.players.get_player(player_id):
@@ -532,6 +542,7 @@ class AirPlayProvider(PlayerProvider):
             companion_info: AsyncServiceInfo | None = None
             mrp_info: AsyncServiceInfo | None = None
             if enhanced_control:
+                self.logger.debug("Starting Companion/MRP gather for %s", player_id)
                 companion_info, mrp_info = await asyncio.gather(
                     self._get_related_discovery_info(
                         COMPANION_DISCOVERY_TYPE,
@@ -546,6 +557,7 @@ class AirPlayProvider(PlayerProvider):
                         display_name,
                     ),
                 )
+                self.logger.debug("Finished Companion/MRP gather for %s", player_id)
 
             player: AirPlayPlayer
             if enhanced_control:
@@ -574,7 +586,19 @@ class AirPlayProvider(PlayerProvider):
                     model=model,
                     initial_volume=volume,
                 )
+            self.logger.debug("About to call players.register() for %s", player_id)
             await self.mass.players.register(player)
+            self.logger.debug("players.register() returned for %s", player_id)
+        except Exception:
+            self.logger.exception(
+                "Unhandled exception while setting up player %s (forced full "
+                "traceback -- MA's own task-exception logging may not show one)",
+                player_id,
+            )
+            raise
+        finally:
+            lock.release()
+            self.logger.debug("Released provider lock for %s", player_id)
 
         # A receiver only publishes its audio formats (and so whether it can do
         # 24-bit) in its /info response, never in its mDNS records, so ask it
