@@ -9,7 +9,7 @@ import shutil
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -439,7 +439,11 @@ class SpotifyProvider(MusicProvider):
         are only returned when using the non-dev (global) token.
         """
         yield await self._get_liked_songs_playlist()
-        async for item in self._get_all_items("me/playlists", use_global_session=True):
+        # the page cache only checks the first playlist for changes, so it would miss a
+        # rename or new cover of any playlist further down the list
+        async for item in self._get_all_items(
+            "me/playlists", use_cache=False, use_global_session=True
+        ):
             if item and item["id"]:
                 yield parse_playlist(item, self)
 
@@ -684,31 +688,43 @@ class SpotifyProvider(MusicProvider):
                 raise NotImplementedError("Spotify audiobook resume sync disabled in settings")
 
             try:
-                chapters_data = await self._get_audiobook_chapters_data(item_id)
-                if not chapters_data:
-                    raise NotImplementedError("No chapters data available")
-
                 total_position_ms = 0
                 fully_played = True
+                has_chapters = False
 
-                for chapter in chapters_data:
-                    resume_point = chapter.get("resume_point", {})
-                    chapter_fully_played = resume_point.get("fully_played", False)
-                    chapter_position_ms = resume_point.get("resume_position_ms", 0)
+                chapters = self._get_all_items(
+                    f"audiobooks/{item_id}/chapters", use_cache=False, market="from_token"
+                )
+                async with aclosing(chapters):
+                    async for chapter in chapters:
+                        if not chapter.get("id"):
+                            continue
+                        has_chapters = True
+                        resume_point = chapter.get("resume_point", {})
+                        chapter_fully_played = resume_point.get("fully_played", False)
+                        chapter_position_ms = resume_point.get("resume_position_ms", 0)
 
-                    if chapter_fully_played:
-                        total_position_ms += chapter.get("duration_ms", 0)
-                    elif chapter_position_ms > 0:
-                        total_position_ms += chapter_position_ms
-                        fully_played = False
-                        break
-                    else:
-                        fully_played = False
-                        break
+                        if chapter_fully_played:
+                            total_position_ms += chapter.get("duration_ms", 0)
+                        elif chapter_position_ms > 0:
+                            total_position_ms += chapter_position_ms
+                            fully_played = False
+                            break
+                        else:
+                            fully_played = False
+                            break
+
+                if not has_chapters:
+                    raise NotImplementedError("No chapters data available")
 
                 return fully_played, total_position_ms, None
 
-            except (MediaNotFoundError, ResourceTemporarilyUnavailable, aiohttp.ClientError) as e:
+            except (
+                MediaNotFoundError,
+                ResourceTemporarilyUnavailable,
+                RetriesExhausted,
+                aiohttp.ClientError,
+            ) as e:
                 self.logger.debug(f"Failed to get audiobook resume position for {item_id}: {e}")
                 raise NotImplementedError("Unable to get audiobook resume position from Spotify")
 
@@ -1644,7 +1660,7 @@ class SpotifyProvider(MusicProvider):
 
         return episodes_data
 
-    @use_cache(7200)  # 2 hours - shorter cache for resume point data
+    @use_cache()
     async def _get_audiobook_chapters_data(self, prov_audiobook_id: str) -> list[dict[str, Any]]:
         """
         Get raw chapter data from Spotify API (cached).
@@ -1671,22 +1687,42 @@ class SpotifyProvider(MusicProvider):
         return chapters_data
 
     async def _get_all_items(
-        self, endpoint: str, key: str = "items", limit: int = 50, **kwargs: Any
+        self,
+        endpoint: str,
+        key: str = "items",
+        limit: int = 50,
+        use_cache: bool = True,
+        **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any]]:
-        """Get all items from a paged list."""
+        """
+        Get all items from a paged list.
+
+        :param endpoint: API endpoint of the paged list.
+        :param key: Key of the items in each page.
+        :param limit: Number of items to request per page.
+        :param use_cache: Serve pages from the page cache; when False, every page is requested
+            from the API.
+        """
         offset = 0
-        # single request to fetch the etag (used as cache checksum) and total
-        meta = await self._get_cached_paginated_meta(endpoint, limit=1, offset=0, **kwargs)
-        cache_checksum = meta["etag"]
-        total = meta["total"]
+        cache_checksum: str | None = None
+        total = 0
+        if use_cache:
+            # single request to fetch the etag (used as cache checksum) and total
+            meta = await self._get_cached_paginated_meta(endpoint, limit=1, offset=0, **kwargs)
+            cache_checksum = meta["etag"]
+            total = meta["total"]
         while True:
             # Avoid requesting beyond the known end. Spotify can return 5xx
             # for offset >= total on some endpoints (e.g. algorithmic playlists).
             if total and offset >= total:
                 break
-            result = await self._get_data_with_caching(
-                endpoint, cache_checksum=cache_checksum, limit=limit, offset=offset, **kwargs
-            )
+            if use_cache:
+                result = await self._get_data_with_caching(
+                    endpoint, cache_checksum=cache_checksum, limit=limit, offset=offset, **kwargs
+                )
+            else:
+                result = await self._get_data(endpoint, limit=limit, offset=offset, **kwargs)
+                total = result.get("total", 0)
             offset += limit
             if not result or key not in result or not result[key]:
                 break
