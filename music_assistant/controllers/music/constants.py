@@ -10,8 +10,9 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
+CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 
-DB_SCHEMA_VERSION: Final[int] = 67
+DB_SCHEMA_VERSION: Final[int] = 68
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
@@ -23,6 +24,8 @@ CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 CACHE_CATEGORY_LISTINGS: Final[int] = 11
 # how long an assembled listing is served without asking the providers again
 LISTING_CACHE_EXPIRATION: Final[int] = 15 * 60
+# how many similar artists or tracks the providers are asked for, the size of such a listing
+SIMILAR_ITEMS_LIMIT: Final[int] = 25
 
 # max time to wait for a single provider's search results before
 # contributing empty results for it, so one slow provider can never block
