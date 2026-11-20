@@ -118,7 +118,7 @@ class MultiChannelPlayer(PlayerProtocol):
     clock so the pairs stay in sync.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         provider: MultiChannelAudioProvider,
         player_id: str,
@@ -130,6 +130,7 @@ class MultiChannelPlayer(PlayerProtocol):
         bit_depth: int,
         channel_map: str = CHANNEL_MAP_FLAC,
         custom_channel_map: str = "",
+        pair_sink_names: dict[str, str] | None = None,
     ) -> None:
         """
         Initialize the Multichannel Audio player.
@@ -144,6 +145,8 @@ class MultiChannelPlayer(PlayerProtocol):
         :param bit_depth: Bit depth (16, 24, or 32).
         :param channel_map: Channel map preset ('flac', 'dvd', 'custom').
         :param custom_channel_map: Custom flat index string when channel_map='custom'.
+        :param pair_sink_names: Explicit PA sink per pair name (e.g. 'front_stereo'),
+            used instead of the '<card_name>_<pair>' remap sink names.
         """
         super().__init__(provider, player_id)
         self._attr_type = PlayerType.PLAYER
@@ -172,6 +175,11 @@ class MultiChannelPlayer(PlayerProtocol):
         self._pair_sinks: dict[str, tuple[int, int]] = _build_pair_sinks(
             card_name, layout, channel_map, custom_channel_map
         )
+        if pair_sink_names:
+            self._pair_sinks = {
+                pair_sink_names.get(key.removeprefix(f"{card_name}_"), key): indices
+                for key, indices in self._pair_sinks.items()
+            }
 
         self._playback_task: asyncio.Task[None] | None = None
         self._paused = False

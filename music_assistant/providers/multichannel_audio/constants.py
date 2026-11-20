@@ -81,6 +81,18 @@ CONF_PA_SINK_NAME = "pa_sink_name"
 CONF_MULTICHANNEL_LAYOUT = "multichannel_layout"
 CONF_CHANNEL_MAP = "channel_map"
 CONF_CUSTOM_CHANNEL_MAP = "custom_channel_map"
+CONF_SINK_FRONT = "sink_front_stereo"
+CONF_SINK_CENTER = "sink_center_sub"
+CONF_SINK_REAR = "sink_rear_stereo"
+CONF_SINK_SIDE = "sink_side_stereo"
+
+# Pair name (as used in PAIR_INDICES_BY_MAP) -> config key holding its PA sink name
+PAIR_SINK_CONF_KEYS: dict[str, str] = {
+    "front_stereo": CONF_SINK_FRONT,
+    "center_sub": CONF_SINK_CENTER,
+    "rear_stereo": CONF_SINK_REAR,
+    "side_stereo": CONF_SINK_SIDE,
+}
 
 # Defaults
 DEFAULT_PLAYER_VOLUME = 25

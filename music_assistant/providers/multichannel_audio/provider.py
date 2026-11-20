@@ -9,12 +9,15 @@ from typing import TYPE_CHECKING
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
+    CHANNEL_MAP_FLAC,
     CONF_CHANNEL_MAP,
     CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
     CONF_PA_SINK_NAME,
     MULTICHANNEL_CHANNELS,
     MULTICHANNEL_LAYOUT_51,
+    PAIR_INDICES_BY_MAP,
+    PAIR_SINK_CONF_KEYS,
 )
 from .pa_simple import enumerate_pa_sinks
 from .player import MultiChannelPlayer, get_player_uuid
@@ -147,10 +150,23 @@ class MultiChannelAudioProvider(PlayerProvider):
             None, _query_sink_format, sink_name
         )
 
-        # Auto-detect the stereo pair sink prefix from PA remap sinks.
-        card_name = await self.mass.loop.run_in_executor(
-            None, _derive_card_name, sink_name, layout
-        )
+        # Explicitly configured pair sinks win; only when every pair the layout needs is
+        # set do we skip auto-detection, so a half-filled form keeps the old behaviour.
+        needed_pairs = PAIR_INDICES_BY_MAP[CHANNEL_MAP_FLAC][layout]
+        pair_sink_names = {
+            pair: str(self.config.get_value(PAIR_SINK_CONF_KEYS[pair]) or "")
+            for pair in needed_pairs
+        }
+        card_name: str | None
+        if all(pair_sink_names.values()):
+            card_name = "configured"
+            self.logger.info("Using configured pair sinks: %s", pair_sink_names)
+        else:
+            pair_sink_names = {}
+            # Auto-detect the stereo pair sink prefix from PA remap sinks.
+            card_name = await self.mass.loop.run_in_executor(
+                None, _derive_card_name, sink_name, layout
+            )
         if not card_name:
             self.logger.error(
                 "Could not auto-detect stereo pair sink prefix for layout %s — "
@@ -172,6 +188,7 @@ class MultiChannelAudioProvider(PlayerProvider):
             bit_depth=bit_depth,
             channel_map=channel_map,
             custom_channel_map=custom_map,
+            pair_sink_names=pair_sink_names,
         )
         await self._player.restore_state()
         await self._player.apply_restored_volume()

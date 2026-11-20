@@ -19,6 +19,10 @@ from .constants import (
     CONF_CUSTOM_CHANNEL_MAP,
     CONF_MULTICHANNEL_LAYOUT,
     CONF_PA_SINK_NAME,
+    CONF_SINK_CENTER,
+    CONF_SINK_FRONT,
+    CONF_SINK_REAR,
+    CONF_SINK_SIDE,
     MULTICHANNEL_LAYOUT_51,
     MULTICHANNEL_LAYOUT_71,
 )
@@ -65,6 +69,9 @@ async def get_config_entries(
     """Return Config entries to setup this provider."""
     # ruff: noqa: ARG001
     sink_options = await mass.loop.run_in_executor(None, _get_pa_sink_options)
+    pair_options = [ConfigValueOption(title="Auto-detect", value="")] + [
+        o for o in sink_options if o.value
+    ]
     return (
         ConfigEntry(
             key=CONF_PA_SINK_NAME,
@@ -130,6 +137,27 @@ async def get_config_entries(
                 "front_stereo, center_sub, rear_stereo[, side_stereo]. "
                 "Example FLAC 5.1: 0,1,2,3,4,5  \u2014  DVD 5.1: 0,1,3,2,4,5"
             ),
+        ),
+        *(
+            ConfigEntry(
+                key=key,
+                type=ConfigEntryType.STRING,
+                label=label,
+                options=pair_options,
+                default_value="",
+                required=False,
+                description=(
+                    "PulseAudio stereo sink that plays this channel pair. "
+                    "Leave every pair on Auto-detect to find "
+                    "<prefix>_front_stereo style remap sinks automatically."
+                ),
+            )
+            for key, label in (
+                (CONF_SINK_FRONT, "Front L/R sink"),
+                (CONF_SINK_CENTER, "Center / LFE sink"),
+                (CONF_SINK_REAR, "Rear (5.1 surround) L/R sink"),
+                (CONF_SINK_SIDE, "Side L/R sink (7.1 only)"),
+            )
         ),
     )
 
