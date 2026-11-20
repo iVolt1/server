@@ -6,6 +6,8 @@ import ctypes
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
+from music_assistant_models.errors import SetupFailedError
+
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
@@ -114,9 +116,11 @@ class MultiChannelAudioProvider(PlayerProvider):
         try:
             ctypes.CDLL("libpulse-simple.so.0")
         except OSError as err:
-            raise RuntimeError(
-                "libpulse-simple.so.0 not found — is PulseAudio installed?"
-            ) from err
+            msg = (
+                "PulseAudio client library (libpulse-simple.so.0) not found: "
+                "this provider needs a server with PulseAudio access"
+            )
+            raise SetupFailedError(msg) from err
         self._player = None
 
     async def loaded_in_mass(self) -> None:
