@@ -16,6 +16,7 @@ from music_assistant_models.enums import (
     PlayerFeature,
     PlayerType,
     PlaybackState,
+    StreamType,
 )
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
@@ -209,34 +210,61 @@ class MultiChannelPlayer(PlayerProtocol):
         """
         return [(self.sample_rate, self.bit_depth)]
 
+    @property
+    def requires_flow_mode(self) -> bool:
+        """Return False: play_media must see each queue item to open its source file."""
+        return False
+
     # --- MA mandatory player interface ---
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY_MEDIA command."""
         await self._stop_playback()
-        url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
-        self.logger.info("Starting multichannel playback from %s", url)
-        # Read source channel count from streamdetails — MA delivers the correct
-        # number of channels for the source via the patched select_flow_pcm_format.
-        source_channels = self.channels
+        source_channels = 2
+        file_path: str | None = None
         try:
             queue = (
                 self.mass.player_queues.get_active_queue(self.player.player_id)
                 if self.player
                 else None
             )
-            if queue and queue.current_item and queue.current_item.streamdetails:
-                sd = queue.current_item.streamdetails
+            item = None
+            if queue and media.queue_item_id:
+                item = self.mass.player_queues.get_item(queue.queue_id, media.queue_item_id)
+            sd = item.streamdetails if item else None
+            self.logger.debug(
+                "play_media: queue_item_id=%s item_found=%s sd_present=%s",
+                media.queue_item_id,
+                item is not None,
+                sd is not None,
+            )
+            if sd:
                 self.logger.debug(
-                    "streamdetails: channels=%d sample_rate=%d uri=%s",
+                    "streamdetails: stream_type=%s path=%s channels=%d sample_rate=%d",
+                    sd.stream_type,
+                    sd.path,
                     sd.audio_format.channels,
                     sd.audio_format.sample_rate,
-                    sd.uri,
                 )
-                if sd.audio_format.channels > 0:
+                # MA folds anything wider than stereo down to 2 channels before it reaches
+                # a player, so a multichannel local file is read straight from disk instead
+                if (
+                    sd.stream_type == StreamType.LOCAL_FILE
+                    and isinstance(sd.path, str)
+                    and sd.audio_format.channels > 2
+                ):
+                    file_path = sd.path
                     source_channels = sd.audio_format.channels
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
+        if file_path:
+            url = file_path
+            self.logger.info(
+                "Starting multichannel playback from file %s (%dch)", file_path, source_channels
+            )
+        else:
+            url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
+            self.logger.info("Starting multichannel playback from %s", url)
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
         self._paused = False
