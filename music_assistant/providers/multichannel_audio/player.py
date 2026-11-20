@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING
@@ -222,6 +223,7 @@ class MultiChannelPlayer(PlayerProtocol):
         await self._stop_playback()
         source_channels = 2
         file_path: str | None = None
+        seek_position = 0.0
         try:
             queue = (
                 self.mass.player_queues.get_active_queue(self.player.player_id)
@@ -255,12 +257,16 @@ class MultiChannelPlayer(PlayerProtocol):
                 ):
                     file_path = sd.path
                     source_channels = sd.audio_format.channels
+                    seek_position = float(sd.seek_position or 0)
         except Exception as err:
             self.logger.debug("Could not read streamdetails: %s", err)
         if file_path:
             url = file_path
             self.logger.info(
-                "Starting multichannel playback from file %s (%dch)", file_path, source_channels
+                "Starting multichannel playback from file %s (%dch, seek %.1fs)",
+                file_path,
+                source_channels,
+                seek_position,
             )
         else:
             url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
@@ -270,7 +276,7 @@ class MultiChannelPlayer(PlayerProtocol):
         self._paused = False
         self.update_state()
         self._playback_task = self.mass.create_task(
-            self._playback_loop(url, source_channels)
+            self._playback_loop(url, source_channels, seek_position)
         )
 
     async def stop(self) -> None:
@@ -283,18 +289,26 @@ class MultiChannelPlayer(PlayerProtocol):
     async def pause(self) -> None:
         """Handle PAUSE command."""
         self._paused = True
+        if self._attr_elapsed_time is not None and self._attr_elapsed_time_last_updated:
+            now = time.time()
+            self._attr_elapsed_time += now - self._attr_elapsed_time_last_updated
+            self._attr_elapsed_time_last_updated = now
         self._attr_playback_state = PlaybackState.PAUSED
         self.update_state()
 
     async def play(self) -> None:
         """Handle PLAY/resume command."""
         self._paused = False
+        if self._attr_elapsed_time is not None:
+            self._attr_elapsed_time_last_updated = time.time()
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
 
     # --- Playback loop ---
 
-    async def _playback_loop(self, url: str, source_channels: int = 0) -> None:
+    async def _playback_loop(
+        self, url: str, source_channels: int = 0, seek_position: float = 0.0
+    ) -> None:
         """
         Fetch the MA PCM stream and demux it to stereo PA sink pairs.
 
@@ -362,6 +376,11 @@ class MultiChannelPlayer(PlayerProtocol):
                 self.sample_rate,
                 self.bit_depth,
             )
+            # elapsed is reported relative to the start of this stream; the queue adds
+            # the item's seek_position itself
+            self._attr_elapsed_time = 0.0
+            self._attr_elapsed_time_last_updated = time.time()
+            self.update_state()
 
             # resolve_stream_url's CONF_OUTPUT_CODEC resolution is non-deterministic
             # across player (re)registration/restart cycles — sometimes it resolves
@@ -402,6 +421,7 @@ class MultiChannelPlayer(PlayerProtocol):
                 audio_input=url,
                 input_format=actual_input_format,
                 output_format=output_format,
+                extra_input_args=["-ss", f"{seek_position:.3f}"] if seek_position else None,
                 extra_output_args=["-flush_packets", "1"],
                 collect_log_history=True,
             )
