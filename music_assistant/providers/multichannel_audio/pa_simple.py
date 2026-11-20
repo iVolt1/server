@@ -90,6 +90,8 @@ def _load_lib() -> ctypes.CDLL:
     lib.pa_simple_drain.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.pa_simple_free.restype = None
     lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+    lib.pa_simple_get_latency.restype = ctypes.c_uint64
+    lib.pa_simple_get_latency.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     return lib
 
 
@@ -193,6 +195,17 @@ class PASimpleStream:
                 return
             error = ctypes.c_int(0)
             self._lib.pa_simple_drain(self._conn, ctypes.byref(error))
+
+    def get_latency(self) -> float:
+        """Return the playback latency of the stream in seconds (0.0 if unknown)."""
+        with self._lock:
+            if not self._conn:
+                return 0.0
+            error = ctypes.c_int(0)
+            usec = self._lib.pa_simple_get_latency(self._conn, ctypes.byref(error))
+            if error.value:
+                return 0.0
+            return float(usec) / 1_000_000
 
     def close(self) -> None:
         """Free the PA stream.

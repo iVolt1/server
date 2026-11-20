@@ -376,12 +376,6 @@ class MultiChannelPlayer(PlayerProtocol):
                 self.sample_rate,
                 self.bit_depth,
             )
-            # elapsed is reported relative to the start of this stream; the queue adds
-            # the item's seek_position itself
-            self._attr_elapsed_time = 0.0
-            self._attr_elapsed_time_last_updated = time.time()
-            self.update_state()
-
             # resolve_stream_url's CONF_OUTPUT_CODEC resolution is non-deterministic
             # across player (re)registration/restart cycles — sometimes it resolves
             # to our intended explicit PCM string (sometimes even with the wrong
@@ -432,6 +426,7 @@ class MultiChannelPlayer(PlayerProtocol):
             )
 
             first_chunk = True
+            clock_started = False
             ct_val: str = ""
             is_float = False
             first_demux_logged = False
@@ -445,9 +440,9 @@ class MultiChannelPlayer(PlayerProtocol):
                     )
                     first_chunk = False
 
-                if self._paused:
+                # hold the chunk while paused; dropping it would skip audio on resume
+                while self._paused:
                     await asyncio.sleep(0.05)
-                    continue
 
                 chunk = self._apply_software_volume(chunk)
                 if not first_demux_logged:
@@ -461,6 +456,19 @@ class MultiChannelPlayer(PlayerProtocol):
                 await self.mass.loop.run_in_executor(
                     None, self._demux_and_write_all, chunk, streams, is_float, source_channels
                 )
+                if not clock_started and streams:
+                    # elapsed is reported relative to the start of this stream (the queue
+                    # adds the item's seek_position itself). The first write is only heard
+                    # once the PA buffer ahead of it has played out, so start the clock
+                    # that far behind; the reported position is clamped at 0 meanwhile.
+                    clock_started = True
+                    latency = await self.mass.loop.run_in_executor(
+                        None, next(iter(streams.values())).get_latency
+                    )
+                    self.logger.debug("PA stream latency at start: %.3fs", latency)
+                    self._attr_elapsed_time = -latency
+                    self._attr_elapsed_time_last_updated = time.time()
+                    self.update_state()
 
         except asyncio.CancelledError:
             pass
