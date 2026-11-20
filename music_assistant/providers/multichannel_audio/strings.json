@@ -1,0 +1,60 @@
+{
+  "config_entries": {
+    "pa_sink_name": {
+      "label": "PulseAudio sink",
+      "description": "Select the PulseAudio surround sink to use for multichannel output. This should be a 5.1 or 7.1 profile sink on your sound card.",
+      "options": {
+        "manual": "(enter sink name manually)"
+      }
+    },
+    "multichannel_layout": {
+      "label": "Channel layout",
+      "description": "Select the surround layout matching the active profile on your sound card. Must match the PulseAudio sink configuration.",
+      "options": {
+        "surround_51": "5.1 Surround (6 channels)",
+        "surround_71": "7.1 Surround (8 channels)"
+      }
+    },
+    "channel_map": {
+      "label": "Channel map",
+      "description": "Channel ordering of the PCM stream delivered by Music Assistant. FLAC/PCM standard is correct for the vast majority of sources. Use DVD/AC3 if center and LFE channels are swapped on playback. Custom allows manual specification as a comma-separated flat index list.",
+      "options": {
+        "flac": "FLAC / PCM standard (default)",
+        "dvd": "DVD / AC3 (FC↔LFE swapped)",
+        "custom": "Custom (enter index pairs below)"
+      }
+    },
+    "custom_channel_map": {
+      "label": "Custom channel map (index pairs)",
+      "description": "Only used when 'Custom' is selected above. Flat comma-separated indices for each sink pair in order: front_stereo, center_sub, rear_stereo[, side_stereo]. Example FLAC 5.1: 0,1,2,3,4,5  —  DVD 5.1: 0,1,3,2,4,5"
+    },
+    "sink_front_stereo": {
+      "label": "Front L/R sink",
+      "description": "PulseAudio stereo sink that plays this channel pair. Leave every pair on Auto-detect to find <prefix>_front_stereo style remap sinks automatically.",
+      "options": {
+        "auto": "Auto-detect"
+      }
+    },
+    "sink_center_sub": {
+      "label": "Center / LFE sink",
+      "description": "PulseAudio stereo sink that plays this channel pair. Leave every pair on Auto-detect to find <prefix>_front_stereo style remap sinks automatically.",
+      "options": {
+        "auto": "Auto-detect"
+      }
+    },
+    "sink_rear_stereo": {
+      "label": "Rear (5.1 surround) L/R sink",
+      "description": "PulseAudio stereo sink that plays this channel pair. Leave every pair on Auto-detect to find <prefix>_front_stereo style remap sinks automatically.",
+      "options": {
+        "auto": "Auto-detect"
+      }
+    },
+    "sink_side_stereo": {
+      "label": "Side L/R sink (7.1 only)",
+      "description": "PulseAudio stereo sink that plays this channel pair. Leave every pair on Auto-detect to find <prefix>_front_stereo style remap sinks automatically.",
+      "options": {
+        "auto": "Auto-detect"
+      }
+    }
+  }
+}

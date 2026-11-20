@@ -64,7 +64,7 @@ def _get_pa_sink_options() -> list[ConfigValueOption]:
                 options.append(ConfigValueOption(title=title, value=name))
     except Exception as err:  # noqa: BLE001 - listing sinks must never break the settings page
         LOGGER.debug("Could not list PulseAudio sinks: %s", err)
-    return options or [ConfigValueOption(title="(enter sink name manually)", value="")]
+    return options or [ConfigValueOption("", translation_key="manual")]
 
 
 async def get_config_entries(
@@ -76,95 +76,51 @@ async def get_config_entries(
     """Return Config entries to setup this provider."""
     # ruff: noqa: ARG001
     sink_options = await mass.loop.run_in_executor(None, _get_pa_sink_options)
-    pair_options = [ConfigValueOption(title="Auto-detect", value="")] + [
+    pair_options = [ConfigValueOption("", translation_key="auto")] + [
         o for o in sink_options if o.value
     ]
     return (
         ConfigEntry(
             key=CONF_PA_SINK_NAME,
             type=ConfigEntryType.STRING,
-            label="PulseAudio sink",
             options=sink_options,
             default_value="",
-            description=(
-                "Select the PulseAudio surround sink to use for multichannel output. "
-                "This should be a 5.1 or 7.1 profile sink on your sound card."
-            ),
             required=True,
         ),
         ConfigEntry(
             key=CONF_MULTICHANNEL_LAYOUT,
             type=ConfigEntryType.STRING,
-            label="Channel layout",
             options=[
-                ConfigValueOption(title="5.1 Surround (6 channels)", value=MULTICHANNEL_LAYOUT_51),
-                ConfigValueOption(title="7.1 Surround (8 channels)", value=MULTICHANNEL_LAYOUT_71),
+                ConfigValueOption(MULTICHANNEL_LAYOUT_51, translation_key="surround_51"),
+                ConfigValueOption(MULTICHANNEL_LAYOUT_71, translation_key="surround_71"),
             ],
             default_value=MULTICHANNEL_LAYOUT_51,
-            description=(
-                "Select the surround layout matching the active profile on your sound card. "
-                "Must match the PulseAudio sink configuration."
-            ),
         ),
         ConfigEntry(
             key=CONF_CHANNEL_MAP,
             type=ConfigEntryType.STRING,
-            label="Channel map",
             options=[
-                ConfigValueOption(
-                    title="FLAC / PCM standard (default)",
-                    value=CHANNEL_MAP_FLAC,
-                ),
-                ConfigValueOption(
-                    title="DVD / AC3 (FC\u2194LFE swapped)",
-                    value=CHANNEL_MAP_DVD,
-                ),
-                ConfigValueOption(
-                    title="Custom (enter index pairs below)",
-                    value=CHANNEL_MAP_CUSTOM,
-                ),
+                ConfigValueOption(CHANNEL_MAP_FLAC),
+                ConfigValueOption(CHANNEL_MAP_DVD),
+                ConfigValueOption(CHANNEL_MAP_CUSTOM),
             ],
             default_value=CHANNEL_MAP_FLAC,
-            description=(
-                "Channel ordering of the PCM stream delivered by Music Assistant. "
-                "FLAC/PCM standard is correct for the vast majority of sources. "
-                "Use DVD/AC3 if center and LFE channels are swapped on playback. "
-                "Custom allows manual specification as a comma-separated flat index list."
-            ),
         ),
         ConfigEntry(
             key=CONF_CUSTOM_CHANNEL_MAP,
             type=ConfigEntryType.STRING,
-            label="Custom channel map (index pairs)",
             default_value="",
             required=False,
-            description=(
-                "Only used when 'Custom' is selected above. "
-                "Flat comma-separated indices for each sink pair in order: "
-                "front_stereo, center_sub, rear_stereo[, side_stereo]. "
-                "Example FLAC 5.1: 0,1,2,3,4,5  \u2014  DVD 5.1: 0,1,3,2,4,5"
-            ),
         ),
         *(
             ConfigEntry(
                 key=key,
                 type=ConfigEntryType.STRING,
-                label=label,
                 options=pair_options,
                 default_value="",
                 required=False,
-                description=(
-                    "PulseAudio stereo sink that plays this channel pair. "
-                    "Leave every pair on Auto-detect to find "
-                    "<prefix>_front_stereo style remap sinks automatically."
-                ),
             )
-            for key, label in (
-                (CONF_SINK_FRONT, "Front L/R sink"),
-                (CONF_SINK_CENTER, "Center / LFE sink"),
-                (CONF_SINK_REAR, "Rear (5.1 surround) L/R sink"),
-                (CONF_SINK_SIDE, "Side L/R sink (7.1 only)"),
-            )
+            for key in (CONF_SINK_FRONT, CONF_SINK_CENTER, CONF_SINK_REAR, CONF_SINK_SIDE)
         ),
     )
 
