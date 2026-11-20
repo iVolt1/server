@@ -50,11 +50,14 @@ def _get_pa_sink_options() -> list[ConfigValueOption]:
             check=False,
         )
         if result.returncode == 0:
-            for sink in json.loads(result.stdout):
-                name: str = sink.get("name", "")
-                desc: str = sink.get("description", name)
-                if name:
-                    options.append(ConfigValueOption(title=desc, value=name))
+            sinks = [s for s in json.loads(result.stdout) if s.get("name")]
+            descs = [s.get("description", s["name"]) for s in sinks]
+            for sink, desc in zip(sinks, descs, strict=True):
+                name: str = sink["name"]
+                # remap sinks of one card all share the card's description; only their
+                # (user-chosen) sink name tells them apart
+                title = name if descs.count(desc) > 1 else desc
+                options.append(ConfigValueOption(title=title, value=name))
     except Exception:
         pass
     return options or [ConfigValueOption(title="(enter sink name manually)", value="")]
