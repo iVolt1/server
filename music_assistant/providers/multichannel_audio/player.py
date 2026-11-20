@@ -21,7 +21,8 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
-from music_assistant.models.player import Player, PlayerMedia
+from music_assistant.models.player import PlayerMedia
+from music_assistant.models.player_protocol import PlayerProtocol
 
 from .constants import (
     CACHE_CATEGORY_PREV_STATE,
@@ -35,6 +36,7 @@ from .constants import (
 )
 
 if TYPE_CHECKING:
+    from .pa_simple import PASimpleStream
     from .provider import MultiChannelAudioProvider
 
 
@@ -106,7 +108,7 @@ def _build_pair_sinks(
     return {f"{card_name}_{pair}": indices for pair, indices in pairs.items()}
 
 
-class MultiChannelPlayer(Player):
+class MultiChannelPlayer(PlayerProtocol):
     """
     Player for a multichannel surround output via stereo PA remap sink pairs.
 
@@ -158,7 +160,6 @@ class MultiChannelPlayer(Player):
             manufacturer="Multichannel Audio",
         )
         self._attr_device_info.add_identifier(IdentifierType.UUID, player_id)
-        self._attr_can_group_with = set()
         self._attr_volume_level = DEFAULT_PLAYER_VOLUME
 
         self.card_name = card_name
@@ -205,13 +206,17 @@ class MultiChannelPlayer(Player):
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY_MEDIA command."""
         await self._stop_playback()
-        url = await self._provider.mass.streams.resolve_stream_url(self.player_id, media)
+        url = await self.mass.streams.resolve_stream_url(self.protocol_id, media)
         self.logger.info("Starting multichannel playback from %s", url)
         # Read source channel count from streamdetails — MA delivers the correct
         # number of channels for the source via the patched select_flow_pcm_format.
         source_channels = self.channels
         try:
-            queue = self.mass.player_queues.get_active_queue(self.player_id)
+            queue = (
+                self.mass.player_queues.get_active_queue(self.player.player_id)
+                if self.player
+                else None
+            )
             if queue and queue.current_item and queue.current_item.streamdetails:
                 sd = queue.current_item.streamdetails
                 self.logger.debug(
@@ -554,8 +559,8 @@ class MultiChannelPlayer(Player):
     async def restore_state(self) -> None:
         """Restore cached volume/mute state from a previous session."""
         if last_state := await self.mass.cache.get(
-            key=self.player_id,
-            provider=self._provider.instance_id,
+            key=self.protocol_id,
+            provider=self.provider_id,
             category=CACHE_CATEGORY_PREV_STATE,
         ):
             self._attr_volume_muted = last_state[0]
@@ -567,8 +572,8 @@ class MultiChannelPlayer(Player):
     async def _save_state(self) -> None:
         """Persist current volume/mute state to cache."""
         await self.mass.cache.set(
-            key=self.player_id,
+            key=self.protocol_id,
             data=[self._attr_volume_muted, self._attr_volume_level],
-            provider=self._provider.instance_id,
+            provider=self.provider_id,
             category=CACHE_CATEGORY_PREV_STATE,
         )

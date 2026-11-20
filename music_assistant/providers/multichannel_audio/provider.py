@@ -20,7 +20,7 @@ from .pa_simple import enumerate_pa_sinks
 from .player import MultiChannelPlayer, get_player_uuid
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
     from music_assistant.mass import MusicAssistant
 
@@ -100,6 +100,12 @@ class MultiChannelAudioProvider(PlayerProvider):
 
     _player: MultiChannelPlayer | None
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return the (options) config entries for this provider instance."""
+        from . import get_config_entries  # noqa: PLC0415
+
+        return await get_config_entries(self.mass, self.instance_id)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         try:
@@ -119,6 +125,8 @@ class MultiChannelAudioProvider(PlayerProvider):
         if self._player:
             with suppress(Exception):
                 await self._player.stop_stream()
+            with suppress(Exception):
+                await self.mass.players.unregister(self._player.protocol_id)
             self._player = None
 
     async def _register_player(self) -> None:
@@ -167,7 +175,7 @@ class MultiChannelAudioProvider(PlayerProvider):
         )
         await self._player.restore_state()
         await self._player.apply_restored_volume()
-        await self.mass.players.register_or_update(self._player)
+        await self.mass.players.register(self._player)
 
         self.logger.info(
             "Registered multichannel player: %s (%s, %dch, %dHz, %dbit) -> pairs: %s",
@@ -181,17 +189,17 @@ class MultiChannelAudioProvider(PlayerProvider):
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
         """Set volume level (0-100) for the player."""
-        if self._player and self._player.player_id == player_id:
+        if self._player and self._player.protocol_id == player_id:
             await self._player.volume_set(volume_level)
 
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
         """Mute/unmute the player."""
-        if self._player and self._player.player_id == player_id:
+        if self._player and self._player.protocol_id == player_id:
             await self._player.volume_mute(muted)
 
     async def cmd_stop(self, player_id: str) -> None:
         """Send stop command to the player."""
-        if self._player and self._player.player_id == player_id:
+        if self._player and self._player.protocol_id == player_id:
             await self._player.stop_stream()
 
 
