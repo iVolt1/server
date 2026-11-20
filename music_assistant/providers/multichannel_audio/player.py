@@ -525,6 +525,12 @@ class MultiChannelPlayer(PlayerProtocol):
                     self._attr_elapsed_time_last_updated = time.time()
                     self.update_state()
 
+            # the source has ended: let every pair play out what PA still buffers before
+            # the streams are freed (freeing discards it) and IDLE moves the queue on
+            await asyncio.gather(
+                *(self.mass.loop.run_in_executor(None, s.drain) for s in streams.values())
+            )
+
         except asyncio.CancelledError:
             pass
         except Exception:
