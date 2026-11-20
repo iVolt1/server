@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 import uuid
@@ -255,7 +256,7 @@ class MultiChannelPlayer(PlayerProtocol):
                     file_path = sd.path
                     source_channels = sd.audio_format.channels
                     seek_position = float(sd.seek_position or 0)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - fall back to MA's stream URL
             self.logger.debug("Could not read streamdetails: %s", err)
         if file_path:
             url = file_path
@@ -303,7 +304,7 @@ class MultiChannelPlayer(PlayerProtocol):
 
     # --- Playback loop ---
 
-    async def _playback_loop(
+    async def _playback_loop(  # noqa: PLR0915
         self, url: str, source_channels: int = 0, seek_position: float = 0.0
     ) -> None:
         """
@@ -353,11 +354,11 @@ class MultiChannelPlayer(PlayerProtocol):
             for sink_name, (left_idx, right_idx) in self._pair_sinks.items():
                 if left_idx >= source_channels or right_idx >= source_channels:
                     continue
-                sname = sink_name
                 stream = await self.mass.loop.run_in_executor(
                     None,
-                    lambda s=sname: PASimpleStream(
-                        sink_name=s,
+                    functools.partial(
+                        PASimpleStream,
+                        sink_name=sink_name,
                         app_name="music-assistant-multichannel",
                         rate=self.sample_rate,
                         channels=2,
@@ -447,7 +448,7 @@ class MultiChannelPlayer(PlayerProtocol):
                 while self._paused:
                     await asyncio.sleep(0.05)
 
-                chunk = self._apply_software_volume(chunk)
+                pcm = self._apply_software_volume(chunk)
                 if not first_demux_logged:
                     first_demux_logged = True
                     self.logger.debug(
@@ -457,7 +458,7 @@ class MultiChannelPlayer(PlayerProtocol):
                         source_channels,
                     )
                 await self.mass.loop.run_in_executor(
-                    None, self._demux_and_write_all, chunk, streams, is_float, source_channels
+                    None, self._demux_and_write_all, pcm, streams, is_float, source_channels
                 )
                 if not clock_started and streams:
                     # elapsed is reported relative to the start of this stream (the queue
@@ -475,8 +476,8 @@ class MultiChannelPlayer(PlayerProtocol):
 
         except asyncio.CancelledError:
             pass
-        except Exception as err:
-            self.logger.error("Playback error: %s", err, exc_info=True)
+        except Exception:
+            self.logger.exception("Playback error")
         finally:
             if ffmpeg_proc is not None:
                 if self.logger.isEnabledFor(logging.DEBUG):

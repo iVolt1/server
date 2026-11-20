@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
     from music_assistant.models import ProviderInstanceType
 
+LOGGER = logging.getLogger(__name__)
+
 SUPPORTED_FEATURES = {
     ProviderFeature.SYNC_PLAYERS,
 }
@@ -44,7 +47,7 @@ def _get_pa_sink_options() -> list[ConfigValueOption]:
     options: list[ConfigValueOption] = []
     try:
         result = subprocess.run(
-            ["pactl", "--format=json", "list", "sinks"],
+            ["pactl", "--format=json", "list", "sinks"],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=5,
@@ -59,8 +62,8 @@ def _get_pa_sink_options() -> list[ConfigValueOption]:
                 # (user-chosen) sink name tells them apart
                 title = name if descs.count(desc) > 1 else desc
                 options.append(ConfigValueOption(title=title, value=name))
-    except Exception:
-        pass
+    except Exception as err:  # noqa: BLE001 - listing sinks must never break the settings page
+        LOGGER.debug("Could not list PulseAudio sinks: %s", err)
     return options or [ConfigValueOption(title="(enter sink name manually)", value="")]
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,8 @@ from .player import MultiChannelPlayer, get_player_uuid
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry
 
+
+LOGGER = logging.getLogger(__name__)
 
 _PAIR_SUFFIXES_51 = {"_front_stereo", "_center_sub", "_rear_stereo"}
 _PAIR_SUFFIXES_71 = _PAIR_SUFFIXES_51 | {"_side_stereo"}
@@ -55,7 +58,8 @@ def _derive_card_name(sink_name: str, layout: str) -> str | None:
     required = _PAIR_SUFFIXES_71 if layout == "7.1" else _PAIR_SUFFIXES_51
     try:
         sinks = enumerate_pa_sinks()
-    except Exception:
+    except Exception as err:  # noqa: BLE001 - auto-detection is best effort
+        LOGGER.debug("Could not enumerate PulseAudio sinks: %s", err)
         return None
 
     remap_names = {s["pa_sink_name"] for s in sinks if s.get("is_remap")}
@@ -78,7 +82,7 @@ def _derive_card_name(sink_name: str, layout: str) -> str | None:
     # the one whose remap sinks point at our configured surround sink.
     try:
         result = subprocess.run(
-            ["pactl", "--format=json", "list", "modules"],
+            ["pactl", "--format=json", "list", "modules"],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=5,
@@ -95,8 +99,8 @@ def _derive_card_name(sink_name: str, layout: str) -> str | None:
                             for suffix in required
                         ):
                             return prefix
-    except Exception:
-        pass
+    except Exception as err:  # noqa: BLE001 - auto-detection is best effort
+        LOGGER.debug("Could not list PulseAudio modules: %s", err)
 
     # Fallback: prefer shorter prefix (less likely to be a generic name).
     return min(matches, key=len)
@@ -238,7 +242,7 @@ def _query_sink_format(sink_name: str) -> tuple[int, int, int]:
 
     try:
         result = subprocess.run(
-            ["pactl", "--format=json", "list", "sinks"],
+            ["pactl", "--format=json", "list", "sinks"],  # noqa: S607
             capture_output=True,
             text=True,
             timeout=5,
@@ -254,6 +258,6 @@ def _query_sink_format(sink_name: str) -> tuple[int, int, int]:
                     sample_rate = int(parts[2].replace("Hz", ""))
                     bit_depth = int("".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0])))
                     return sample_rate, bit_depth, channels
-    except Exception:
-        pass
+    except Exception as err:  # noqa: BLE001 - fall back to defaults below
+        LOGGER.debug("Could not read format of sink %s: %s", sink_name, err)
     return 48000, 16, 0

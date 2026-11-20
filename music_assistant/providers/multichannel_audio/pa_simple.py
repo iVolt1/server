@@ -7,7 +7,7 @@ import ctypes
 import os
 import threading
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Self
 
 PA_STREAM_PLAYBACK: Final = 1
 
@@ -51,7 +51,7 @@ def _find_pulse_server() -> str:
         "/run/pulse/native",
         "/var/run/pulse/native",
     ):
-        if os.path.exists(path):
+        if Path(path).exists():
             return f"unix:{path}"
     return ""
 
@@ -224,7 +224,7 @@ class PASimpleStream:
             if conn:
                 self._lib.pa_simple_free(conn)
 
-    def __enter__(self) -> PASimpleStream:
+    def __enter__(self) -> Self:
         """Enter context manager."""
         return self
 
@@ -257,12 +257,12 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
     import subprocess  # noqa: PLC0415
 
     # Locate pactl — prefer bundled binary, fall back to system
-    bundled = os.path.join(os.path.dirname(__file__), "bin", "pactl")
-    if os.path.isfile(bundled):
+    bundled = str(Path(__file__).parent / "bin" / "pactl")
+    if Path(bundled).is_file():
         if not os.access(bundled, os.X_OK):
             with contextlib.suppress(OSError):
                 Path(bundled).chmod(0o755)
-    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+    if Path(bundled).is_file() and os.access(bundled, os.X_OK):
         pactl_bin = bundled
     elif path := shutil.which("pactl"):
         pactl_bin = path
