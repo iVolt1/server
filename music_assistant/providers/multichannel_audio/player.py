@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 import uuid
 from contextlib import suppress
@@ -14,15 +13,14 @@ import numpy as np
 from music_assistant_models.enums import (
     ContentType,
     IdentifierType,
+    PlaybackState,
     PlayerFeature,
     PlayerType,
-    PlaybackState,
     StreamType,
 )
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 
-from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.player import PlayerMedia
 from music_assistant.models.player_protocol import PlayerProtocol
 
@@ -40,7 +38,6 @@ from .constants import (
 if TYPE_CHECKING:
     from .pa_simple import PASimpleStream
     from .provider import MultiChannelAudioProvider
-
 
 
 def get_player_uuid(pa_sink_name: str) -> str:
@@ -317,8 +314,9 @@ class MultiChannelPlayer(PlayerProtocol):
         PA remap sinks in a single executor thread keeping them frame-aligned.
         PA buffers are sized to absorb full ffmpeg burst chunks without blocking.
         """
-        from .pa_simple import PASimpleStream  # noqa: PLC0415
         from music_assistant.helpers.ffmpeg import FFMpeg  # noqa: PLC0415
+
+        from .pa_simple import PASimpleStream  # noqa: PLC0415
 
         if source_channels == 0:
             source_channels = self.channels
@@ -344,8 +342,9 @@ class MultiChannelPlayer(PlayerProtocol):
         # Large chunks cause pa_simple_write to block on the first sink
         # while the buffer fills, starving subsequent sinks of data.
         chunk_size = int(self.sample_rate * 0.010) * source_channels * 4
-        chunk_size = max((chunk_size // (source_channels * 4)) * (source_channels * 4),
-                         source_channels * 4)
+        chunk_size = max(
+            (chunk_size // (source_channels * 4)) * (source_channels * 4), source_channels * 4
+        )
         buffer_msec = 300
 
         streams: dict[str, PASimpleStream] = {}
@@ -409,7 +408,8 @@ class MultiChannelPlayer(PlayerProtocol):
                 actual_input_format = AudioFormat(content_type=ContentType.UNKNOWN)
             self.logger.debug(
                 "Resolved stream format from URL: url_content_type=%s -> input_format=%s",
-                url_content_type, actual_input_format.content_type,
+                url_content_type,
+                actual_input_format.content_type,
             )
             ffmpeg_proc = FFMpeg(
                 audio_input=url,
@@ -422,7 +422,8 @@ class MultiChannelPlayer(PlayerProtocol):
             await ffmpeg_proc.start()
             self.logger.debug(
                 "ffmpeg started: pid=%s chunk_size=%d",
-                ffmpeg_proc.proc.pid if ffmpeg_proc.proc else None, chunk_size,
+                ffmpeg_proc.proc.pid if ffmpeg_proc.proc else None,
+                chunk_size,
             )
 
             first_chunk = True
@@ -436,7 +437,9 @@ class MultiChannelPlayer(PlayerProtocol):
                     is_float = "f32" in ct_val or "float" in ct_val
                     self.logger.debug(
                         "First PCM chunk: len=%d channels=%d content_type=%s",
-                        len(chunk), source_channels, output_format.content_type,
+                        len(chunk),
+                        source_channels,
+                        output_format.content_type,
                     )
                     first_chunk = False
 
@@ -503,7 +506,8 @@ class MultiChannelPlayer(PlayerProtocol):
         source_channels: int,
         source_bit_depth: int = 32,
     ) -> None:
-        """Demux interleaved PCM and write each pair to its PA sink sequentially.
+        """
+        Demux interleaved PCM and write each pair to its PA sink sequentially.
 
         PA buffers are sized to absorb the full chunk so each write returns
         immediately. Sequential writes keep all sinks frame-aligned.
@@ -528,9 +532,7 @@ class MultiChannelPlayer(PlayerProtocol):
                     continue
                 pair = np.column_stack((samples[:, left_idx], samples[:, right_idx]))
                 streams[sink_name].write(
-                    np.clip(pair * 2147483647.0, -2147483648, 2147483647)
-                    .astype(np.int32)
-                    .tobytes()
+                    np.clip(pair * 2147483647.0, -2147483648, 2147483647).astype(np.int32).tobytes()
                 )
         else:
             dtype = np.int16 if source_bit_depth == 16 else np.int32
@@ -550,8 +552,11 @@ class MultiChannelPlayer(PlayerProtocol):
                 if debug_first:
                     self.logger.debug(
                         "demux %s: idx=(%d,%d) frames=%d max_abs=%d",
-                        sink_name, left_idx, right_idx,
-                        len(pair), int(np.abs(pair).max()),
+                        sink_name,
+                        left_idx,
+                        right_idx,
+                        len(pair),
+                        int(np.abs(pair).max()),
                     )
                 if source_bit_depth == 16:
                     streams[sink_name].write((pair.astype(np.int32) << 16).tobytes())
@@ -588,7 +593,8 @@ class MultiChannelPlayer(PlayerProtocol):
         self.update_state()
 
     async def apply_restored_volume(self) -> None:
-        """Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
+        """
+        Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
 
         Ensures a corrupt or missing cache entry never causes full-blast output.
         Volume is applied to the PCM stream via software scaling during playback.

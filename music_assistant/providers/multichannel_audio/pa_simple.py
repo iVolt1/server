@@ -57,7 +57,8 @@ def _find_pulse_server() -> str:
 
 
 def _get_pulse_server() -> str:
-    """Return the PulseAudio server path, checked fresh on each call.
+    """
+    Return the PulseAudio server path, checked fresh on each call.
 
     Intentionally not cached — the socket may not exist at import time
     but appear later once the audio addon has fully started.
@@ -107,17 +108,19 @@ def _get_lib() -> ctypes.CDLL:
 
 class _PABufferAttr(ctypes.Structure):
     """PA buffer attributes for controlling stream buffering."""
+
     _fields_: ClassVar = [
         ("maxlength", ctypes.c_uint32),
-        ("tlength",   ctypes.c_uint32),
-        ("prebuf",    ctypes.c_uint32),
-        ("minreq",    ctypes.c_uint32),
-        ("fragsize",  ctypes.c_uint32),
+        ("tlength", ctypes.c_uint32),
+        ("prebuf", ctypes.c_uint32),
+        ("minreq", ctypes.c_uint32),
+        ("fragsize", ctypes.c_uint32),
     ]
 
 
 class PASimpleStream:
-    """Synchronous PCM playback stream to a named PulseAudio sink.
+    """
+    Synchronous PCM playback stream to a named PulseAudio sink.
 
     All libpulse calls are serialized behind a threading.Lock so that
     concurrent executor threads cannot simultaneously write/free the
@@ -133,7 +136,8 @@ class PASimpleStream:
         bit_depth: int = 16,
         buffer_msec: int = 200,
     ) -> None:
-        """Open a synchronous PCM playback stream to the named PulseAudio sink.
+        """
+        Open a synchronous PCM playback stream to the named PulseAudio sink.
 
         :param buffer_msec: Target buffer size in milliseconds. Larger values
             reduce underruns at the cost of increased latency. Default 200ms.
@@ -150,11 +154,11 @@ class PASimpleStream:
         tlength = int(bytes_per_sec * buffer_msec / 1000)
 
         buf_attr = _PABufferAttr(
-            maxlength=0xFFFFFFFF,   # PA chooses max
-            tlength=tlength,        # target buffer size
-            prebuf=0xFFFFFFFF,      # PA chooses prebuf
-            minreq=0xFFFFFFFF,      # PA chooses minreq
-            fragsize=0xFFFFFFFF,    # recording only
+            maxlength=0xFFFFFFFF,  # PA chooses max
+            tlength=tlength,  # target buffer size
+            prebuf=0xFFFFFFFF,  # PA chooses prebuf
+            minreq=0xFFFFFFFF,  # PA chooses minreq
+            fragsize=0xFFFFFFFF,  # recording only
         )
 
         error = ctypes.c_int(0)
@@ -208,7 +212,8 @@ class PASimpleStream:
             return float(usec) / 1_000_000
 
     def close(self) -> None:
-        """Free the PA stream.
+        """
+        Free the PA stream.
 
         Acquires the lock before zeroing _conn and calling pa_simple_free,
         ensuring no concurrent write() or drain() can touch the pointer
@@ -229,7 +234,8 @@ class PASimpleStream:
 
 
 def enumerate_pa_sinks() -> list[dict[str, Any]]:
-    """Enumerate stereo-capable PulseAudio sinks via pactl JSON output.
+    """
+    Enumerate stereo-capable PulseAudio sinks via pactl JSON output.
 
     Uses pactl --format=json list sinks which always returns the sink's
     native sample rate and format regardless of active stream state —
@@ -312,7 +318,7 @@ def enumerate_pa_sinks() -> list[dict[str, Any]]:
             channels = int(parts[1].replace("ch", ""))
             sample_rate = int(parts[2].replace("Hz", ""))
             bit_depth = int("".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0])))
-        except (IndexError, ValueError):
+        except IndexError, ValueError:
             continue
         if channels < 2:
             continue

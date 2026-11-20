@@ -25,9 +25,7 @@ from .pa_simple import enumerate_pa_sinks
 from .player import MultiChannelPlayer, get_player_uuid
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
-    from music_assistant_models.provider import ProviderManifest
-    from music_assistant.mass import MusicAssistant
+    from music_assistant_models.config_entries import ConfigEntry
 
 
 _PAIR_SUFFIXES_51 = {"_front_stereo", "_center_sub", "_rear_stereo"}
@@ -35,7 +33,8 @@ _PAIR_SUFFIXES_71 = _PAIR_SUFFIXES_51 | {"_side_stereo"}
 
 
 def _derive_card_name(sink_name: str, layout: str) -> str | None:
-    """Auto-detect the stereo pair sink prefix by scanning PulseAudio remap sinks.
+    """
+    Auto-detect the stereo pair sink prefix by scanning PulseAudio remap sinks.
 
     For each candidate prefix, checks whether the remap sinks' master sink
     matches the configured surround sink name — giving an exact match rather
@@ -80,7 +79,10 @@ def _derive_card_name(sink_name: str, layout: str) -> str | None:
     try:
         result = subprocess.run(
             ["pactl", "--format=json", "list", "modules"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
         if result.returncode == 0:
             for mod in json.loads(result.stdout):
@@ -250,9 +252,7 @@ def _query_sink_format(sink_name: str) -> tuple[int, int, int]:
                     fmt = parts[0]
                     channels = int(parts[1].replace("ch", ""))
                     sample_rate = int(parts[2].replace("Hz", ""))
-                    bit_depth = int(
-                        "".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0]))
-                    )
+                    bit_depth = int("".join(filter(str.isdigit, fmt.split("le")[0].split("be")[0])))
                     return sample_rate, bit_depth, channels
     except Exception:
         pass

@@ -35,34 +35,34 @@ VOLUME_CONTROL_HARDWARE = "hardware"
 VOLUME_CONTROL_SOFTWARE = "software"
 
 # Channel map preset identifiers
-CHANNEL_MAP_FLAC = "flac"    # FL FR FC LFE RL RR [SL SR] — FLAC/PCM standard, MA default
-CHANNEL_MAP_DVD = "dvd"      # FL FR LFE FC RL RR [SL SR] — DVD/AC3 order (FC↔LFE swapped)
+CHANNEL_MAP_FLAC = "flac"  # FL FR FC LFE RL RR [SL SR] — FLAC/PCM standard, MA default
+CHANNEL_MAP_DVD = "dvd"  # FL FR LFE FC RL RR [SL SR] — DVD/AC3 order (FC↔LFE swapped)
 CHANNEL_MAP_CUSTOM = "custom"  # User-specified index pairs
 
 # Per-layout channel pair index maps for each preset.
 # Each entry maps PA sink name suffix -> (left_ch_index, right_ch_index)
 # in the interleaved PCM stream delivered by MA.
 _PAIRS_FLAC_71 = {
-    "front_stereo": (0, 1),   # FL, FR
-    "center_sub":   (2, 3),   # FC, LFE
-    "rear_stereo":  (4, 5),   # RL, RR
-    "side_stereo":  (6, 7),   # SL, SR
+    "front_stereo": (0, 1),  # FL, FR
+    "center_sub": (2, 3),  # FC, LFE
+    "rear_stereo": (4, 5),  # RL, RR
+    "side_stereo": (6, 7),  # SL, SR
 }
 _PAIRS_FLAC_51 = {
-    "front_stereo": (0, 1),   # FL, FR
-    "center_sub":   (2, 3),   # FC, LFE
-    "rear_stereo":  (4, 5),   # RL, RR
+    "front_stereo": (0, 1),  # FL, FR
+    "center_sub": (2, 3),  # FC, LFE
+    "rear_stereo": (4, 5),  # RL, RR
 }
 _PAIRS_DVD_71 = {
-    "front_stereo": (0, 1),   # FL, FR
-    "center_sub":   (3, 2),   # FC(idx3), LFE(idx2) — DVD swaps FC↔LFE vs FLAC
-    "rear_stereo":  (4, 5),   # RL, RR
-    "side_stereo":  (6, 7),   # SL, SR
+    "front_stereo": (0, 1),  # FL, FR
+    "center_sub": (3, 2),  # FC(idx3), LFE(idx2) — DVD swaps FC↔LFE vs FLAC
+    "rear_stereo": (4, 5),  # RL, RR
+    "side_stereo": (6, 7),  # SL, SR
 }
 _PAIRS_DVD_51 = {
-    "front_stereo": (0, 1),   # FL, FR
-    "center_sub":   (3, 2),   # FC(idx3), LFE(idx2)
-    "rear_stereo":  (4, 5),   # RL, RR
+    "front_stereo": (0, 1),  # FL, FR
+    "center_sub": (3, 2),  # FC(idx3), LFE(idx2)
+    "rear_stereo": (4, 5),  # RL, RR
 }
 
 PAIR_INDICES_BY_MAP: dict[str, dict[str, dict[str, tuple[int, int]]]] = {
