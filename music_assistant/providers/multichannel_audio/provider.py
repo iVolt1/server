@@ -142,6 +142,21 @@ class MultiChannelAudioProvider(PlayerProvider):
                 await self.mass.players.unregister(self._player.protocol_id)
             self._player = None
 
+    async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
+        """Set volume level (0-100) for the player."""
+        if self._player and self._player.protocol_id == player_id:
+            await self._player.volume_set(volume_level)
+
+    async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
+        """Mute/unmute the player."""
+        if self._player and self._player.protocol_id == player_id:
+            await self._player.volume_mute(muted)
+
+    async def cmd_stop(self, player_id: str) -> None:
+        """Send stop command to the player."""
+        if self._player and self._player.protocol_id == player_id:
+            await self._player.stop_stream()
+
     async def _register_player(self) -> None:
         """Register a single multichannel player from provider configuration."""
         sink_name = str(self.config.get_value(CONF_PA_SINK_NAME) or "")
@@ -213,21 +228,6 @@ class MultiChannelAudioProvider(PlayerProvider):
             bit_depth,
             list(self._player._pair_sinks.keys()),
         )
-
-    async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
-        """Set volume level (0-100) for the player."""
-        if self._player and self._player.protocol_id == player_id:
-            await self._player.volume_set(volume_level)
-
-    async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
-        """Mute/unmute the player."""
-        if self._player and self._player.protocol_id == player_id:
-            await self._player.volume_mute(muted)
-
-    async def cmd_stop(self, player_id: str) -> None:
-        """Send stop command to the player."""
-        if self._player and self._player.protocol_id == player_id:
-            await self._player.stop_stream()
 
 
 def _query_sink_format(sink_name: str) -> tuple[int, int, int]:

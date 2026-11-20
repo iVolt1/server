@@ -302,6 +302,57 @@ class MultiChannelPlayer(PlayerProtocol):
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
 
+    async def stop_stream(self) -> None:
+        """Stop streaming — alias for stop() used by provider unload."""
+        await self._stop_playback()
+
+    # --- Volume control ---
+
+    async def volume_set(self, volume_level: int) -> None:
+        """Handle VOLUME_SET command. Volume applied via software PCM scaling."""
+        self._attr_volume_level = volume_level
+        await self._save_state()
+        self.update_state()
+
+    async def volume_mute(self, muted: bool) -> None:
+        """Handle VOLUME_MUTE command. Mute applied via software PCM scaling."""
+        self._attr_volume_muted = muted
+        await self._save_state()
+        self.update_state()
+
+    async def apply_restored_volume(self) -> None:
+        """
+        Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
+
+        Ensures a corrupt or missing cache entry never causes full-blast output.
+        Volume is applied to the PCM stream via software scaling during playback.
+        """
+        volume = min(
+            self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
+            DEFAULT_HARDWARE_VOLUME_CEILING,
+        )
+        self._attr_volume_level = volume
+        self.logger.debug(
+            "Restored volume %d%% muted=%s",
+            volume,
+            self._attr_volume_muted,
+        )
+
+    # --- State persistence ---
+
+    async def restore_state(self) -> None:
+        """Restore cached volume/mute state from a previous session."""
+        if last_state := await self.mass.cache.get(
+            key=self.protocol_id,
+            provider=self.provider_id,
+            category=CACHE_CATEGORY_PREV_STATE,
+        ):
+            self._attr_volume_muted = last_state[0]
+            self._attr_volume_level = last_state[1]
+        else:
+            self._attr_volume_muted = False
+            self._attr_volume_level = DEFAULT_PLAYER_VOLUME
+
     # --- Playback loop ---
 
     async def _playback_loop(  # noqa: PLR0915
@@ -575,42 +626,6 @@ class MultiChannelPlayer(PlayerProtocol):
                 await self._playback_task
         self._playback_task = None
 
-    async def stop_stream(self) -> None:
-        """Stop streaming — alias for stop() used by provider unload."""
-        await self._stop_playback()
-
-    # --- Volume control ---
-
-    async def volume_set(self, volume_level: int) -> None:
-        """Handle VOLUME_SET command. Volume applied via software PCM scaling."""
-        self._attr_volume_level = volume_level
-        await self._save_state()
-        self.update_state()
-
-    async def volume_mute(self, muted: bool) -> None:
-        """Handle VOLUME_MUTE command. Mute applied via software PCM scaling."""
-        self._attr_volume_muted = muted
-        await self._save_state()
-        self.update_state()
-
-    async def apply_restored_volume(self) -> None:
-        """
-        Clamp restored volume to DEFAULT_HARDWARE_VOLUME_CEILING on startup.
-
-        Ensures a corrupt or missing cache entry never causes full-blast output.
-        Volume is applied to the PCM stream via software scaling during playback.
-        """
-        volume = min(
-            self._attr_volume_level or DEFAULT_PLAYER_VOLUME,
-            DEFAULT_HARDWARE_VOLUME_CEILING,
-        )
-        self._attr_volume_level = volume
-        self.logger.debug(
-            "Restored volume %d%% muted=%s",
-            volume,
-            self._attr_volume_muted,
-        )
-
     def _apply_software_volume(self, pcm_data: bytes) -> bytes:
         """Apply software volume scaling to s32le PCM data."""
         if self.volume_control_mode != VOLUME_CONTROL_SOFTWARE:
@@ -624,21 +639,6 @@ class MultiChannelPlayer(PlayerProtocol):
         samples = np.frombuffer(pcm_data, dtype=np.int32).copy()
         scaled = np.clip(samples.astype(np.float64) * scale, -2147483648, 2147483647)
         return scaled.astype(np.int32).tobytes()
-
-    # --- State persistence ---
-
-    async def restore_state(self) -> None:
-        """Restore cached volume/mute state from a previous session."""
-        if last_state := await self.mass.cache.get(
-            key=self.protocol_id,
-            provider=self.provider_id,
-            category=CACHE_CATEGORY_PREV_STATE,
-        ):
-            self._attr_volume_muted = last_state[0]
-            self._attr_volume_level = last_state[1]
-        else:
-            self._attr_volume_muted = False
-            self._attr_volume_level = DEFAULT_PLAYER_VOLUME
 
     async def _save_state(self) -> None:
         """Persist current volume/mute state to cache."""
